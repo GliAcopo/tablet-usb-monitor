@@ -48,6 +48,29 @@ state independently of whether the local overlay is visible:
 {"type":"stats","panel_hz":120.0,"decoder_fps":119.8,"received_mbps":42.1,"stream_fps":120,"width":2960,"height":1848}
 ```
 
+On connect the client also announces its own panel, before any video has
+arrived:
+
+```json
+{"type":"resolution","width":2960,"height":1848,"width_mm":314,"height_mm":195}
+```
+
+The host records it and warns once if it disagrees with the virtual output it
+already created; it cannot resize an output KWin has bound to a live stream, so
+the fix is to restart with matching `--width`/`--height`. The millimetre fields
+are accepted and currently unused.
+
+The client can also ask to be used as a graphics tablet for the laptop's own
+screen instead of as a second screen:
+
+```json
+{"type":"mode","pen_only":true}
+```
+
+This mode is **not implemented host-side**. The host replies with its full
+applied state (`pen_only` false), which the client treats as authoritative, so
+the toggle reverts instead of showing a mode the host never entered.
+
 Frame acknowledgements and touch/pen messages retain the upstream format.
 The video socket receives a four-byte big-endian packet length, followed by
 packet type `1`, a four-byte big-endian sequence number, and one Annex-B HEVC

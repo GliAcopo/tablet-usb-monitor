@@ -159,3 +159,54 @@ throughput rather than language preference.
 Do not insert `videorate` merely to report 120 fps: duplicated frames increase
 the counter and bitrate without improving motion.  Preserve the variable-rate
 source and solve the stage that is producing unique frames at 60 Hz.
+
+## Live result: the cross-GPU DMA-BUF import works
+
+The open question above — whether NVIDIA EGL can import the DMA-BUF and modifier
+that the Intel-composited KWin session exports — is now answered on this
+machine.  A live `--capture-memory gl` run negotiated:
+
+```text
+video/x-raw(memory:DMABuf), drm-format=AR24, format=DMA_DRM,
+interlace-mode=progressive, width=2960, height=1848,
+framerate=0/1, max-framerate=120/1
+```
+
+and encoded at the native `(2960, 1848)`.  The automatic SystemMemory fallback
+in `Host.fallback_or_stop` was never triggered, so `glupload` accepted the
+imported buffer and `nvh265enc` accepted GLMemory.  The run sustained 5 min 28 s
+and consumed 19.7 s of host CPU time (about 6 % of one core), which is
+consistent with no full-frame CPU readback.
+
+This closes the "capability evidence rather than proof" caveat: the route
+`KWin DMA-BUF -> pipewiresrc -> glupload -> GLMemory -> nvh265enc` is live on
+an Intel-composited session with an RTX 4050 encoder.
+
+### Still open: the frame-rate A/B
+
+The cadence comparison between `--capture-memory system` and
+`--capture-memory gl` is **not** settled.  The figures logged so far were taken
+against an ordinary idle desktop, where KWin only produces a screencast frame
+when something is damaged; they ranged from 9 to 40 fps and measure how much the
+desktop happened to be changing, not any capacity limit.  Encoded fps tracked
+capture fps exactly in every window, and `tablet_ack_fps` tracked both, so
+nothing downstream of the capture was throttling.
+
+A valid comparison needs, for each memory mode:
+
+1. `./tabs9 test-motion` running (continuous 8 ms repaints on the virtual
+   output), identical content and duration in both runs;
+2. the first five seconds discarded — one cold BGRx run above took 2.95 s for
+   120 frames against 1.60 s for 240 warm ones;
+3. `capture_fps` plus `capture_pts_interval_ms_p50` as the discriminator, and
+   systemd's `Consumed Xs CPU time` line for the cost side.
+
+Expected readings and what each would mean:
+
+| Reading | Conclusion |
+|---|---|
+| both modes about 60 | KWin's screencast scheduling is the ceiling; the GL path still wins on CPU and latency, but not on fps |
+| `gl` above 60, `system` about 60 | the CPU readback/upload was the limit and the GL path is the fix |
+
+That measurement requires a granted portal session (see below), so it is left
+for the first supervised run.

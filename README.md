@@ -13,11 +13,24 @@ Ubuntu 26.04, KDE Plasma 6.6.6 Wayland, NVIDIA RTX 4050 Laptop GPU.
 - USB debugging authorized, wired link negotiated at 5 Gbit/s.
 - Separate extended output, native 2960 × 1848, 120 Hz mode, scale 1.5.
 - Actual HEVC stream dimensions verified as 2960 × 1848.
-- Initial end-to-end stream delivered roughly 60 frames/s. **A 120 Hz output
-  mode is not proof of sustained 120 fps delivery.** Further measurements are
-  recorded in [docs/performance.md](docs/performance.md).
+- The zero-readback capture path works: `--capture-memory gl` negotiated
+  `video/x-raw(memory:DMABuf)` from KWin at native size and encoded it without
+  falling back to system memory. See [docs/performance.md](docs/performance.md).
+- Host → tablet settings sync verified: started with `--bitrate 40000`, the
+  client logged `Host stream: hevc 2960x1848 @ 120 fps, 40000 kbps` and
+  configured its decoder from that, not from its own preferences.
+- Tablet → host input transport verified over USB: injected taps and swipes
+  reached the host's control socket as well-formed touch messages.
+- **Sustained frame rate is still unmeasured.** Early end-to-end runs delivered
+  roughly 60 frames/s, and a 120 Hz output mode is not proof of 120 fps
+  delivery. The remaining measurement needs continuous motion on the virtual
+  output; the numbers logged against an idle desktop only show how much the
+  desktop was changing.
 - Touch implementation uses KDE's RemoteDesktop portal; no kernel input
-  permissions or global input injection service is required.
+  permissions or global input injection service is required. Host-side
+  injection into the virtual output has not yet been confirmed on the device.
+- Pen-only mode (tablet as a graphics tablet for the laptop's own screen) is
+  not implemented; the host tells the client so rather than ignoring it.
 
 This is a hardware-specific implementation, not a claim of support for every
 Linux compositor or graphics card. It does not turn the tablet USB port into a
@@ -36,8 +49,20 @@ driver must support hardware encoding. The motion test additionally uses PyQt6.
 ```
 
 `setup` downloads checksum-pinned ADB into `.local/`; it does not install system
-packages, load kernel modules, change the firewall or enable autostart. Android
-build/install instructions are supplied with the client build scripts.
+packages, load kernel modules, change the firewall or enable autostart.
+
+The Android client is built from source in this repository, with its own pinned
+toolchain under `.local/android-toolchain` (nothing is installed system-wide):
+
+```sh
+scripts/build-android.sh
+.local/platform-tools/adb -d install -r .local/artifacts/tab-s9-usb-display-debug.apk
+```
+
+The build script prints the APK's SHA-256. The host launches the installed
+client itself over ADB — `local.tabs9.usbdisplay/.MainActivity`, with the
+session token as an intent extra — so the app does not need to be started by
+hand. See [android/README.md](android/README.md) for the control protocol.
 
 Connect the tablet directly with a USB 3 data cable, unlock it, enable USB
 debugging, and authorize this computer on the tablet. A charging-only cable
@@ -70,10 +95,24 @@ removes the virtual output, and removes the two ADB reverse mappings it created.
 The laptop panel remains enabled. Windows on the removed output are managed by
 KDE's normal display-disconnection behavior.
 
+Both dialogs must be answered by hand on every start: the portal consent prompt
+is what authorizes screen capture and input control, and this project
+deliberately ships no tool to click it automatically. Until one of those dialogs
+is answered there is no picture, but the control socket is already up, so
+`./tabs9 logs` still reports whether the tablet is connected and its touches are
+arriving.
+
 For a lighter profile, start with `--fps 60 --bitrate 30000`. Bitrate is in
 kbit/s. Lowering bitrate primarily reduces USB traffic; lowering the frame rate
 reduces rendering and encoding work. The application reports the host's applied
 settings and measured delivery separately.
+
+`--capture-memory gl` keeps captured frames on the GPU
+(`KWin DMA-BUF → glupload → GLMemory → nvh265enc`) instead of routing them
+through system memory, and falls back to the system-memory pipeline by itself if
+that negotiation fails. It is not yet the default: it is confirmed to negotiate
+and encode correctly on this machine, but its effect on sustained frame rate has
+not been measured against continuous motion.
 
 ## Verification and privacy
 

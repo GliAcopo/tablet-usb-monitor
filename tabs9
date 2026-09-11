@@ -33,6 +33,8 @@ case "${1:-help}" in
   logs) journalctl --user -u "$unit" --no-pager -n 30 -o cat ;;
   test-motion) exec python3 scripts/motion-test.py ;;
   *)
-    echo 'Usage: ./tabs9 {setup|doctor|start [--fps 60|90|120] [--bitrate 40000]|stop|status|logs|test-motion}'
+    echo 'Usage: ./tabs9 {setup|doctor|start [options]|stop|status|logs|test-motion}'
+    echo '  start options: --fps 30|60|90|120  --bitrate 40000  --scale 1.5'
+    echo '                 --width 2960 --height 1848  --capture-memory system|gl'
     ;;
 esac
