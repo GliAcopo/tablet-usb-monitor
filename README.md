@@ -118,11 +118,17 @@ not been measured against continuous motion.
 
 ```sh
 python3 -m unittest discover -s tests -v
-./tabs9 test-motion
+./tabs9 test-motion --seconds 20
+./tabs9 bench-capture --seconds 30
 ```
 
-The motion test displays a synthetic moving pattern for 20 seconds on the
-virtual output. Logs contain counts, frame dimensions, timing and negotiated
+`bench-capture` measures both capture paths against continuous motion and prints
+capture, encode and tablet-acknowledgement rates side by side. It prompts for the
+two consent dialogs per path and does the rest itself; that comparison is the one
+remaining answer needed about sustained frame rate.
+
+The motion test displays a synthetic moving pattern on the virtual output and
+reports how many injected touches arrived as native input. Logs contain counts, frame dimensions, timing and negotiated
 formats, not desktop pixels, touch coordinates, clipboard data or device
 identifiers. Runtime tokens, downloads and signing keys belong in ignored
 `.local/` paths. Never commit those files or captured desktop images.
