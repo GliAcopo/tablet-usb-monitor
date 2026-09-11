@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- connectedDevice, not mediaPlayback: this service exists to keep a USB
+         display link alive, and Android 14+ expects a mediaPlayback service to
+         be backed by real media playback (an active MediaSession).
+
+         A connectedDevice FGS additionally requires one permission from a fixed
+         qualifying list (Bluetooth/NFC/network/USB-accessory); without one,
+         startForeground throws SecurityException and the app dies instantly on
+         launch. CHANGE_NETWORK_STATE is the applicable one while the transport
+         is a TCP socket over adb. Once the USB-accessory transport lands, the
+         accessory connection itself qualifies and this can go. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- For the Wi-Fi lock that keeps the radio out of power save while
+         streaming. Read-only: it does not let the app change any setting. -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="Tab S9 USB Display"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.UScreen"
+        android:usesCleartextTraffic="true"
+        android:hardwareAccelerated="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
+            android:windowSoftInputMode="adjustResize"
+            android:screenOrientation="sensorLandscape"
+            android:launchMode="singleTask"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".StreamingService"
+            android:foregroundServiceType="connectedDevice"
+            android:exported="false" />
+    </application>
+</manifest>

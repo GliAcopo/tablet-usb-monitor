@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$(realpath "$0")")"
+unit=tab-s9-usb-display.service
+case "${1:-help}" in
+  setup) exec python3 scripts/setup.py ;;
+  doctor) exec python3 scripts/doctor.py ;;
+  start)
+    shift
+    if systemctl --user is-active --quiet "$unit"; then
+      echo 'USB display is already running.'
+      exit 0
+    fi
+    python3 scripts/doctor.py --check
+    systemd-run --user --quiet --collect --unit="$unit" \
+      --property=Type=exec --property=TimeoutStopSec=10 --property=KillMode=mixed \
+      --working-directory="$PWD" /usr/bin/python3 -u "$PWD/src/host.py" "$@"
+    echo 'USB display started. Complete the KDE sharing dialog(s).'
+    ;;
+  stop)
+    if systemctl --user is-active --quiet "$unit"; then
+      systemctl --user stop "$unit"
+    fi
+    echo 'USB display stopped.'
+    ;;
+  status)
+    if systemctl --user is-active --quiet "$unit"; then
+      echo 'USB display service: running'
+    else
+      echo 'USB display service: stopped'
+    fi
+    ;;
+  logs) journalctl --user -u "$unit" --no-pager -n 30 -o cat ;;
+  test-motion) exec python3 scripts/motion-test.py ;;
+  *)
+    echo 'Usage: ./tabs9 {setup|doctor|start [--fps 60|90|120] [--bitrate 40000]|stop|status|logs|test-motion}'
+    ;;
+esac
