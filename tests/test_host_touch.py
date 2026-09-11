@@ -91,6 +91,10 @@ def bare_host():
     value.stats = []
     value.rendered = 0
     value.tablet_stats = {}
+    value.input_messages = 0
+    value.input_rejected = 0
+    value.tablet_panel = None
+    value.panel_mismatch_reported = False
     return value
 
 
@@ -186,6 +190,63 @@ class HostTouchIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(value.control_owner)
         self.assertNotIn(ws, value.controls)
         self.assertEqual(value.touch.releases, 2)  # begin + disconnect
+
+    async def test_mode_request_is_answered_with_the_mode_actually_in_force(self):
+        # The tablet's pen-only toggle is not implemented host-side. Without an
+        # answer its UI would keep showing a mode the host never entered.
+        value = bare_host()
+        ws = FakeWebSocket(value.token)
+        task = asyncio.create_task(value.control(ws))
+        await self._settle()
+        self.glib.drain()
+        greeting = len(ws.sent)
+
+        ws.push({"type": "mode", "pen_only": True})
+        await self._settle()
+        ws.stop()
+        await task
+        self.glib.drain()
+
+        self.assertEqual(len(ws.sent), greeting + 1)
+        self.assertIs(ws.sent[-1]["pen_only"], False)
+
+    async def test_unhandled_message_types_are_counted_as_no_input(self):
+        value = bare_host()
+        ws = FakeWebSocket(value.token)
+        task = asyncio.create_task(value.control(ws))
+        await self._settle()
+        self.glib.drain()
+
+        ws.push({"type": "resolution", "width": 2960, "height": 1848})
+        ws.push({"type": "touch", "action": 0, "slot": 0, "x": 0.1, "y": 0.1})
+        await self._settle()
+        ws.stop()
+        await task
+        self.glib.drain()
+
+        self.assertEqual(value.input_messages, 1)
+        self.assertEqual(value.tablet_panel, (2960, 1848))
+        self.assertFalse(value.panel_mismatch_reported)
+
+    async def test_mismatched_tablet_panel_is_reported_once(self):
+        value = bare_host()
+
+        self.assertTrue(value.note_tablet_panel({"width": 2560, "height": 1600}))
+        self.assertTrue(value.panel_mismatch_reported)
+        self.assertEqual(value.tablet_panel, (2560, 1600))
+
+        # A second announcement must not repeat the warning.
+        value.panel_mismatch_reported = False
+        value.note_tablet_panel({"width": 2960, "height": 1848})
+        self.assertFalse(value.panel_mismatch_reported)
+
+    async def test_implausible_panel_announcement_is_ignored(self):
+        value = bare_host()
+        for bad in ({"width": 0, "height": 1848}, {"width": "2960", "height": 1848},
+                    {"width": True, "height": 1848}, {"height": 1848},
+                    {"width": 99999, "height": 1848}):
+            self.assertFalse(value.note_tablet_panel(bad))
+        self.assertIsNone(value.tablet_panel)
 
     async def test_rejected_touch_event_releases_all_contacts(self):
         value = bare_host()

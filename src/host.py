@@ -64,6 +64,10 @@ class Host:
         self.control_owner = None
         self.control_generation = 0
         self.tablet_stats = {}
+        self.input_messages = 0
+        self.input_rejected = 0
+        self.tablet_panel = None
+        self.panel_mismatch_reported = False
         self.sent = collections.OrderedDict()
         self.stats = collections.deque(maxlen=1200)
         self.frames = 0
@@ -385,7 +389,16 @@ class Host:
                         for k in ('panel_hz', 'decoder_fps', 'received_mbps', 'stream_fps')
                         if isinstance(msg.get(k), (int, float)) and math.isfinite(msg[k]) and 0 <= msg[k] <= 1000}
                 elif msg.get('type') in ('touch', 'pen'):
+                    self.input_messages += 1
                     GLib.idle_add(self.handle_touch, msg, generation)
+                elif msg.get('type') == 'resolution':
+                    self.note_tablet_panel(msg)
+                elif msg.get('type') == 'mode':
+                    # Pen-only (tablet as a graphics tablet for the laptop's own
+                    # screen) is not implemented host-side. Answer with the mode
+                    # actually in force so the tablet's toggle snaps back instead
+                    # of showing a state the host never entered.
+                    await ws.send(json.dumps(self.settings()))
         except Exception:
             pass
         finally:
@@ -412,8 +425,31 @@ class Host:
             try:
                 self.touch.handle_message(message)
             except (TouchInputError, dbus.DBusException):
+                self.input_rejected += 1
                 self.release_touch()
         return False
+
+    def note_tablet_panel(self, message):
+        """Record the tablet's own panel size and warn once if it disagrees.
+
+        The tablet announces its native landscape resolution on connect. The
+        host cannot resize a virtual output that KWin has already bound to a
+        stream, so a mismatch is reported rather than silently stretched: the
+        picture would be rescaled on the tablet and touch coordinates would land
+        on the wrong pixels.
+        """
+        width, height = message.get('width'), message.get('height')
+        if (isinstance(width, bool) or isinstance(height, bool) or
+                type(width) is not int or type(height) is not int or
+                not (320 <= width <= 8192 and 240 <= height <= 8192)):
+            return False
+        self.tablet_panel = (width, height)
+        if (width, height) != (self.args.width, self.args.height) and not self.panel_mismatch_reported:
+            self.panel_mismatch_reported = True
+            print(f'Tablet panel is {width}x{height} but the virtual output is '
+                  f'{self.args.width}x{self.args.height}; restart with '
+                  f'--width {width} --height {height} for a pixel-exact image.', flush=True)
+        return True
 
     def release_touch(self):
         if self.touch is not None:
@@ -473,6 +509,8 @@ class Host:
             'capture_fps': round((self.capture_frames - captured) / elapsed, 1),
             'encoded_fps': round((self.frames - frames) / elapsed, 1),
             'tablet_ack_fps': round((self.rendered - rendered) / elapsed, 1),
+            'tablet_input_messages': self.input_messages,
+            'tablet_input_rejected': self.input_rejected,
             'tablet': self.tablet_stats,
             'capture_interval_ms_p50': round(arrivals[len(arrivals)//2], 2) if arrivals else None,
             'capture_pts_interval_ms_p50': round(timestamps[len(timestamps)//2], 2) if timestamps else None,
@@ -486,6 +524,11 @@ class Host:
         threading.Thread(target=worker, daemon=True).start()
         try:
             if not self.ready.wait(5): raise RuntimeError('Local streaming ports unavailable')
+            # Report from the moment the sockets are up, not from the moment
+            # capture starts: while the KDE sharing dialogs are still open this
+            # is the only signal that the tablet is connected and its input is
+            # arriving over USB.
+            self.report_timer = GLib.timeout_add_seconds(5, self.report)
             for port in (8890, 8891):
                 adb('reverse', '--no-rebind', f'tcp:{port}', f'tcp:{port}')
                 self.reverse_ports.append(port)
