@@ -19,6 +19,7 @@ Only aggregate timing metadata is read: the host's own telemetry lines from the
 journal, plus the service's CPU accounting.  No screen content is touched.
 """
 import argparse
+import fcntl
 import json
 from pathlib import Path
 import statistics
@@ -27,6 +28,7 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
+LOCK = ROOT / '.local/state/host.lock'
 UNIT = 'tab-s9-usb-display.service'
 # Telemetry arrives every five seconds; discard the first window of each run.
 # A cold encoder run has measured almost twice the per-frame cost of a warm one.
@@ -45,14 +47,36 @@ def start_host(mode, extra):
                     '--capture-memory', mode, *extra], check=True)
 
 
+def host_gone():
+    """True once no host process holds the single-instance lock.
+
+    `systemctl is-active` can already report inactive while the unit is still
+    deactivating, and host.py refuses to start while the previous process still
+    holds .local/state/host.lock.  Waiting on the lock itself is what makes a
+    back-to-back restart -- one capture path after the other -- reliable.
+    """
+    if unit_active():
+        return False
+    if not LOCK.exists():
+        return True
+    try:
+        with LOCK.open('r') as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        return True
+    except (BlockingIOError, OSError):
+        return False
+
+
 def stop_host():
     if unit_active():
         subprocess.run(['systemctl', '--user', 'stop', UNIT], check=False)
-    # systemd-run --collect drops the unit as soon as it is inactive.
-    for _ in range(50):
-        if not unit_active():
-            return
+    for _ in range(75):
+        if host_gone():
+            return True
         time.sleep(0.2)
+    print('The previous host process is still holding its lock.', flush=True)
+    return False
 
 
 def cpu_seconds():
@@ -93,13 +117,16 @@ def reports(lines):
 
 
 def median(values):
-    values = [v for v in values if isinstance(v, (int, float))]
+    # bool is a subclass of int: a stray True would be averaged in as 1 fps.
+    values = [v for v in values
+              if isinstance(v, (int, float)) and not isinstance(v, bool)]
     return round(statistics.median(values), 1) if values else None
 
 
 def measure(mode, seconds, extra):
     print(f'\n=== capture path: {mode} ===', flush=True)
-    stop_host()
+    if not stop_host():
+        return None
     started = time.time()
     start_host(mode, extra)
     print('Answer the two KDE sharing dialogs now:', flush=True)
@@ -151,8 +178,9 @@ def main():
                         help='measured window per capture path, after warm-up')
     parser.add_argument('--modes', nargs='+', default=['system', 'gl'],
                         choices=['system', 'gl'])
-    parser.add_argument('rest', nargs='*',
-                        help='extra host arguments, after --, e.g. -- --fps 120')
+    parser.add_argument('rest', nargs='*', metavar='-- HOST ARGS',
+                        help='extra host arguments; the -- separator is required, '
+                             'e.g. bench-capture --seconds 30 -- --fps 60')
     args = parser.parse_args()
     if not 5 <= args.seconds <= 600:
         parser.error('--seconds must be between 5 and 600')
