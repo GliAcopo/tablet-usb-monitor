@@ -1,12 +1,25 @@
 #!/usr/bin/env python3
-"""20-second synthetic motion on the virtual output, without reading desktop content."""
+"""Synthetic motion on the virtual output, without reading desktop content.
+
+Repaints as fast as an 8 ms timer allows, so the capture path is measured
+against continuous damage rather than against whatever the desktop happens to
+be doing. Also reports whether injected touches arrive as native input.
+"""
+import argparse
 import sys
 import time
 from PyQt6.QtWidgets import QApplication, QWidget
 from PyQt6.QtCore import QTimer, Qt, QEvent
 from PyQt6.QtGui import QPainter, QColor, QFont
 
-app = QApplication(sys.argv)
+parser = argparse.ArgumentParser()
+parser.add_argument('--seconds', type=float, default=20.0,
+                    help='how long to keep the pattern moving')
+options, rest = parser.parse_known_args()
+if not 1 <= options.seconds <= 600:
+    parser.error('--seconds must be between 1 and 600')
+
+app = QApplication([sys.argv[0], *rest])
 screens = [s for s in app.screens() if s.name().startswith('Virtual-')]
 if len(screens) != 1:
     raise SystemExit('Expected exactly one virtual screen; refusing ambiguous placement')
@@ -53,5 +66,8 @@ class Pattern(QWidget):
 
 window = Pattern()
 window.showFullScreen()
-QTimer.singleShot(20000, app.quit)
+QTimer.singleShot(int(options.seconds * 1000), app.quit)
 app.exec()
+print(f'Motion test finished after {options.seconds:g} s; '
+      f'native touches: {window.touch_count}, pointer presses: {window.pointer_count}',
+      flush=True)
