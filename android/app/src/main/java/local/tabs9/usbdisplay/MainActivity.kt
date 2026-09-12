@@ -40,6 +40,8 @@ class MainActivity : ComponentActivity() {
     private var hostStreamConfig by mutableStateOf(HostStreamConfig())
     private var actualPanelHz by mutableStateOf(0f)
     private var showThanks by mutableStateOf(false)
+    /** Host protocol version from its greeting; 0 until known. */
+    private var hostProtocol by mutableStateOf(0)
     private var videoReceiver: VideoReceiver? = null
     private var touchCapture: TouchCapture? = null
     private lateinit var prefs: Prefs
@@ -68,6 +70,7 @@ class MainActivity : ComponentActivity() {
             }
         }
         videoReceiver?.onKeyframeNeeded = { touchCapture?.sendKeyframeRequest() }
+        touchCapture?.onProtocolKnown = { version -> runOnUiThread { hostProtocol = version } }
         videoReceiver?.onStatsUpdated = { decoderFps, receivedMbps ->
             runOnUiThread {
                 actualPanelHz = currentPanelRefreshRate()
@@ -119,6 +122,7 @@ class MainActivity : ComponentActivity() {
                     panelHz = actualPanelHz,
                     showThanks = showThanks,
                     onDismissThanks = { showThanks = false },
+                    hostProtocol = hostProtocol,
                     videoReceiver = videoReceiver,
                     touchCapture = touchCapture,
                     prefs = prefs,
@@ -351,6 +355,7 @@ fun UScreenMain(
     panelHz: Float = 0f,
     showThanks: Boolean = false,
     onDismissThanks: () -> Unit = {},
+    hostProtocol: Int = 0,
     onSurfaceDestroyed: () -> Unit = {},
     videoReceiver: VideoReceiver? = null,
     touchCapture: TouchCapture? = null,
@@ -448,6 +453,26 @@ fun UScreenMain(
                     ),
                     fontSize = 12.sp,
                     color = Color(0xFFB0B0C0),
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                )
+            }
+        }
+
+        // A host speaking another protocol version is said out loud rather
+        // than silently degrading; the common subset keeps streaming.
+        if (hostProtocol != 0 && hostProtocol != TouchCapture.PROTOCOL) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(12.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color(0xCC7A2E2E))
+            ) {
+                Text(
+                    text = "Host protocol $hostProtocol, app protocol ${TouchCapture.PROTOCOL}: " +
+                        "update the ${if (hostProtocol < TouchCapture.PROTOCOL) "host" else "app"}",
+                    fontSize = 12.sp,
+                    color = Color.White,
                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
                 )
             }

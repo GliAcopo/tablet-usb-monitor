@@ -22,6 +22,8 @@ data class HostStreamConfig(
 class TouchCapture {
     companion object {
         const val TAG = "UScreenTouch"
+        /** Control-channel contract this client implements (see host.py PROTOCOL). */
+        const val PROTOCOL = 2
         const val WS_URL = "ws://127.0.0.1:8891"
         private const val TOOL_TYPE_PALM = 6
         const val RECONNECT_DELAY_MS = 2000L
@@ -38,6 +40,8 @@ class TouchCapture {
         private set
     var onModeKnown: ((penOnly: Boolean) -> Unit)? = null
     var onStreamConfigKnown: ((HostStreamConfig) -> Unit)? = null
+    /** Host protocol version from its greeting (1 when it sends none). */
+    var onProtocolKnown: ((Int) -> Unit)? = null
 
     @Volatile var hostStreamConfig = HostStreamConfig()
         private set
@@ -114,6 +118,17 @@ class TouchCapture {
             // ignored, this channel is otherwise ours to talk on.
             try {
                 val o = JSONObject(text)
+                if (o.has("protocol")) {
+                    val hostProtocol = o.optInt("protocol", 1)
+                    if (hostProtocol != PROTOCOL) {
+                        Log.w(TAG, "Host speaks protocol $hostProtocol, this client $PROTOCOL; " +
+                            "using the common subset")
+                    }
+                    onProtocolKnown?.invoke(hostProtocol)
+                } else if (o.has("status")) {
+                    Log.w(TAG, "Host greeting has no protocol version (legacy host)")
+                    onProtocolKnown?.invoke(1)
+                }
                 val previous = hostStreamConfig
                 val updated = HostStreamConfig(
                     codec = o.optString("codec", previous.codec),
@@ -501,6 +516,7 @@ class TouchCapture {
     fun sendConfig(bitrateKbps: Int, fps: Int) {
         val msg = JSONObject().apply {
             put("type", "config")
+            put("protocol", PROTOCOL)
             put("bitrate", bitrateKbps)
             put("fps", fps)
         }

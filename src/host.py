@@ -1055,6 +1055,13 @@ class Host:
                 elif msg.get('type') == 'keyframe':
                     GLib.idle_add(self.request_keyframe)
                 elif msg.get('type') == 'config':
+                    protocol = msg.get('protocol')
+                    if type(protocol) is not int:
+                        print('Tablet client speaks protocol 1 (legacy mode: no render timestamps, '
+                              'no keyframe requests).', flush=True)
+                    elif protocol > self.PROTOCOL:
+                        print(f'Tablet client speaks protocol {protocol}, host {self.PROTOCOL}: '
+                              'update the host; continuing with the common subset.', flush=True)
                     GLib.idle_add(self.apply_settings, msg, generation)
                 elif msg.get('type') == 'stats':
                     self.tablet_stats = {k: round(float(msg[k]), 2)
@@ -1136,9 +1143,17 @@ class Host:
             self.touch.release_all()
         return False
 
+    # Control-channel contract. 2 adds: render_ns in acks, {"type":"keyframe"}
+    # requests, a 'protocol' field in the tablet's config message. The video
+    # framing (4-byte length, type 0x01, 4-byte sequence) is unchanged, so a
+    # protocol-1 client (the previous APK) still streams: legacy mode.
+    PROTOCOL = 2
+
     def settings(self):
-        return {'status': 'connected', 'width': self.args.width, 'height': self.args.height,
-                'codec': 'hevc', 'pen_only': False, 'fps': self.args.fps, 'bitrate': self.args.bitrate}
+        return {'status': 'connected', 'protocol': self.PROTOCOL, 'width': self.args.width,
+                'height': self.args.height, 'codec': 'hevc', 'pen_only': False,
+                'fps': self.args.fps, 'bitrate': self.args.bitrate,
+                'features': ['keyframe_request', 'render_ns']}
 
     async def broadcast_settings(self):
         payload = json.dumps(self.settings())
