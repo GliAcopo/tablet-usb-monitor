@@ -233,6 +233,8 @@ class Host:
         self.capture_node = None
         self.memory_mode = args.capture_memory
         self.native = None
+        self.native_pushed = collections.deque()   # slots in encoder order
+        self.native_last_encoded = None
         self.native_dropped = 0
         self.native_ready_lag = collections.deque(maxlen=1200)
         self.native_last_seq = None
@@ -256,7 +258,7 @@ class Host:
         # probe, then (the encoder never drops or reorders) a FIFO of arrivals
         # for the frames that entered the encoder.
         self.capture_arrivals = collections.OrderedDict()
-        self.encoder_fifo = collections.deque()
+        self.encoder_arrivals = collections.OrderedDict()   # encoder-input pts -> capture arrival
         self.capture_to_ack = collections.deque(maxlen=1200)
         self.ack_intervals = collections.deque(maxlen=1200)
         self.ack_wall = None
@@ -670,6 +672,8 @@ class Host:
                 Gst.PadProbeType.BUFFER, self.capture_probe)
             self.pipeline.get_by_name('encoder').get_static_pad('sink').add_probe(
                 Gst.PadProbeType.BUFFER, self.encoder_in_probe)
+            self.pipeline.get_by_name('encoded').get_static_pad('sink').add_probe(
+                Gst.PadProbeType.BUFFER, self.native_encoded)
             self.pipeline.get_by_name('encoded').connect('new-sample', self.sample)
             if os.environ.get('TABS9_STAGE_PROBES'):
                 self.install_stage_probes()
@@ -717,14 +721,17 @@ class Host:
             self.native_pushed.remove(frame.slot)
             self.native.release(frame.slot)
 
-    def native_encoded(self):
-        """appsink got a frame: the slot before this one is certainly free."""
+    def native_encoded(self, pad, info):
+        """Every encoded frame (probe on the appsink's pad, so a sample the
+        appsink drops still returns its slot): the slot before this one is
+        certainly free."""
         if self.native is None or not self.native_pushed:
-            return
+            return Gst.PadProbeReturn.OK
         slot = self.native_pushed.popleft()
         if self.native_last_encoded is not None:
             self.native.release(self.native_last_encoded)
         self.native_last_encoded = slot
+        return Gst.PadProbeReturn.OK
 
     def native_exit(self, code):
         if not self.closing:
@@ -780,9 +787,12 @@ class Host:
     def encoder_in_probe(self, pad, info):
         buffer = info.get_buffer()
         if buffer is not None:
-            self.encoder_fifo.append(self.capture_arrivals.pop(buffer.pts, None))
-            while len(self.encoder_fifo) > 16:
-                self.encoder_fifo.popleft()
+            # Keyed by pts (which the encoder preserves), not a FIFO: the
+            # appsink may drop a sample, and a FIFO would then pair every
+            # later frame with the arrival of the one before it.
+            self.encoder_arrivals[buffer.pts] = self.capture_arrivals.pop(buffer.pts, None)
+            while len(self.encoder_arrivals) > 16:
+                self.encoder_arrivals.popitem(last=False)
         return Gst.PadProbeReturn.OK
 
     def capture_probe(self, pad, info):
@@ -938,13 +948,11 @@ class Host:
         data = buf.extract_dup(0, buf.get_size())
         keyframe = not buf.has_flags(Gst.BufferFlags.DELTA_UNIT)
         self.frames += 1
-        if self.native is not None:
-            self.native_encoded()
         seq = self.frames & 0xffffffff
         # Only aggregate timing metadata is retained, never screen data on disk.
         payload = b'\x01' + struct.pack('!I', seq) + data
         packet = struct.pack('!I', len(payload)) + payload
-        arrival = self.encoder_fifo.popleft() if self.encoder_fifo else None
+        arrival = self.encoder_arrivals.pop(buf.pts, None)
         self.aio.call_soon_threadsafe(self.distribute, packet, keyframe, seq, arrival)
         return Gst.FlowReturn.OK
 
@@ -1237,6 +1245,7 @@ class Host:
             'tablet_input_followon_rejected': self.input_followon_rejected,
             'client_resyncs': self.resyncs,
             'native_dropped': self.native_dropped if self.native is not None else None,
+            'native_pending': len(self.native_pushed) if self.native is not None else None,
             'native_seq_gaps': self.native_seq_gaps if self.native is not None else None,
             'native_convert_ms_p50': pct(sorted(self.native_ready_lag), 0.5) if self.native is not None else None,
             'tablet_input_mode': self.touch.mode if self.touch else None,
