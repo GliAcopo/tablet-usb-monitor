@@ -261,14 +261,25 @@ static VASurfaceID import_buffer(struct pw_buffer *pwb)
 
 static bool convert(VASurfaceID in, VASurfaceID out)
 {
+	/* Same colour contract as GStreamer's vapostproc on this stream: full
+	 * range sRGB in, limited range BT.709 NV12 out.  (The tablet colours
+	 * matched the GStreamer path only once the host also pinned
+	 * colorimetry=bt709 on the ring's caps; without it the host-side copy
+	 * treated the NV12 as something else and bright colours clipped.) */
 	VAProcPipelineParameterBuffer p = {
 		.surface = in,
-		.surface_color_standard = VAProcColorStandardSRGB,
-		.output_color_standard = VAProcColorStandardBT709,
+		.surface_color_standard = VAProcColorStandardExplicit,
+		.output_color_standard = VAProcColorStandardExplicit,
 		.output_background_color = 0xff000000,
 		.filter_flags = VA_FRAME_PICTURE,
 	};
+	p.input_color_properties.colour_primaries = 1;          /* BT.709 */
+	p.input_color_properties.transfer_characteristics = 13; /* sRGB */
+	p.input_color_properties.matrix_coefficients = 0;       /* identity (RGB) */
 	p.input_color_properties.color_range = VA_SOURCE_RANGE_FULL;
+	p.output_color_properties.colour_primaries = 1;
+	p.output_color_properties.transfer_characteristics = 1;
+	p.output_color_properties.matrix_coefficients = 1;      /* BT.709 */
 	p.output_color_properties.color_range = VA_SOURCE_RANGE_REDUCED;
 	VABufferID buf;
 	if (vaCreateBuffer(S.dpy, S.context_id, VAProcPipelineParameterBufferType, sizeof p, 1, &p, &buf)

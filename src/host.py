@@ -645,7 +645,8 @@ class Host:
         else:
             rc = f'rate-control={self.args.rate_control} bitrate={self.args.bitrate}'
         caps = (f'video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format={ring.drm_format},'
-                f'width={width},height={height},framerate=0/1,max-framerate={self.args.fps}/1')
+                f'width={width},height={height},framerate=0/1,max-framerate={self.args.fps}/1,'
+                'colorimetry=bt709')
         description = (
             f'appsrc name=capture is-live=true format=time do-timestamp=true block=true max-buffers=2 '
             f'caps="{caps}" '
@@ -653,7 +654,7 @@ class Host:
             # it into its own VAMemory pool, exactly the boundary the encoder
             # already handles; feeding the encoder our DMA-BUFs directly made it
             # re-import every frame and fail on its reconstruct pool.
-            '! vapostproc ! video/x-raw(memory:VAMemory),format=NV12 '
+            '! vapostproc ! video/x-raw(memory:VAMemory),format=NV12,colorimetry=bt709 '
             f'! vah265enc name=encoder {rc} '
             f'key-int-max={self.args.fps} b-frames=0 ref-frames=1 target-usage=7 '
             '! video/x-h265,profile=main '
