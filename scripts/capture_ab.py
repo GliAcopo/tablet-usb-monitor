@@ -168,8 +168,17 @@ def measure(mode, seconds, extra, env=()):
         'capture_interval_ms_p90': median([r.get('capture_interval_ms_p90') for r in window]),
         'capture_interval_ms_max': max((r.get('capture_interval_ms_max') for r in window
                                         if isinstance(r.get('capture_interval_ms_max'), (int, float))), default=None),
+        'capture_interval_ms_p95': max((r.get('capture_interval_ms_p95') for r in window
+                                        if isinstance(r.get('capture_interval_ms_p95'), (int, float))), default=None),
+        'capture_stalls_over_100ms': sum(r.get('capture_stalls_over_100ms') or 0 for r in window),
         'capture_pts_interval_ms_p50': median([r.get('capture_pts_interval_ms_p50') for r in window]),
         'encode_to_render_ms_p50': median([r.get('encode_to_render_ms_p50') for r in window]),
+        'capture_to_ack_ms_p50': median([r.get('capture_to_ack_ms_p50') for r in window]),
+        'capture_to_ack_ms_p95': max((r.get('capture_to_ack_ms_p95') for r in window
+                                      if isinstance(r.get('capture_to_ack_ms_p95'), (int, float))), default=None),
+        'capture_to_ack_over_100ms': sum(r.get('capture_to_ack_over_100ms') or 0 for r in window),
+        'ack_interval_ms_p95': max((r.get('ack_interval_ms_p95') for r in window
+                                    if isinstance(r.get('ack_interval_ms_p95'), (int, float))), default=None),
         'tablet_decoder_fps': median([r.get('tablet', {}).get('decoder_fps') for r in window]),
         'input_rejected_delta': max((r.get('tablet_input_rejected', 0) for r in window), default=0) -
                                 min((r.get('tablet_input_rejected', 0) for r in window), default=0),

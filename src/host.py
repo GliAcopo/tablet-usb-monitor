@@ -200,7 +200,8 @@ def compute_virtual_position(current_outputs, previous_names):
     return (max(0, right_edge), 0)
 
 
-RESYNC = object()  # queue marker: the client must wait for the next keyframe
+RESYNC = object()
+TRACE_CAPTURE = bool(os.environ.get('TABS9_TRACE_CAPTURE'))  # diagnostics: raw capture intervals  # queue marker: the client must wait for the next keyframe
 
 
 class Host:
@@ -234,11 +235,20 @@ class Host:
         self.panel_mismatch_reported = False
         self.sent = collections.OrderedDict()
         self.stats = collections.deque(maxlen=1200)
+        # Capture arrival carried to the ack: pts -> arrival at the capture
+        # probe, then (the encoder never drops or reorders) a FIFO of arrivals
+        # for the frames that entered the encoder.
+        self.capture_arrivals = collections.OrderedDict()
+        self.encoder_fifo = collections.deque()
+        self.capture_to_ack = collections.deque(maxlen=1200)
+        self.ack_intervals = collections.deque(maxlen=1200)
+        self.ack_wall = None
         self.frames = 0
         self.capture_frames = 0
         self.capture_pts = None
         self.capture_wall = None
         self.capture_intervals = collections.deque(maxlen=1200)
+        self.capture_trace = []
         self.capture_pts_intervals = collections.deque(maxlen=1200)
         self.capture_caps = None
         self.rendered = 0
@@ -461,7 +471,8 @@ class Host:
         # more than one of them in the queue, or KWin has nothing to render into
         # at 120 Hz and drops frames.
         description = (
-            f'pipewiresrc name=capture fd={self.fd} path={self.capture_node} do-timestamp=true keepalive-time=1000 '
+            f'pipewiresrc name=capture fd={self.fd} path={self.capture_node} do-timestamp=true '
+            f'keepalive-time={os.environ.get("TABS9_KEEPALIVE_MS", "1000")} '
             + os.environ.get('TABS9_PWSRC_EXTRA', '') +
             'min-buffers=4 max-buffers=4 '
             '! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream '
@@ -484,6 +495,9 @@ class Host:
             self.pipeline = Gst.parse_launch(description)
             self.pipeline.get_by_name('capture').get_static_pad('src').add_probe(
                 Gst.PadProbeType.BUFFER, self.capture_probe)
+            encoder_element = self.pipeline.get_by_name('encoder')
+            if encoder_element is not None:
+                encoder_element.get_static_pad('sink').add_probe(Gst.PadProbeType.BUFFER, self.encoder_in_probe)
             encoded = self.pipeline.get_by_name('encoded')
             if encoded is not None:
                 encoded.connect('new-sample', self.sample)
@@ -620,6 +634,14 @@ class Host:
             pad.add_probe(Gst.PadProbeType.BUFFER, mark(name) if previous is None
                           else since(name, previous, fifo=(name == 'encode')))
 
+    def encoder_in_probe(self, pad, info):
+        buffer = info.get_buffer()
+        if buffer is not None:
+            self.encoder_fifo.append(self.capture_arrivals.pop(buffer.pts, None))
+            while len(self.encoder_fifo) > 16:
+                self.encoder_fifo.popleft()
+        return Gst.PadProbeReturn.OK
+
     def capture_probe(self, pad, info):
         buffer = info.get_buffer()
         if buffer is not None:
@@ -627,7 +649,15 @@ class Host:
             self.capture_frames += 1
             if self.capture_wall is not None:
                 self.capture_intervals.append((now - self.capture_wall) * 1000)
+                if TRACE_CAPTURE:
+                    self.capture_trace.append(round((now - self.capture_wall) * 1000, 1))
+                    if len(self.capture_trace) >= 120:
+                        print('TRACE capture intervals:', ' '.join(map(str, self.capture_trace)), flush=True)
+                        self.capture_trace.clear()
             self.capture_wall = now
+            self.capture_arrivals[buffer.pts] = now
+            while len(self.capture_arrivals) > 16:
+                self.capture_arrivals.popitem(last=False)
             if buffer.pts != Gst.CLOCK_TIME_NONE:
                 if self.capture_pts is not None and buffer.pts > self.capture_pts:
                     self.capture_pts_intervals.append((buffer.pts - self.capture_pts) / 1000000)
@@ -764,7 +794,8 @@ class Host:
         # Only aggregate timing metadata is retained, never screen data on disk.
         payload = b'\x01' + struct.pack('!I', seq) + data
         packet = struct.pack('!I', len(payload)) + payload
-        self.aio.call_soon_threadsafe(self.distribute, packet, keyframe, seq)
+        arrival = self.encoder_fifo.popleft() if self.encoder_fifo else None
+        self.aio.call_soon_threadsafe(self.distribute, packet, keyframe, seq, arrival)
         return Gst.FlowReturn.OK
 
     def request_keyframe(self):
@@ -781,8 +812,8 @@ class Host:
             encoder.send_event(Gst.Event.new_custom(Gst.EventType.CUSTOM_UPSTREAM, structure))
         return False
 
-    def distribute(self, packet, keyframe, seq):
-        self.sent[seq] = time.monotonic()
+    def distribute(self, packet, keyframe, seq, arrival=None):
+        self.sent[seq] = (time.monotonic(), arrival)
         while len(self.sent) > 1200:
             self.sent.popitem(last=False)
         for queue in tuple(self.clients):
@@ -856,8 +887,15 @@ class Host:
                 msg = json.loads(raw)
                 if msg.get('type') == 'rendered':
                     self.rendered += 1
+                    now = time.monotonic()
+                    if self.ack_wall is not None:
+                        self.ack_intervals.append((now - self.ack_wall) * 1000)
+                    self.ack_wall = now
                     sent = self.sent.get(int(msg['seq']))
-                    if sent is not None: self.stats.append((time.monotonic() - sent) * 1000)
+                    if sent is not None:
+                        self.stats.append((now - sent[0]) * 1000)
+                        if sent[1] is not None:
+                            self.capture_to_ack.append((now - sent[1]) * 1000)
                 elif msg.get('type') == 'config':
                     GLib.idle_add(self.apply_settings, msg, generation)
                 elif msg.get('type') == 'stats':
@@ -991,6 +1029,13 @@ class Host:
 
     def report(self):
         stats = sorted(self.stats)
+        self.stats.clear()
+        acks = sorted(self.ack_intervals)
+        self.ack_intervals.clear()
+        c2a = sorted(self.capture_to_ack)
+        self.capture_to_ack.clear()
+        def pct(values, q):
+            return round(values[min(len(values) - 1, int(len(values) * q))], 1) if values else None
         now = time.monotonic()
         before, frames, rendered, captured = self.last_report
         elapsed = now - before
@@ -1020,9 +1065,21 @@ class Host:
             'tablet': self.tablet_stats,
             'capture_interval_ms_p50': round(arrivals[len(arrivals)//2], 2) if arrivals else None,
             'capture_interval_ms_p90': round(arrivals[int(len(arrivals)*0.9)], 2) if arrivals else None,
+            'capture_interval_ms_p95': pct(arrivals, 0.95),
             'capture_interval_ms_max': round(arrivals[-1], 1) if arrivals else None,
+            'capture_stalls_over_100ms': sum(1 for v in arrivals if v > 100),
             'capture_pts_interval_ms_p50': round(timestamps[len(timestamps)//2], 2) if timestamps else None,
-            'encode_to_render_ms_p50': round(stats[len(stats)//2], 1) if stats else None}), flush=True)
+            'encode_to_render_ms_p50': round(stats[len(stats)//2], 1) if stats else None,
+            # Host-side software measurement including the return path; not pixel latency.
+            'capture_to_ack_ms_p50': pct(c2a, 0.5),
+            'capture_to_ack_ms_p95': pct(c2a, 0.95),
+            'capture_to_ack_ms_max': pct(c2a, 1.0),
+            'capture_to_ack_over_100ms': sum(1 for v in c2a if v > 100),
+            # Interval between render acknowledgements as seen on the host (a
+            # proxy until the tablet reports its own render timestamps).
+            'ack_interval_ms_p50': pct(acks, 0.5),
+            'ack_interval_ms_p95': pct(acks, 0.95),
+            'ack_interval_ms_max': pct(acks, 1.0)}), flush=True)
         return True
 
     def run(self):
