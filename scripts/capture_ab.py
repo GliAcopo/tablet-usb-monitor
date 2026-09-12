@@ -21,6 +21,7 @@ journal, plus the service's CPU accounting.  No screen content is touched.
 import argparse
 import fcntl
 import json
+import os
 from pathlib import Path
 import statistics
 import subprocess
@@ -32,7 +33,7 @@ LOCK = ROOT / '.local/state/host.lock'
 UNIT = 'tab-s9-usb-display.service'
 # Telemetry arrives every five seconds; discard the first window of each run.
 # A cold encoder run has measured almost twice the per-frame cost of a warm one.
-WARMUP_SECONDS = 6.0
+WARMUP_SECONDS = 10.0
 
 
 def unit_active():
@@ -140,8 +141,11 @@ def measure(mode, seconds, extra, env=()):
         print('Note: the GL path fell back to system memory.', flush=True)
     fallback = bool(wait_for(started, 'falling back to the system-memory', 1))
 
+    # Native Wayland: through XWayland the pattern paints at 60 but KWin
+    # records ~56 unique frames per second on the virtual output.
     motion = subprocess.Popen([sys.executable, str(ROOT / 'scripts/gpu-motion-test.py'),
-                               '--seconds', str(seconds + WARMUP_SECONDS + 2)])
+                               '--seconds', str(seconds + WARMUP_SECONDS + 2)],
+                              env={**os.environ, 'QT_QPA_PLATFORM': 'wayland'})
     time.sleep(WARMUP_SECONDS)
     window_start = time.time()
     time.sleep(seconds)
