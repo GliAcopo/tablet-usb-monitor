@@ -258,7 +258,8 @@ class Host:
         # probe, then (the encoder never drops or reorders) a FIFO of arrivals
         # for the frames that entered the encoder.
         self.capture_arrivals = collections.OrderedDict()
-        self.encoder_arrivals = collections.OrderedDict()   # encoder-input pts -> capture arrival
+        self.encoder_fifo = collections.deque()             # capture arrivals in encoder order
+        self.encoded_arrivals = collections.OrderedDict()   # encoded pts -> capture arrival
         self.capture_to_ack = collections.deque(maxlen=1200)
         self.ack_intervals = collections.deque(maxlen=1200)
         self.ack_wall = None
@@ -524,6 +525,7 @@ class Host:
                 encoder_element.get_static_pad('sink').add_probe(Gst.PadProbeType.BUFFER, self.encoder_in_probe)
             encoded = self.pipeline.get_by_name('encoded')
             if encoded is not None:
+                encoded.get_static_pad('sink').add_probe(Gst.PadProbeType.BUFFER, self.encoded_probe)
                 encoded.connect('new-sample', self.sample)
             self.force_live_encoder()
             if os.environ.get('TABS9_STAGE_PROBES'):
@@ -673,7 +675,7 @@ class Host:
             self.pipeline.get_by_name('encoder').get_static_pad('sink').add_probe(
                 Gst.PadProbeType.BUFFER, self.encoder_in_probe)
             self.pipeline.get_by_name('encoded').get_static_pad('sink').add_probe(
-                Gst.PadProbeType.BUFFER, self.native_encoded)
+                Gst.PadProbeType.BUFFER, self.encoded_probe)
             self.pipeline.get_by_name('encoded').connect('new-sample', self.sample)
             if os.environ.get('TABS9_STAGE_PROBES'):
                 self.install_stage_probes()
@@ -721,16 +723,24 @@ class Host:
             self.native_pushed.remove(frame.slot)
             self.native.release(frame.slot)
 
-    def native_encoded(self, pad, info):
-        """Every encoded frame (probe on the appsink's pad, so a sample the
-        appsink drops still returns its slot): the slot before this one is
-        certainly free."""
-        if self.native is None or not self.native_pushed:
+    def encoded_probe(self, pad, info):
+        """Every encoded frame, before the appsink may drop it (drop=true).
+
+        Pairs the frame with its capture arrival by output pts (the appsink
+        pulls by pts, so a dropped sample cannot shift later pairings), and
+        on the native path returns the ring slot before this one, which the
+        encoder has certainly finished with."""
+        buffer = info.get_buffer()
+        if buffer is None:
             return Gst.PadProbeReturn.OK
-        slot = self.native_pushed.popleft()
-        if self.native_last_encoded is not None:
-            self.native.release(self.native_last_encoded)
-        self.native_last_encoded = slot
+        self.encoded_arrivals[buffer.pts] = self.encoder_fifo.popleft() if self.encoder_fifo else None
+        while len(self.encoded_arrivals) > 16:
+            self.encoded_arrivals.popitem(last=False)
+        if self.native is not None and self.native_pushed:
+            slot = self.native_pushed.popleft()
+            if self.native_last_encoded is not None:
+                self.native.release(self.native_last_encoded)
+            self.native_last_encoded = slot
         return Gst.PadProbeReturn.OK
 
     def native_exit(self, code):
@@ -787,12 +797,12 @@ class Host:
     def encoder_in_probe(self, pad, info):
         buffer = info.get_buffer()
         if buffer is not None:
-            # Keyed by pts (which the encoder preserves), not a FIFO: the
-            # appsink may drop a sample, and a FIFO would then pair every
-            # later frame with the arrival of the one before it.
-            self.encoder_arrivals[buffer.pts] = self.capture_arrivals.pop(buffer.pts, None)
-            while len(self.encoder_arrivals) > 16:
-                self.encoder_arrivals.popitem(last=False)
+            # Order is enough between here and the appsink pad (b-frames=0,
+            # nothing drops); encoded_probe re-keys by output pts because the
+            # encoder re-bases timestamps and the appsink may drop samples.
+            self.encoder_fifo.append(self.capture_arrivals.pop(buffer.pts, None))
+            while len(self.encoder_fifo) > 16:
+                self.encoder_fifo.popleft()
         return Gst.PadProbeReturn.OK
 
     def capture_probe(self, pad, info):
@@ -952,7 +962,7 @@ class Host:
         # Only aggregate timing metadata is retained, never screen data on disk.
         payload = b'\x01' + struct.pack('!I', seq) + data
         packet = struct.pack('!I', len(payload)) + payload
-        arrival = self.encoder_arrivals.pop(buf.pts, None)
+        arrival = self.encoded_arrivals.pop(buf.pts, None)
         self.aio.call_soon_threadsafe(self.distribute, packet, keyframe, seq, arrival)
         return Gst.FlowReturn.OK
 
