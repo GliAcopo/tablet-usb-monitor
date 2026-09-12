@@ -1,34 +1,45 @@
 # Tab S9 Ultra as a wired Linux monitor
 
 A local Linux host and Android client for a **real extended desktop over USB**.
-The host creates a KDE virtual monitor, captures it through PipeWire, compresses
-video with NVIDIA's hardware HEVC encoder, and sends it through authenticated
-loopback sockets forwarded by ADB. Wi-Fi and USB tethering are not used.
+The host creates a KDE virtual monitor, captures it through PipeWire as a
+DMA-BUF, converts and compresses it on the same Intel GPU with VA-API HEVC
+(zero copies, no readback), and sends it through authenticated loopback
+sockets forwarded by ADB. Touch comes back through KDE's RemoteDesktop portal
+and is injected with libei. Wi-Fi and USB tethering are not used.
 
 Target: Galaxy Tab S9 Ultra, 2960 × 1848 at 120 Hz. Development machine:
 Ubuntu 26.04, KDE Plasma 6.6.6 Wayland, NVIDIA RTX 4050 Laptop GPU.
 
-## Current verification
+## Current verification (live, 2026-09-12)
+
+All of the following were measured on the device with the synthetic OpenGL
+motion pattern on the virtual output (`scripts/gpu-motion-test.py`); nothing
+private was captured.
 
 - USB debugging authorized, wired link negotiated at 5 Gbit/s.
-- Separate extended output, native 2960 × 1848, 120 Hz mode, scale 1.5.
-- Actual HEVC stream dimensions verified as 2960 × 1848.
-- The zero-readback capture path works: `--capture-memory gl` negotiated
-  `video/x-raw(memory:DMABuf)` from KWin at native size and encoded it without
-  falling back to system memory. See [docs/performance.md](docs/performance.md).
-- Host → tablet settings sync verified: started with `--bitrate 40000`, the
-  client logged `Host stream: hevc 2960x1848 @ 120 fps, 40000 kbps` and
-  configured its decoder from that, not from its own preferences.
-- Tablet → host input transport verified over USB: injected taps and swipes
-  reached the host's control socket as well-formed touch messages.
-- **Sustained frame rate is still unmeasured.** Early end-to-end runs delivered
-  roughly 60 frames/s, and a 120 Hz output mode is not proof of 120 fps
-  delivery. The remaining measurement needs continuous motion on the virtual
-  output; the numbers logged against an idle desktop only show how much the
-  desktop was changing.
-- Touch implementation uses KDE's RemoteDesktop portal; no kernel input
-  permissions or global input injection service is required. Host-side
-  injection into the virtual output has not yet been confirmed on the device.
+- Separate extended output, native 2960 × 1848, 120 Hz mode, scale 1.5,
+  placed to the right of the laptop panel.
+- **Visible pixels confirmed**: a tablet screenshot shows the synthetic pattern
+  rendered on the virtual output at 2960 × 1848.
+- **Frame rate, default `--capture-memory va`**: KWin presents the virtual
+  output at 117–120 fps and stamps screencast frames 8.33 ms apart; the host
+  captures, encodes and the tablet decodes and acknowledges **~110 fps**
+  sustained, encode-to-render p50 ≈ 11 ms. Host CPU 20–40 % of one core,
+  NVIDIA GPU idle.
+- For comparison on the same run type: `system` (CPU readback → NVENC)
+  reached 30–36 fps and stalled the compositor itself to ~80 fps;
+  `gl` (cross-GPU DMA-BUF import → NVENC) 13 fps. The encoder was never the
+  limit; moving the frame off the Intel GPU was. See
+  [docs/performance.md](docs/performance.md).
+- **Touch confirmed end-to-end**: taps on the tablet arrive as native Wayland
+  touch events in a window on the virtual output (multitouch slots, correct
+  position). This needed libei — see "Touch" below for why the portal's own
+  touch calls cannot work on KDE 6.6.
+- Consent: the "Share virtual screen" dialog prompts on every start; the
+  capture/input dialog is **skipped after the first approval** via the stored
+  restore token (verified live: the second session is restored in ~100 ms).
+- Host → tablet settings sync and tablet → host input transport verified as
+  before.
 - Pen-only mode (tablet as a graphics tablet for the laptop's own screen) is
   not implemented; the host tells the client so rather than ignoring it.
 
@@ -77,42 +88,105 @@ cannot work. `doctor` deliberately does not print device serial numbers.
 ./tabs9 stop
 ```
 
+`./tabs9 start` is **supervised**: it waits (up to 60 seconds) for the host to
+reach a terminal state (streaming, failed, or stopped) or a consent-needed
+phase, instead of printing "started" the moment `systemd-run` succeeds. It
+prints precise instructions about the two consent dialogs.
+
 KDE requires two portal sessions in this implementation:
 
-1. Choose **Share virtual screen** to create the output. The host arranges it to
-   the **left** of the laptop, at the tablet's native resolution.
-2. Select the **existing Virtual Output** in the subsequent sharing/control
-   dialog. Approve input control for touchscreen support. Do not select the
-   laptop screen.
+1. **"Share virtual screen"** creates the output. The host places it to the
+   right of all existing physical monitors, using non-negative logical
+   coordinates derived from the current desktop layout.
+2. A RemoteDesktop + ScreenCast session captures it and grants input. On KDE
+   this dialog has **no screen chooser** — it only asks to approve "see what's
+   on the screen" and "control input devices". `xdg-desktop-portal-kde`'s
+   RemoteDesktop portal never shows one: with `multiple=false` and more than
+   one screen it streams the *whole workspace*, with `multiple=true` it
+   streams one PipeWire node per screen. The host therefore asks for all
+   screens and selects the node whose geometry is the virtual output; the
+   laptop's node is never consumed (KWin does not render into an unconnected
+   stream).
 
-The first portal session keeps the output alive. The second captures its
-independent logical desktop and authorizes touch. There is only one video
-encoder and one transmitted video stream. This sequence avoids KDE binding the
-capture to the laptop while the new virtual output initially mirrors it.
+The first session keeps the output alive. The second captures its independent
+logical desktop and authorizes touch. There is only one video encoder and one
+transmitted video stream.
+
+### Touch: why libei and not the portal's NotifyTouch calls
+
+`xdg-desktop-portal-kde` 6.6.6 forwards `NotifyTouchDown/Motion/Up` to KWin's
+fake-input protocol but never sends `touch_frame`; Wayland clients (Qt, GTK,
+Chromium) only dispatch touch on a frame, so those touches reach no window.
+It also ignores the `stream` argument and injects the coordinates as
+workspace-global, while `xdg-desktop-portal` validates them stream-relative,
+so they can only ever land on whichever output sits at the origin. Both were
+reproduced live. The host instead calls `RemoteDesktop.ConnectToEIS` on the
+same consented session and drives KWin's EIS backend through libei
+(`src/eis_touch.py`, ctypes, no extra permissions): KWin exposes one absolute
+device with a region per output, and every contact is framed. Pen input
+still uses the portal's pointer calls, which KDE maps correctly.
+
+### Portal token persistence (one-time consent for capture)
+
+The capture/RemoteDesktop session requests `persist_mode=2`. Per the XDG
+RemoteDesktop spec, if the portal's **"Allow restoring on future sessions"**
+checkbox is checked, the portal should return a `restore_token` that the host
+stores in `.local/state/portal_tokens.json` (gitignored, 0600 permissions,
+atomic writes), and present on subsequent starts to `SelectDevices`. This
+round trip is **confirmed live** on KDE 6.6.6: the checkbox is on by default,
+the token is returned and stored, and the next start restores the session
+without a dialog. If a
+stored token is stale or rejected by the portal, it is discarded and the host
+retries once with interactive consent — no silent retry loop (this recovery
+path is unit-tested).
+
+The first dialog, "Share virtual screen" (virtual-output creation), never
+requests `persist_mode`: KDE 6.6.6 does not implement persistence for that
+session type, so asking would only promise a skipped dialog this backend
+cannot deliver. Because no persistence is ever requested for it, this dialog
+necessarily prompts on every start — that follows from the request the host
+sends, not from an additional live measurement.
+
+### Status reporting
+
+The host writes its current phase to `.local/state/host.status.json` (atomic,
+0600):
+
+| Phase | Meaning |
+|---|---|
+| `starting` | Host process initializing |
+| `waiting_virtual_consent` | First portal dialog is open |
+| `configuring_output` | Virtual output appeared, configuring |
+| `waiting_capture_consent` | Second portal dialog is open |
+| `streaming` | Encoder pipeline is running |
+| `failed` | Unrecoverable error (message included) |
+| `stopped` | Clean shutdown |
+
+`./tabs9 status` shows the current phase. The status file never contains
+desktop content, tokens, or device identifiers.
 
 The service runs only on request. Stopping it closes both portal sessions,
 removes the virtual output, and removes the two ADB reverse mappings it created.
 The laptop panel remains enabled. Windows on the removed output are managed by
 KDE's normal display-disconnection behavior.
 
-Both dialogs must be answered by hand on every start: the portal consent prompt
-is what authorizes screen capture and input control, and this project
-deliberately ships no tool to click it automatically. Until one of those dialogs
-is answered there is no picture, but the control socket is already up, so
-`./tabs9 logs` still reports whether the tablet is connected and its touches are
-arriving.
-
 For a lighter profile, start with `--fps 60 --bitrate 30000`. Bitrate is in
 kbit/s. Lowering bitrate primarily reduces USB traffic; lowering the frame rate
 reduces rendering and encoding work. The application reports the host's applied
 settings and measured delivery separately.
 
-`--capture-memory gl` keeps captured frames on the GPU
-(`KWin DMA-BUF → glupload → GLMemory → nvh265enc`) instead of routing them
-through system memory, and falls back to the system-memory pipeline by itself if
-that negotiation fails. It is not yet the default: it is confirmed to negotiate
-and encode correctly on this machine, but its effect on sustained frame rate has
-not been measured against continuous motion.
+`--capture-memory` selects the capture/encode route:
+
+- `va` (default): `KWin DMA-BUF → vapostproc → vah265enc` on the Intel GPU.
+  Zero copies; the frame never leaves the GPU that composited it. Falls back
+  to `system` by itself if the VA negotiation fails. Two details matter for
+  cadence: KWin offers only 2–4 PipeWire buffers, so the host negotiates 4 and
+  queues at most one ahead of the converter, and colour conversion and
+  encoding are decoupled by a queue so they overlap.
+- `system`: CPU readback (`BGRx`) → `nvh265enc`. Reference path; ~30–36 fps at
+  native size because KWin's synchronous readback is the ceiling.
+- `gl`: DMA-BUF imported by NVIDIA EGL → `nvh265enc`. Negotiates and encodes,
+  but the cross-GPU import stalls (~13 fps); kept for diagnosis only.
 
 ## Verification and privacy
 
@@ -122,10 +196,12 @@ python3 -m unittest discover -s tests -v
 ./tabs9 bench-capture --seconds 30
 ```
 
-`bench-capture` measures both capture paths against continuous motion and prints
-capture, encode and tablet-acknowledgement rates side by side. It prompts for the
-two consent dialogs per path and does the rest itself; that comparison is the one
-remaining answer needed about sustained frame rate.
+`bench-capture` measures the capture paths (`--modes va system gl`) against
+continuous motion and prints capture, encode and tablet-acknowledgement rates
+side by side. It prompts for the consent dialog per path and does the rest
+itself. Note it drives the *raster* Qt pattern, which itself repaints at most
+~30–40 fps; use `python3 scripts/gpu-motion-test.py --seconds 20` with the host
+already running for the OpenGL source that reaches 120.
 
 The motion test displays a synthetic moving pattern on the virtual output and
 reports how many injected touches arrived as native input. Logs contain counts, frame dimensions, timing and negotiated

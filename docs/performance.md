@@ -182,31 +182,37 @@ This closes the "capability evidence rather than proof" caveat: the route
 `KWin DMA-BUF -> pipewiresrc -> glupload -> GLMemory -> nvh265enc` is live on
 an Intel-composited session with an RTX 4050 encoder.
 
-### Still open: the frame-rate A/B
+### Settled: the frame-rate comparison (live, 2026-09-12)
 
-The cadence comparison between `--capture-memory system` and
-`--capture-memory gl` is **not** settled.  The figures logged so far were taken
-against an ordinary idle desktop, where KWin only produces a screencast frame
-when something is damaged; they ranged from 9 to 40 fps and measure how much the
-desktop happened to be changing, not any capacity limit.  Encoded fps tracked
-capture fps exactly in every window, and `tablet_ack_fps` tracked both, so
-nothing downstream of the capture was throttling.
+Measured with the host streaming and `scripts/gpu-motion-test.py` (OpenGL,
+repaints on every frame callback) on the virtual output, 20 s windows, same
+content. `swap_fps` is what the compositor presented; the host columns are
+its 5 s telemetry; `pts p50` is the spacing of KWin's own frame timestamps.
 
-A valid comparison needs, for each memory mode:
+| mode | compositor swap fps | KWin pts p50 | capture / encoded / tablet ack fps | encode→render p50 | notes |
+|------|--------------------:|-------------:|-----------------------------------:|------------------:|-------|
+| `system` (readback → NVENC) | 80–87 | 25 ms | 35 / 35 / 35 | 15.6 ms | KWin's synchronous `glReadPixels` per frame is the ceiling and slows the compositor itself |
+| `gl` (DMA-BUF → NVIDIA EGL → NVENC) | — | 66.7 ms | 13.4 / 13.4 / 13.4 | 16.2 ms | cross-GPU import stalls; CPU low because it is waiting |
+| `va`, 3 buffers, queue of 2 | 119.5 | 8.33 ms | 57 / 57 / 57 | 12.3 ms | KWin produces 120; consumer holds too many of the 3 buffers |
+| `va`, 4 buffers, queue of 1, conversion‖encode | 117–120 | 8.33 ms | **110 / 110 / 110** | 11.2 ms | default now; NVIDIA idle, host 20–40 % of a core |
 
-1. `./tabs9 test-motion` running (continuous 8 ms repaints on the virtual
-   output), identical content and duration in both runs;
-2. the first five seconds discarded — one cold BGRx run above took 2.95 s for
-   120 frames against 1.60 s for 240 warm ones;
-3. `capture_fps` plus `capture_pts_interval_ms_p50` as the discriminator, and
-   systemd's `Consumed Xs CPU time` line for the cost side.
+Isolated Intel numbers on this Core Ultra 7 155H (Arc iGPU), 2960×1848,
+300 frames including `videotestsrc` cost: `vapostproc` BGRA→NV12 2.45 s,
+`vapostproc → vah265enc` 4.51 s (target-usage 4 and 7 identical) — the
+encoder is roughly 7 ms/frame, conversion 3–4 ms, which is why overlapping
+them mattered. The earlier "9 fps" Intel VA figure in this file measured a
+software-fed path and is not representative of the hardware.
 
-Expected readings and what each would mean:
+Take-aways:
 
-| Reading | Conclusion |
-|---|---|
-| both modes about 60 | KWin's screencast scheduling is the ceiling; the GL path still wins on CPU and latency, but not on fps |
-| `gl` above 60, `system` about 60 | the CPU readback/upload was the limit and the GL path is the fix |
+- The encoder was never the limit; moving 22 MB frames off the Intel GPU was.
+  Encoding where the frame already lives beats a faster encoder elsewhere.
+- KWin's screencast offers `SPA_PARAM_BUFFERS_buffers` in the range 2–4. Any
+  element that parks a buffer costs a frame at 8 ms cadence; negotiate 4 and
+  keep the leaky queue at 1.
+- The raster Qt motion test (`motion-test.py`) repaints at ~30–40 fps at
+  this size and cannot exercise 120; use the OpenGL source for cadence.
 
-That measurement requires a granted portal session (see below), so it is left
-for the first supervised run.
+The remaining ~10 fps gap to 120 has not been chased; the tablet decoder
+already reports 111 fps and the compositor 117–120, so it is a small,
+distributed cost rather than one stall.

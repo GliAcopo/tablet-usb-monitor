@@ -136,7 +136,7 @@ def measure(mode, seconds, extra):
         stop_host()
         return None
     actual = wait_for(started, 'Memory path:', 5) or ''
-    if mode == 'gl' and 'gl' not in actual.split('Memory path:')[-1]:
+    if mode != 'system' and mode not in actual.split('Memory path:')[-1]:
         print('Note: the GL path fell back to system memory.', flush=True)
     fallback = bool(wait_for(started, 'falling back to the system-memory', 1))
 
@@ -176,8 +176,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--seconds', type=float, default=30.0,
                         help='measured window per capture path, after warm-up')
-    parser.add_argument('--modes', nargs='+', default=['system', 'gl'],
-                        choices=['system', 'gl'])
+    parser.add_argument('--modes', nargs='+', default=['va', 'system'],
+                        choices=['system', 'gl', 'va'])
     parser.add_argument('rest', nargs='*', metavar='-- HOST ARGS',
                         help='extra host arguments; the -- separator is required, '
                              'e.g. bench-capture --seconds 30 -- --fps 60')
