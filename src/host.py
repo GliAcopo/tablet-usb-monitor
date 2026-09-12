@@ -462,6 +462,7 @@ class Host:
         # at 120 Hz and drops frames.
         description = (
             f'pipewiresrc name=capture fd={self.fd} path={self.capture_node} do-timestamp=true keepalive-time=1000 '
+            + os.environ.get('TABS9_PWSRC_EXTRA', '') +
             'min-buffers=4 max-buffers=4 '
             '! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream '
             + os.environ.get('TABS9_CAPTURE_CAPS', '')
@@ -486,6 +487,7 @@ class Host:
             encoded = self.pipeline.get_by_name('encoded')
             if encoded is not None:
                 encoded.connect('new-sample', self.sample)
+            self.force_live_encoder()
             if os.environ.get('TABS9_STAGE_PROBES'):
                 self.install_stage_probes()
                 def latency_probe():
@@ -505,7 +507,7 @@ class Host:
             self.status.write('streaming')
             print('Capture authorized; starting encoder. Memory path:', self.memory_mode, flush=True)
         except Exception as error:
-            print('Encoder setup failed:', type(error).__name__, flush=True)
+            print('Encoder setup failed:', type(error).__name__, str(error)[:300], flush=True)
             self.fallback_or_stop()
         return False
 
@@ -534,34 +536,89 @@ class Host:
         print('GPU-memory import unavailable; falling back to the system-memory capture path.', flush=True)
         GLib.idle_add(self.start_pipeline)
 
+    def force_live_encoder(self):
+        """Make vah265enc take its low-latency path.
+
+        GstVaBaseEnc asks upstream for liveness once, in set_format, and only a
+        live answer selects preferred_output_delay=0 (finish each frame as soon
+        as its coded buffer is ready).  pipewiresrc 1.6 answers that query from
+        a field it only fills once the stream is STREAMING, and the caps event
+        that triggers set_format arrives during negotiation, before that: the
+        encoder is told "not live".  It then polls readiness only on the next
+        input, on the reconstruct surface that frame N+1 is still reading as a
+        reference, so every frame left the encoder two frame periods after it
+        entered (measured 33.8 ms at 60 Hz, 67.6 ms at 30 Hz, 17 ms at 120 Hz).
+
+        The probe answers the latency query on the encoder's sink peer as
+        live.  It edits the query through its raw pointer because a PyGObject
+        wrapper would hold a second reference and make the query read-only.
+        """
+        encoder = self.pipeline.get_by_name('encoder')
+        if encoder is None or os.environ.get('TABS9_NO_FORCE_LIVE'):
+            return
+        peer = encoder.get_static_pad('sink').get_peer()
+        if peer is None:
+            return
+        import ctypes
+        lib = ctypes.CDLL('libgstreamer-1.0.so.0')
+        lib.gst_query_set_latency.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64]
+        lib.gst_query_set_latency.restype = None
+        # GstQuery is {GstMiniObject (64 bytes on LP64); GstQueryType type;}.
+        type_offset = 64 if ctypes.sizeof(ctypes.c_void_p) == 8 else 36
+        latency = int(Gst.QueryType.LATENCY)
+        def probe(pad, info):
+            if ctypes.c_int.from_address(info.data + type_offset).value == latency:
+                lib.gst_query_set_latency(info.data, 1, 0, Gst.CLOCK_TIME_NONE)
+                return Gst.PadProbeReturn.HANDLED
+            return Gst.PadProbeReturn.OK
+        self._live_probe = probe   # keep the closure alive for the pad's lifetime
+        peer.add_probe(Gst.PadProbeType.QUERY_UPSTREAM, probe)
+
     def install_stage_probes(self):
         """Diagnostics only: per-stage dwell time (ms) from in-process pad probes."""
-        self.stage_marks = {}
+        # Marks are keyed by PTS: a FIFO pairing drifts by one frame for every
+        # buffer a leaky queue drops between two probes and then reports a
+        # whole frame period as "dwell" forever.
+        self.stage_marks = collections.defaultdict(dict)
         self.stage_times = collections.defaultdict(lambda: collections.deque(maxlen=600))
+        def remember(name, pts, now):
+            marks = self.stage_marks[name]
+            marks[pts] = now
+            if len(marks) > 64:
+                for old in sorted(marks)[:32]:
+                    del marks[old]
         def mark(name):
             def probe(pad, info):
-                self.stage_marks.setdefault(name, collections.deque()).append(time.monotonic())
+                buffer = info.get_buffer()
+                if buffer is not None:
+                    remember(name, buffer.pts, time.monotonic())
                 return Gst.PadProbeReturn.OK
             return probe
-        def since(name, previous):
+        def since(name, previous, fifo=False):
+            # fifo: the encoder rewrites timestamps but never drops, so its
+            # output pairs with the oldest pending input mark.
             def probe(pad, info):
+                buffer = info.get_buffer()
+                if buffer is None:
+                    return Gst.PadProbeReturn.OK
                 now = time.monotonic()
-                starts = self.stage_marks.get(previous)
-                if starts:
-                    self.stage_times[name].append((now - starts.popleft()) * 1000)
-                    if len(starts) > 8:
-                        starts.clear()  # a drop broke the pairing; resync
-                self.stage_marks.setdefault(name, collections.deque()).append(now)
+                marks = self.stage_marks[previous]
+                start = marks.pop(min(marks), None) if fifo and marks else marks.pop(buffer.pts, None)
+                if start is not None:
+                    self.stage_times[name].append((now - start) * 1000)
+                remember(name, buffer.pts, now)
                 return Gst.PadProbeReturn.OK
             return probe
         stages = [('capture', 'capture', 'src', None), ('queue', 'vapostproc0', 'sink', 'capture'),
-                  ('convert', 'vapostproc0', 'src', 'queue'), ('encode', 'encoder', 'src', 'convert')]
+                  ('convert', 'vapostproc0', 'src', 'queue'), ('encqueue', 'encoder', 'sink', 'convert'),
+                  ('encode', 'encoder', 'src', 'encqueue')]
         for name, element, padname, previous in stages:
             el = self.pipeline.get_by_name(element)
             if el is None:
                 continue
             pad = el.get_static_pad(padname)
-            pad.add_probe(Gst.PadProbeType.BUFFER, mark(name) if previous is None else since(name, previous))
+            pad.add_probe(Gst.PadProbeType.BUFFER, mark(name) if previous is None
+                          else since(name, previous, fifo=(name == 'encode')))
 
     def capture_probe(self, pad, info):
         buffer = info.get_buffer()

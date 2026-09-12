@@ -39,10 +39,11 @@ def unit_active():
     return subprocess.run(['systemctl', '--user', '-q', 'is-active', UNIT]).returncode == 0
 
 
-def start_host(mode, extra):
+def start_host(mode, extra, env=()):
     subprocess.run(['systemd-run', '--user', '--quiet', '--collect', f'--unit={UNIT}',
                     '--property=Type=exec', '--property=TimeoutStopSec=10',
                     '--property=KillMode=mixed', f'--working-directory={ROOT}',
+                    *(f'--setenv={item}' for item in env),
                     '/usr/bin/python3', '-u', str(ROOT / 'src/host.py'),
                     '--capture-memory', mode, *extra], check=True)
 
@@ -123,14 +124,13 @@ def median(values):
     return round(statistics.median(values), 1) if values else None
 
 
-def measure(mode, seconds, extra):
+def measure(mode, seconds, extra, env=()):
     print(f'\n=== capture path: {mode} ===', flush=True)
     if not stop_host():
         return None
     started = time.time()
-    start_host(mode, extra)
-    print('Answer the two KDE sharing dialogs now:', flush=True)
-    print('  1. "Share virtual screen"   2. "Approve" (screen + input control)', flush=True)
+    start_host(mode, extra, env)
+    print('Waiting for capture (stored consent tokens make this dialog-free).', flush=True)
     if wait_for(started, 'Capture authorized', 300) is None:
         print(f'Capture never started for {mode}; skipping this path.', flush=True)
         stop_host()
@@ -184,6 +184,10 @@ def main():
     parser.add_argument('--modes', nargs='+', default=['va', 'system'],
                         choices=['system', 'gl', 'va'])
     parser.add_argument('--runs', type=int, default=3, help='separate runs per candidate')
+    parser.add_argument('--json', type=Path, help='also write every run as one JSON document')
+    parser.add_argument('--env', action='append', default=[], metavar='KEY=VALUE',
+                        help='environment for the host (e.g. TABS9_DEBUG_TAIL=...); repeatable')
+    parser.add_argument('--label', default='', help='name prefix for the runs in the comparison')
     parser.add_argument('rest', nargs='*', metavar='-- HOST ARGS',
                         help='extra host arguments; the -- separator is required, '
                              'e.g. bench-capture --seconds 30 -- --fps 60')
@@ -200,13 +204,17 @@ def main():
         for mode in args.modes:
             for run in range(1, args.runs + 1):
                 print(f'\nRun {run}/{args.runs}', flush=True)
-                result = measure(mode, args.seconds, args.rest)
+                result = measure(mode, args.seconds, args.rest, args.env)
                 if result:
-                    result['mode'] = f'{mode}-{run}'
+                    result['mode'] = f'{args.label or mode}-{run}'
                     results.append(result)
     finally:
         stop_host()
 
+    if args.json and results:
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(json.dumps({'seconds': args.seconds, 'host_args': args.rest, 'env': args.env,
+                                         'runs': results}, indent=1) + '\n')
     if not results:
         print('\nNo comparable measurement was collected.', flush=True)
         return 1

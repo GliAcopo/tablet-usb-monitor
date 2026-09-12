@@ -191,8 +191,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--seconds", type=float, default=20.0)
     args = parser.parse_args()
-    if not (0.5 <= args.seconds <= 30.0):
-        parser.error("--seconds must be between 0.5 and 30")
+    if not (0.5 <= args.seconds <= 3600.0):
+        parser.error("--seconds must be between 0.5 and 3600")
     return args
 
 
