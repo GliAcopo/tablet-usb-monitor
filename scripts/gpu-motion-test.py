@@ -55,6 +55,9 @@ class GpuPattern(QOpenGLWindow):
         self.paints = 0
         self.swaps = 0
         self.touch_begins = 0
+        self.touch_updates = 0
+        self.max_touch_points = 0
+        self.touch_zones: dict[str, int] = {}
         self.button_presses = 0
         self.final_reported = False
 
@@ -115,9 +118,24 @@ class GpuPattern(QOpenGLWindow):
         if time.monotonic() - self.started < self.seconds:
             self.update()
 
+    def zone(self, point) -> str:
+        # Coarse 3x3 zone name only (no positions are stored).
+        column = min(2, max(0, int(point.x() * 3 / max(1, self.width()))))
+        row = min(2, max(0, int(point.y() * 3 / max(1, self.height()))))
+        return ("top", "middle", "bottom")[row] + "-" + ("left", "center", "right")[column]
+
     def event(self, event: QEvent) -> bool:
-        if event.type() == QEvent.Type.TouchBegin:
-            self.touch_begins += 1
+        kind = event.type()
+        if kind in (QEvent.Type.TouchBegin, QEvent.Type.TouchUpdate, QEvent.Type.TouchEnd):
+            points = event.points()
+            self.max_touch_points = max(self.max_touch_points, len(points))
+            if kind == QEvent.Type.TouchBegin:
+                self.touch_begins += 1
+                for point in points:
+                    name = self.zone(point.position())
+                    self.touch_zones[name] = self.touch_zones.get(name, 0) + 1
+            elif kind == QEvent.Type.TouchUpdate:
+                self.touch_updates += 1
             event.accept()
             return True
         return super().event(event)
@@ -137,6 +155,8 @@ class GpuPattern(QOpenGLWindow):
             "paints": self.paints,
             "swaps": self.swaps,
             "touch_begins": self.touch_begins,
+            "touch_updates": self.touch_updates,
+            "max_touch_points": self.max_touch_points,
             "button_presses": self.button_presses,
         }), flush=True)
         self.last_report = now
@@ -160,6 +180,9 @@ class GpuPattern(QOpenGLWindow):
                 "paints": self.paints,
                 "swaps": self.swaps,
                 "touch_begins": self.touch_begins,
+                "touch_updates": self.touch_updates,
+                "max_touch_points": self.max_touch_points,
+                "touch_zones": self.touch_zones,
                 "button_presses": self.button_presses,
             }), flush=True)
 

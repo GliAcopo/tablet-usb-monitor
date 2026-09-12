@@ -258,6 +258,7 @@ class Host:
         # Token persistence
         self.tokens_file = TOKENS_FILE
         self._capture_token_used = False
+        self._virtual_token_used = False
         self._wrong_source_attempts = 0
         self.failed = False
 
@@ -306,11 +307,20 @@ class Host:
         interactively.  The token flag is set exactly once per phase, so
         at most one interactive retry is possible.
 
-        KDE 6.6.6 does not implement persistence for virtual-output creation
-        (ScreenCast type=4): that session never requests persist_mode, so
-        there is no creation-side token to discard here -- only the capture
-        (RemoteDesktop+ScreenCast) session can hold a restore token.
+        Both phases can hold a restore token (creation: 'screencast_create',
+        capture: 'remotedesktop_capture'); each is discarded at most once.
         """
+        if self._virtual_token_used and self.creation_session is None:
+            self._virtual_token_used = False
+            discard_token(self.tokens_file, 'screencast_create')
+            if self.session:
+                with contextlib.suppress(Exception):
+                    dbus.Interface(self.bus.get_object('org.freedesktop.portal.Desktop', self.session),
+                        'org.freedesktop.portal.Session').Close()
+                self.session = None
+            print('Stored virtual-screen token was stale; retrying with interactive consent.', flush=True)
+            self.create()
+            return
         # Capture (RemoteDesktop+ScreenCast) token was attempted and the
         # rejection arrived at SelectDevices, SelectSources, or Start on the
         # capture session.  Restart the full capture session because the
@@ -338,14 +348,19 @@ class Host:
 
     def created(self, result):
         self.session = result['session_handle']
-        # KDE 6.6.6 does not implement persistence for virtual-output creation
-        # (ScreenCast type=4), so this session never requests persist_mode or
-        # presents a restore_token: doing so would promise a skipped dialog
-        # that this backend cannot deliver. See README's persistence section.
+        # xdg-desktop-portal-kde 6.6.6 restores a screencast selection by output
+        # uniqueId, and the "Share virtual screen" entry has the fixed id
+        # "Virtual" (screencast.cpp / outputsmodel.cpp), so the creation session
+        # can be restored like the capture one: one dialog on the first start.
         options = dbus.Dictionary({
             'types': dbus.UInt32(4), 'multiple': False,
             'cursor_mode': dbus.UInt32(2),
+            'persist_mode': dbus.UInt32(2),
         }, signature='sv')
+        tokens = load_tokens(self.tokens_file)
+        if 'screencast_create' in tokens:
+            options['restore_token'] = tokens['screencast_create']
+            self._virtual_token_used = True
         self.request(self.portal.SelectSources, [self.session, options], self.selected)
 
     def selected(self, result):
@@ -361,6 +376,9 @@ class Host:
             if not result.get('streams') or int(result['streams'][0][1].get('source_type', 0)) != 4:
                 self._fail('Refusing a non-virtual creation source.')
                 return
+            restore_token = result.get('restore_token')
+            if isinstance(restore_token, str) and restore_token:
+                save_token(self.tokens_file, 'screencast_create', str(restore_token))
             self.creation_session = self.session
             self.session = None
             self.watch_session(self.creation_session)
@@ -644,8 +662,6 @@ class Host:
 
     def capture_created(self, result):
         self.session = result['session_handle']
-        print('Choose the existing virtual monitor in the sharing dialog.', flush=True)
-        notify('Allow screen sharing and input', CAPTURE_DIALOG_HINT)
         options = dbus.Dictionary({
             'types': dbus.UInt32(6),
             'persist_mode': dbus.UInt32(2),
@@ -654,6 +670,10 @@ class Host:
         if 'remotedesktop_capture' in tokens:
             options['restore_token'] = tokens['remotedesktop_capture']
             self._capture_token_used = True
+            print('Presenting the stored capture token; no dialog is expected.', flush=True)
+        else:
+            print('Choose the existing virtual monitor in the sharing dialog.', flush=True)
+            notify('Allow screen sharing and input', CAPTURE_DIALOG_HINT)
         self.request(self.remote.SelectDevices, [self.session, options], self.capture_devices_selected)
 
     def capture_devices_selected(self, result):
@@ -939,6 +959,7 @@ class Host:
             'tablet_input_rejected': self.input_rejected,
             'tablet_input_followon_rejected': self.input_followon_rejected,
             'client_resyncs': self.resyncs,
+            'tablet_input_mode': self.touch.mode if self.touch else None,
             'tablet': self.tablet_stats,
             'capture_interval_ms_p50': round(arrivals[len(arrivals)//2], 2) if arrivals else None,
             'capture_interval_ms_p90': round(arrivals[int(len(arrivals)*0.9)], 2) if arrivals else None,

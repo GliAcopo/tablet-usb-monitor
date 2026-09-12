@@ -27,6 +27,7 @@ def make_test_host(tmp_dir):
     h.session = 'session_1'
     h.creation_session = None
     h._capture_token_used = False
+    h._virtual_token_used = False
     h._wrong_source_attempts = 0
     h.failed = False
     h.virtual_name = 'Virtual-1'
@@ -245,43 +246,50 @@ class HostTokenIntegrationTests(unittest.TestCase):
         self.assertNotIn('screencast_create', tokens)
         h._fail.assert_called_once_with('Refusing a non-virtual creation source.')
 
-    def test_creation_never_persists_a_token_on_kde_6_6_6(self):
-        """KDE 6.6.6 has no persistence for virtual-output creation, so the
-        host must not save one even if a future/different portal offered a
-        restore_token on this branch -- no code path here ever calls
-        save_token('screencast_create', ...), and the tokens file must not
-        exist afterwards (it never held anything else in this test)."""
+    def test_creation_saves_its_restore_token(self):
+        """xdg-desktop-portal-kde restores the "Virtual" selection by its fixed
+        uniqueId, so the creation session persists a token like capture does."""
         h = make_test_host(self.tmpdir)
         h.creation_session = None
         h.watch_session = MagicMock()
         h.configure_output = MagicMock()
 
         with patch('host.GLib.timeout_add_seconds'):
-            result_with_token = {
-                'streams': [(100, {'source_type': 4})],
-                'restore_token': 'should_never_be_saved',
-            }
-            h.started(result_with_token)
+            h.started({'streams': [(100, {'source_type': 4})], 'restore_token': 'virt_token_1'})
 
-        self.assertEqual(load_tokens(h.tokens_file), {})
-        self.assertFalse(h.tokens_file.exists())
+        self.assertEqual(load_tokens(h.tokens_file), {'screencast_create': 'virt_token_1'})
         self.assertEqual(read_status(Path(self.tmpdir) / 'host.status.json')['phase'], 'configuring_output')
 
-    def test_creation_select_sources_never_requests_persist_mode(self):
-        """The creation-session SelectSources options must not claim
-        persistence support that KDE 6.6.6 does not implement."""
+    def test_creation_select_sources_presents_stored_token(self):
         h = make_test_host(self.tmpdir)
+        save_token(h.tokens_file, 'screencast_create', 'virt_token_1')
         h.session = 'creation_session_1'
         h.request = MagicMock()
 
         h.created({'session_handle': 'creation_session_1'})
 
-        h.request.assert_called_once()
         method, args, callback = h.request.call_args[0]
         self.assertEqual(method, h.portal.SelectSources)
         options = args[1]
-        self.assertNotIn('persist_mode', options)
-        self.assertNotIn('restore_token', options)
+        self.assertEqual(int(options['persist_mode']), 2)
+        self.assertEqual(options['restore_token'], 'virt_token_1')
+        self.assertTrue(h._virtual_token_used)
+
+    def test_stale_creation_token_retries_creation_once(self):
+        h = make_test_host(self.tmpdir)
+        save_token(h.tokens_file, 'screencast_create', 'stale')
+        h._virtual_token_used = True
+        h.create = MagicMock()
+
+        h._handle_portal_rejection(2, h.selected)
+
+        self.assertFalse(h._virtual_token_used)
+        self.assertNotIn('screencast_create', load_tokens(h.tokens_file))
+        h.create.assert_called_once()
+        self.assertFalse(h.failed)
+        # A second rejection without a token is final.
+        h._handle_portal_rejection(1, h.selected)
+        self.assertTrue(h.failed)
 
     def test_wrong_source_retry_is_capped(self):
         """Repeatedly selecting the wrong output must fail instead of
