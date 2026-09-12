@@ -212,8 +212,8 @@ def compute_virtual_position(current_outputs, previous_names):
     return (max(0, right_edge), 0)
 
 
-RESYNC = object()
-TRACE_CAPTURE = bool(os.environ.get('TABS9_TRACE_CAPTURE'))  # diagnostics: raw capture intervals  # queue marker: the client must wait for the next keyframe
+RESYNC = object()  # queue marker: the client must wait for the next keyframe
+TRACE_CAPTURE = bool(os.environ.get('TABS9_TRACE_CAPTURE'))  # diagnostics: raw capture intervals
 
 
 class Host:
@@ -258,6 +258,8 @@ class Host:
         self.capture_to_ack = collections.deque(maxlen=1200)
         self.ack_intervals = collections.deque(maxlen=1200)
         self.ack_wall = None
+        self.render_intervals = collections.deque(maxlen=1200)   # tablet-reported render stamps
+        self.tablet_render_ns = None
         self.frames = 0
         self.capture_frames = 0
         self.capture_pts = None
@@ -1039,6 +1041,14 @@ class Host:
                         self.stats.append((now - sent[0]) * 1000)
                         if sent[1] is not None:
                             self.capture_to_ack.append((now - sent[1]) * 1000)
+                    render_ns = msg.get('render_ns')
+                    if isinstance(render_ns, int) and not isinstance(render_ns, bool):
+                        # Tablet clock domain only: consecutive render stamps.
+                        if self.tablet_render_ns is not None and 0 < render_ns - self.tablet_render_ns < 5_000_000_000:
+                            self.render_intervals.append((render_ns - self.tablet_render_ns) / 1e6)
+                        self.tablet_render_ns = render_ns
+                elif msg.get('type') == 'keyframe':
+                    GLib.idle_add(self.request_keyframe)
                 elif msg.get('type') == 'config':
                     GLib.idle_add(self.apply_settings, msg, generation)
                 elif msg.get('type') == 'stats':
@@ -1175,6 +1185,8 @@ class Host:
         self.stats.clear()
         acks = sorted(self.ack_intervals)
         self.ack_intervals.clear()
+        renders = sorted(self.render_intervals)
+        self.render_intervals.clear()
         c2a = sorted(self.capture_to_ack)
         self.capture_to_ack.clear()
         def pct(values, q):
@@ -1224,7 +1236,12 @@ class Host:
             # proxy until the tablet reports its own render timestamps).
             'ack_interval_ms_p50': pct(acks, 0.5),
             'ack_interval_ms_p95': pct(acks, 0.95),
-            'ack_interval_ms_max': pct(acks, 1.0)}), flush=True)
+            'ack_interval_ms_max': pct(acks, 1.0),
+            # Intervals between the tablet's own OnFrameRendered timestamps.
+            'render_interval_ms_p50': pct(renders, 0.5),
+            'render_interval_ms_p95': pct(renders, 0.95),
+            'render_interval_ms_max': pct(renders, 1.0),
+            'render_stalls_over_100ms': sum(1 for v in renders if v > 100)}), flush=True)
         return True
 
     def run(self):

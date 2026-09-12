@@ -59,14 +59,15 @@ class MainActivity : ComponentActivity() {
 
         // Close the host's latency measurement loop: every acknowledged frame
         // lets the host time capture→display on its own clock.
-        videoReceiver?.onFrameRendered = { seq, decodeUs ->
-            touchCapture?.sendRendered(seq, decodeUs)
+        videoReceiver?.onFrameRendered = { seq, decodeUs, renderNanos ->
+            touchCapture?.sendRendered(seq, decodeUs, renderNanos)
             // First frame ever on screen: say thanks once, then never again.
             if (!prefs.thankedOnce) {
                 prefs.thankedOnce = true
                 runOnUiThread { showThanks = true }
             }
         }
+        videoReceiver?.onKeyframeNeeded = { touchCapture?.sendKeyframeRequest() }
         videoReceiver?.onStatsUpdated = { decoderFps, receivedMbps ->
             runOnUiThread {
                 actualPanelHz = currentPanelRefreshRate()

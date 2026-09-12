@@ -516,10 +516,14 @@ class TouchCapture {
      * when it emitted that frame, so the round trip it computes is the real
      * end-to-end latency without either side needing a shared time base.
      */
-    fun sendRendered(seq: Int, decodeUs: Int) {
+    fun sendRendered(seq: Int, decodeUs: Int, renderNanos: Long) {
         if (!isConnected) return
         val msg = JSONObject().apply {
             put("type", "rendered")
+            // When the frame reached the screen, on this device's monotonic
+            // clock (OnFrameRendered's nanoTime): the host measures render
+            // intervals from consecutive values, never mixing clock domains.
+            put("render_ns", renderNanos)
             // Sent unsigned: the host's counter is a u32 and Kotlin's Int is
             // signed, so it wraps negative after ~2^31 frames (~1 year at
             // 60 fps, but free to get right).
@@ -529,6 +533,12 @@ class TouchCapture {
             if (decodeUs >= 0) put("decode_us", decodeUs)
         }
         webSocket?.send(msg.toString())
+    }
+
+    /** The decoder discarded a stale backlog; an IDR now shortens the blank. */
+    fun sendKeyframeRequest() {
+        if (!isConnected) return
+        webSocket?.send(JSONObject().put("type", "keyframe").toString())
     }
 
     /** Report measured tablet-side delivery, independent of the local overlay. */

@@ -1,6 +1,8 @@
 package local.tabs9.usbdisplay
 
 import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.os.Handler
 import android.os.HandlerThread
@@ -48,7 +50,6 @@ class VideoReceiver {
     private var socket: Socket? = null
     private var inputStream: InputStream? = null
     private var mediaCodec: MediaCodec? = null
-    private var outputThread: Thread? = null
     @Volatile private var isRunning = false
     @Volatile private var codecAlive = false
 
@@ -61,7 +62,10 @@ class VideoReceiver {
      * actually on screen. The host times the round trip on its own clock, so
      * no clock synchronisation between the two devices is needed.
      */
-    var onFrameRendered: ((seq: Int, decodeUs: Int) -> Unit)? = null
+    var onFrameRendered: ((seq: Int, decodeUs: Int, renderNanos: Long) -> Unit)? = null
+
+    /** Asks the host for an IDR after this side had to discard dependent frames. */
+    var onKeyframeNeeded: (() -> Unit)? = null
 
     /// Which bitstream the host is sending. Set from the host's greeting
     /// before the stream starts; the frames carry nothing that says which
@@ -251,6 +255,48 @@ class VideoReceiver {
         releaseCodec()
     }
 
+    /**
+     * Decoder ownership. One HandlerThread ("uscreen-codec") owns the
+     * MediaCodec lifecycle and every input submission; the network reader
+     * only appends access units to [inputQueue]. MediaCodec runs in
+     * asynchronous mode, so no thread ever polls dequeueInputBuffer with a
+     * timeout (the old loop could sit 200 ms waiting for an input buffer and
+     * then reset the codec).
+     */
+    private class AccessUnit(
+        val data: ByteArray, val size: Int, val isConfig: Boolean,
+        val keyframe: Boolean, val seq: Int, val arrivalNanos: Long
+    )
+
+    private var codecThread: HandlerThread? = null
+    private var codecHandler: Handler? = null
+    private val inputQueue = ArrayDeque<AccessUnit>()
+    private val freeInputs = ArrayDeque<Int>()
+    private val queueLock = Object()
+    @Volatile private var waitingForKeyframe = false
+    private var codecGeneration = 0
+    private var droppedForAge = 0L
+    private var lastDropLogNanos = 0L
+
+    /** Media timestamp (arrival on this device, µs) -> host sequence. Bounded ring. */
+    private val ptsSeq = LongArray(ARRIVAL_RING)
+    private val ptsSeqValue = IntArray(ARRIVAL_RING)
+    private var ptsWrite = 0
+    private fun rememberPts(pts: Long, seq: Int) {
+        val i = ptsWrite % ARRIVAL_RING
+        ptsSeq[i] = pts; ptsSeqValue[i] = seq; ptsWrite++
+    }
+    private fun seqForPts(pts: Long): Int {
+        for (n in 0 until ARRIVAL_RING) {
+            val i = (ptsWrite - 1 - n + ARRIVAL_RING * 2) % ARRIVAL_RING
+            if (ptsSeq[i] == pts) return ptsSeqValue[i]
+        }
+        return -1
+    }
+
+    /** Two frame periods at the stream rate: older compressed data is stale. */
+    private fun queueAgeBudgetNanos(): Long = 2_000_000_000L / streamFps.coerceAtLeast(1)
+
     private fun setupCodec(surface: Surface): Boolean {
         try {
             val format = MediaFormat.createVideoFormat(mimeType, formatWidth, formatHeight)
@@ -259,54 +305,97 @@ class VideoReceiver {
             // internal pacing and power/clock decisions.
             format.setInteger(MediaFormat.KEY_FRAME_RATE, streamFps)
             format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-
-            // State the colour space explicitly rather than relying on the SPS
-            // alone. A/B measured: no latency cost either way, and being
-            // explicit means the decoder cannot guess wrong.
             try {
                 format.setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
                 format.setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
                 format.setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
             } catch (_: Exception) {}
 
-            // Low latency flags (safe to set, ignored if unsupported)
-            if (android.os.Build.VERSION.SDK_INT >= 30) {
-                format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
-            }
+            // Pick the hardware decoder explicitly and only ask for features it
+            // declares; a hint the codec does not support is not a setting.
+            val codecName = MediaCodecList(MediaCodecList.REGULAR_CODECS).findDecoderForFormat(
+                MediaFormat.createVideoFormat(mimeType, formatWidth, formatHeight))
+            val codec = if (codecName != null) MediaCodec.createByCodecName(codecName)
+                        else MediaCodec.createDecoderByType(mimeType)
+            val caps = try { codec.codecInfo.getCapabilitiesForType(mimeType) } catch (_: Exception) { null }
+            val lowLatency = android.os.Build.VERSION.SDK_INT >= 30 &&
+                caps?.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency) == true
+            if (lowLatency) format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
             try {
-                // Ask the decoder to run flat out rather than pace to the frame
-                // rate — headroom above the stream rate, so a late frame is
-                // caught up on instead of waiting for the next slot.
                 format.setFloat(MediaFormat.KEY_OPERATING_RATE, streamFps.toFloat())
             } catch (_: Exception) {}
-            try {
-                format.setInteger("vendor.qti-ext-dec-low-latency.enable", 1)
-            } catch (_: Exception) {}
+            val qualcomm = codec.name.contains("qti", ignoreCase = true) ||
+                codec.name.contains("qcom", ignoreCase = true)
+            if (qualcomm) {
+                try { format.setInteger("vendor.qti-ext-dec-low-latency.enable", 1) } catch (_: Exception) {}
+            }
 
-            val codec = MediaCodec.createDecoderByType(mimeType)
+            val generation = ++codecGeneration
+            val thread = HandlerThread("uscreen-codec").apply { start() }
+            val handler = Handler(thread.looper)
+            codecThread = thread
+            codecHandler = handler
+            synchronized(queueLock) { inputQueue.clear(); freeInputs.clear() }
+            waitingForKeyframe = true
+
+            codec.setCallback(object : MediaCodec.Callback() {
+                override fun onInputBufferAvailable(c: MediaCodec, index: Int) {
+                    if (generation != codecGeneration) return
+                    synchronized(queueLock) { freeInputs.addLast(index) }
+                    submitPending(c, generation)
+                }
+
+                override fun onOutputBufferAvailable(c: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
+                    if (generation != codecGeneration) return
+                    try {
+                        // Render immediately: with a SurfaceView the frame goes
+                        // straight to the compositor and OnFrameRendered says
+                        // when it was actually shown.
+                        c.releaseOutputBuffer(index, true)
+                        noteReleased(seqForPts(info.presentationTimeUs))
+                        frameCounter.incrementAndGet()
+                    } catch (e: IllegalStateException) {
+                        Log.w(TAG, "Output release: codec gone", e)
+                    }
+                }
+
+                override fun onError(c: MediaCodec, e: MediaCodec.CodecException) {
+                    Log.e(TAG, "Decoder error: ${e.diagnosticInfo}", e)
+                    if (generation == codecGeneration) handler.post { resetCodec() }
+                }
+
+                override fun onOutputFormatChanged(c: MediaCodec, f: MediaFormat) {
+                    Log.i(TAG, "Decoder output format: $f")
+                }
+            }, handler)
+
             codec.configure(format, surface, null, 0)
             codec.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT)
+            val applied = try { codec.inputFormat } catch (_: Exception) { null }
+            val appliedLowLatency = applied?.containsKey(MediaFormat.KEY_LOW_LATENCY) == true &&
+                applied.getInteger(MediaFormat.KEY_LOW_LATENCY) == 1
+            val appliedVendor = applied?.containsKey("vendor.qti-ext-dec-low-latency.enable") == true
 
             // Fires when a frame has actually reached the output surface —
-            // the true "it is on screen" moment, rather than the earlier
-            // moment we handed the buffer back. The host's sequence number
-            // rides along as the presentation timestamp.
+            // the true "it is on screen" moment. The frame is identified
+            // through its media timestamp (arrival time on this device).
             val cbThread = HandlerThread("uscreen-frame-cb").apply { start() }
             frameCallbackThread = cbThread
-            codec.setOnFrameRenderedListener({ _, presentationTimeUs, _ ->
+            codec.setOnFrameRenderedListener({ _, presentationTimeUs, nanoTime ->
                 if (renderedCount.incrementAndGet() % ACK_EVERY == 0L) {
-                    val seq = presentationTimeUs.toInt()
-                    onFrameRendered?.invoke(seq, decodeMicrosFor(seq))
+                    val seq = seqForPts(presentationTimeUs)
+                    if (seq >= 0) onFrameRendered?.invoke(seq, decodeMicrosFor(seq), nanoTime)
                 }
             }, Handler(cbThread.looper))
 
             codec.start()
             mediaCodec = codec
             codecAlive = true
-            startOutputThread(codec)
             Log.i(
                 TAG,
-                "Codec configured: $mimeType ${formatWidth}x${formatHeight} @ $streamFps fps"
+                "Codec ${codec.name} configured: $mimeType ${formatWidth}x${formatHeight} @ $streamFps fps, " +
+                    "low-latency feature=${lowLatency} applied=${appliedLowLatency}, " +
+                    "qti hint applied=${appliedVendor}, input format=${applied}"
             )
             return true
         } catch (e: Exception) {
@@ -316,35 +405,62 @@ class VideoReceiver {
     }
 
     /**
-     * Dedicated render thread: drains decoded frames and releases them to the
-     * surface as soon as they're ready, independent of network reads. This is
-     * what keeps the display latency at "one frame", not "one network stall".
+     * Network reader side: append one access unit. Bounded by age as well as
+     * count: if the oldest queued unit is older than two frame periods the
+     * compressed stream is behind, so the whole generation is discarded and
+     * decoding resumes at the next keyframe (never a dependent frame without
+     * its references). The host is asked for an IDR so that wait is short.
      */
-    private fun startOutputThread(codec: MediaCodec) {
-        outputThread = Thread({
-            val info = MediaCodec.BufferInfo()
-            var rendered = 0L
-            while (codecAlive) {
-                try {
-                    val index = codec.dequeueOutputBuffer(info, 10_000) // 10ms
-                    if (index >= 0) {
-                        val seq = info.presentationTimeUs.toInt()
-                        codec.releaseOutputBuffer(index, true)
-                        noteReleased(seq)
-                        frameCounter.incrementAndGet()
-                        rendered++
-                        if (rendered <= 2) Log.i(TAG, "Rendered output frame #$rendered")
+    private fun enqueueAccessUnit(codec: MediaCodec, unit: AccessUnit) {
+        val generation = codecGeneration
+        synchronized(queueLock) {
+            if (unit.isConfig) {
+                inputQueue.addLast(unit)
+            } else {
+                val oldest = inputQueue.firstOrNull { !it.isConfig }
+                val stale = oldest != null && unit.arrivalNanos - oldest.arrivalNanos > queueAgeBudgetNanos()
+                if (stale || inputQueue.size >= 8) {
+                    inputQueue.removeAll { !it.isConfig }
+                    waitingForKeyframe = true
+                    droppedForAge++
+                    if (unit.arrivalNanos - lastDropLogNanos > 1_000_000_000L) {
+                        lastDropLogNanos = unit.arrivalNanos
+                        Log.w(TAG, "Compressed backlog over budget; resuming at the next keyframe (total $droppedForAge)")
                     }
-                } catch (e: IllegalStateException) {
-                    if (codecAlive) Log.w(TAG, "Output thread: codec gone", e)
-                    break
-                } catch (e: Exception) {
-                    if (codecAlive) Log.w(TAG, "Output thread error", e)
+                    onKeyframeNeeded?.invoke()
                 }
+                if (waitingForKeyframe && !unit.keyframe) {
+                    return
+                }
+                waitingForKeyframe = false
+                inputQueue.addLast(unit)
             }
-        }, "uscreen-render").apply {
-            priority = Thread.MAX_PRIORITY
-            start()
+        }
+        codecHandler?.post { submitPending(codec, generation) }
+    }
+
+    /** Codec thread: marry queued access units with free input buffers. */
+    private fun submitPending(codec: MediaCodec, generation: Int) {
+        while (true) {
+            val unit: AccessUnit
+            val index: Int
+            synchronized(queueLock) {
+                if (generation != codecGeneration || inputQueue.isEmpty() || freeInputs.isEmpty()) return
+                unit = inputQueue.removeFirst()
+                index = freeInputs.removeFirst()
+            }
+            try {
+                val buffer = codec.getInputBuffer(index) ?: return
+                buffer.clear()
+                buffer.put(unit.data, 0, unit.size)
+                val flags = if (unit.isConfig) MediaCodec.BUFFER_FLAG_CODEC_CONFIG else 0
+                val pts = unit.arrivalNanos / 1000L
+                if (!unit.isConfig) rememberPts(pts, unit.seq)
+                codec.queueInputBuffer(index, 0, unit.size, pts, flags)
+            } catch (e: IllegalStateException) {
+                Log.w(TAG, "Submit: codec gone", e)
+                return
+            }
         }
     }
 
@@ -459,7 +575,8 @@ class VideoReceiver {
                         PACKET_TYPE_CONFIG -> {
                             val payloadSize = frameSize - 1
                             Log.i(TAG, "Received codec config: ${payloadSize}B")
-                            feedDecoder(codec, packetBuf, 1, payloadSize, true, 0L)
+                            enqueueAccessUnit(codec, AccessUnit(packetBuf.copyOfRange(1, 1 + payloadSize),
+                                payloadSize, true, true, -1, System.nanoTime()))
                         }
                         PACKET_TYPE_FRAME -> {
                             if (frameSize <= FRAME_HEADER_SIZE) {
@@ -478,11 +595,11 @@ class VideoReceiver {
                                 onConnected?.invoke()
                             }
                             noteArrival(seq)
-                            feedDecoder(
-                                codec, packetBuf, FRAME_HEADER_SIZE,
-                                frameSize - FRAME_HEADER_SIZE, false,
-                                seq.toLong() and 0xFFFFFFFFL
-                            )
+                            val size = frameSize - FRAME_HEADER_SIZE
+                            enqueueAccessUnit(codec, AccessUnit(
+                                packetBuf.copyOfRange(FRAME_HEADER_SIZE, FRAME_HEADER_SIZE + size),
+                                size, false, isKeyframe(packetBuf, FRAME_HEADER_SIZE, size),
+                                seq, System.nanoTime()))
                         }
                         else -> {
                             Log.w(TAG, "Unknown packet type: $packetType, reconnecting")
@@ -519,62 +636,48 @@ class VideoReceiver {
     }
 
     /**
-     * Queue one access unit into the decoder. Never silently drops frames:
-     * a dropped P-frame corrupts the picture until the next keyframe. If no
-     * input buffer frees up within ~200ms the codec is genuinely stuck and we
-     * reset it instead.
+     * Whether this access unit starts with (or contains) an IDR/I slice, so
+     * decoding can resume here after a discard. Annex B byte stream; HEVC
+     * NAL type bits are in the first header byte, H.264 in its low 5 bits.
      */
-    private fun feedDecoder(
-        codec: MediaCodec, data: ByteArray, offset: Int, size: Int,
-        isConfig: Boolean, presentationTimeUs: Long
-    ) {
-        try {
-            var attempts = 0
-            while (true) {
-                val inputIndex = codec.dequeueInputBuffer(20_000) // 20ms
-                if (inputIndex >= 0) {
-                    val inputBuffer = codec.getInputBuffer(inputIndex) ?: return
-                    inputBuffer.clear()
-                    inputBuffer.put(data, offset, size)
-
-                    val flags = if (isConfig) MediaCodec.BUFFER_FLAG_CODEC_CONFIG else 0
-                    // The host's sequence number rides in the presentation
-                    // timestamp so the render callback can identify the frame.
-                    codec.queueInputBuffer(
-                        inputIndex,
-                        0,
-                        size,
-                        presentationTimeUs,
-                        flags
-                    )
-                    return
+    private fun isKeyframe(data: ByteArray, offset: Int, size: Int): Boolean {
+        var i = offset
+        val end = offset + size - 4
+        val hevc = mimeType == MIME_TYPE_HEVC
+        while (i < end) {
+            if (data[i].toInt() == 0 && data[i + 1].toInt() == 0 && data[i + 2].toInt() == 1) {
+                val header = data[i + 3].toInt() and 0xFF
+                if (hevc) {
+                    val type = (header shr 1) and 0x3F
+                    if (type in 16..21) return true          // BLA/IDR/CRA
+                    if (type == 32 || type == 33 || type == 34) { i += 3; continue } // VPS/SPS/PPS
+                } else {
+                    val type = header and 0x1F
+                    if (type == 5) return true
+                    if (type == 7 || type == 8) { i += 3; continue }
                 }
-                attempts++
-                if (attempts >= 10) {
-                    Log.w(TAG, "Decoder stuck for 200ms — resetting codec")
-                    resetCodec()
-                    return
-                }
+                i += 3
+            } else {
+                i++
             }
-        } catch (e: MediaCodec.CodecException) {
-            Log.e(TAG, "Decoder codec error: ${e.diagnosticInfo}", e)
-            resetCodec()
-        } catch (e: Exception) {
-            Log.w(TAG, "Decoder feed error", e)
         }
+        return false
     }
 
     /** Tear the decoder down without touching the surface or the socket. */
     private fun releaseCodec() {
         synchronized(this) {
             codecAlive = false
-            outputThread?.join(500)
-            outputThread = null
+            codecGeneration++          // callbacks from the old codec are ignored
+            synchronized(queueLock) { inputQueue.clear(); freeInputs.clear() }
             mediaCodec?.let {
                 try { it.stop() } catch (_: Exception) {}
                 try { it.release() } catch (_: Exception) {}
             }
             mediaCodec = null
+            codecThread?.quitSafely()
+            codecThread = null
+            codecHandler = null
             frameCallbackThread?.quitSafely()
             frameCallbackThread = null
         }

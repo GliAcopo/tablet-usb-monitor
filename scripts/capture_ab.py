@@ -177,6 +177,9 @@ def measure(mode, seconds, extra, env=()):
         'capture_to_ack_ms_p95': max((r.get('capture_to_ack_ms_p95') for r in window
                                       if isinstance(r.get('capture_to_ack_ms_p95'), (int, float))), default=None),
         'capture_to_ack_over_100ms': sum(r.get('capture_to_ack_over_100ms') or 0 for r in window),
+        'render_interval_ms_p95': max((r.get('render_interval_ms_p95') for r in window
+                                       if isinstance(r.get('render_interval_ms_p95'), (int, float))), default=None),
+        'render_stalls_over_100ms': sum(r.get('render_stalls_over_100ms') or 0 for r in window),
         'ack_interval_ms_p95': max((r.get('ack_interval_ms_p95') for r in window
                                     if isinstance(r.get('ack_interval_ms_p95'), (int, float))), default=None),
         'tablet_decoder_fps': median([r.get('tablet', {}).get('decoder_fps') for r in window]),
