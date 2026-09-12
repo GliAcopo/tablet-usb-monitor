@@ -25,6 +25,7 @@ class FakeLib:
     def ei_region_get_y(self, value): return self._region(value)[1]
     def ei_region_get_width(self, value): return self._region(value)[2]
     def ei_region_get_height(self, value): return self._region(value)[3]
+    def ei_device_has_capability(self, device, cap): return True
     def ei_device_start_emulating(self, device, sequence): self.started.append((int(device), sequence))
     def ei_device_stop_emulating(self, device): self.stopped.append(int(device))
 
@@ -39,6 +40,7 @@ def controller(regions, target):
     value.ready = False
     value._sequence = 0
     value._touches = {}
+    value._pen_down = False
     value._devices = {key: key for key in regions}
     value._resumed = set(regions)
     value._layout_changed = None
@@ -91,6 +93,46 @@ class EisBindingTests(unittest.TestCase):
         target[0] = (1463, 0, 1973, 1232)
         self.assertFalse(touch.refresh_binding())
         self.assertIsNone(touch.device)
+
+
+class EisPenTests(unittest.TestCase):
+    def test_pen_rides_the_bound_device_as_absolute_pointer_and_button(self):
+        touch = controller({1: [(1463, 0, 1973, 1232)]}, [(1463, 0, 1973, 1232)])
+        calls = []
+        touch.lib.ei_device_pointer_motion_absolute = lambda d, x, y: calls.append(("motion", x, y))
+        touch.lib.ei_device_button_button = lambda d, b, press: calls.append(("button", b, press))
+        touch.lib.ei_device_frame = lambda *a: calls.append(("frame",))
+        touch.lib.ei_now = lambda ei: 0
+        self.assertTrue(touch.refresh_binding())
+        self.assertTrue(touch.pen_capable)
+        touch.pen_motion(10.0, 20.0)      # hover
+        touch.pen_down(10.0, 20.0)
+        touch.pen_motion(30.0, 40.0)
+        touch.pen_up()
+        self.assertEqual(calls, [
+            ("motion", 1473.0, 20.0), ("frame",),
+            ("motion", 1473.0, 20.0), ("button", 0x110, True), ("frame",),
+            ("motion", 1493.0, 40.0), ("frame",),
+            ("button", 0x110, False), ("frame",)])
+        with self.assertRaises(Exception):
+            touch.pen_up()
+
+    def test_pen_without_absolute_pointer_capability_is_refused_and_released_on_pause(self):
+        touch = controller({1: [(0, 0, 1973, 1232)]}, [(0, 0, 1973, 1232)])
+        calls = []
+        touch.lib.ei_device_pointer_motion_absolute = lambda d, x, y: None
+        touch.lib.ei_device_button_button = lambda d, b, press: calls.append(("button", b, press))
+        touch.lib.ei_device_frame = lambda *a: None
+        touch.lib.ei_now = lambda ei: 0
+        self.assertTrue(touch.refresh_binding())
+        touch.pen_down(1.0, 1.0)
+        touch._release_contacts()   # what pause/removal/disconnect do
+        self.assertEqual(calls, [("button", 0x110, True), ("button", 0x110, False)])
+        self.assertFalse(touch._pen_down)
+        touch.lib.ei_device_has_capability = lambda d, cap: cap == 1 << 3
+        self.assertFalse(touch.pen_capable)
+        with self.assertRaises(Exception):
+            touch.pen_motion(1.0, 1.0)
 
 
 if __name__ == '__main__':

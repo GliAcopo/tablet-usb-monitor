@@ -332,9 +332,12 @@ class PortalTouchInput:
         return True
 
     def _handle_pen(self, message: Mapping[str, Any]) -> bool:
-        """Map basic S Pen hover/tip input onto the portal pointer device."""
-        if not self.pointer_enabled:
-            return False
+        """Map basic S Pen hover/tip input onto an absolute pointer.
+
+        With the libei backend the pen rides on the same KWin device as the
+        touches (absolute pointer + button); otherwise the portal's pointer
+        calls are used, which KDE 6.6 refuses for this session type.
+        """
         action = message.get("action")
         if isinstance(action, bool) or not isinstance(action, int):
             raise TouchInputError("unsupported pen action")
@@ -345,6 +348,9 @@ class PortalTouchInput:
             return False
         if action not in (0, 1, 2, 3, 4):
             raise TouchInputError("unsupported pen action")
+        backend = self.touch_backend if getattr(self.touch_backend, "pen_capable", False) else None
+        if backend is None and not self.pointer_enabled:
+            return False
 
         if action == 0:  # tip down
             if self.pen_down:
@@ -352,41 +358,54 @@ class PortalTouchInput:
             if self.pointer_slot is not None:
                 return False
             x, y = self._position(message)
-            self.portal.NotifyPointerMotionAbsolute(
-                self.session_handle, {}, self.stream_id, x, y)
-            self.portal.NotifyPointerButton(
-                self.session_handle, {}, BTN_LEFT, BUTTON_PRESSED)
+            if backend is not None:
+                backend.pen_down(x, y)
+            else:
+                self.portal.NotifyPointerMotionAbsolute(
+                    self.session_handle, {}, self.stream_id, x, y)
+                self.portal.NotifyPointerButton(
+                    self.session_handle, {}, BTN_LEFT, BUTTON_PRESSED)
             self.pen_down = True
             return True
         if action == 2:  # tip motion
             if not self.pen_down:
                 raise TouchInputError("pen is not down")
             x, y = self._position(message)
-            self.portal.NotifyPointerMotionAbsolute(
-                self.session_handle, {}, self.stream_id, x, y)
+            self._pen_motion(backend, x, y)
             return True
         if action == 3:  # hover
             if self.pen_down or self.pointer_slot is not None:
                 return False
             x, y = self._position(message)
-            self.portal.NotifyPointerMotionAbsolute(
-                self.session_handle, {}, self.stream_id, x, y)
+            self._pen_motion(backend, x, y)
             return True
         if action == 1:  # tip up
             if not self.pen_down:
                 raise TouchInputError("pen is not down")
-            self.portal.NotifyPointerButton(
-                self.session_handle, {}, BTN_LEFT, BUTTON_RELEASED)
             self.pen_down = False
+            self._pen_release(backend)
             return True
 
         # Hover exit has no pointer equivalent. If Android omitted tip-up,
         # release here defensively so disconnect is not the only recovery.
         if self.pen_down:
+            self.pen_down = False
+            self._pen_release(backend)
+        return True
+
+    def _pen_motion(self, backend, x: float, y: float) -> None:
+        if backend is not None:
+            backend.pen_motion(x, y)
+        else:
+            self.portal.NotifyPointerMotionAbsolute(
+                self.session_handle, {}, self.stream_id, x, y)
+
+    def _pen_release(self, backend) -> None:
+        if backend is not None:
+            backend.pen_up()
+        else:
             self.portal.NotifyPointerButton(
                 self.session_handle, {}, BTN_LEFT, BUTTON_RELEASED)
-            self.pen_down = False
-        return True
 
     def release_all(self) -> None:
         """Best-effort release for websocket disconnect and host shutdown."""
@@ -404,8 +423,11 @@ class PortalTouchInput:
             self.active_slots.clear()
         if self.pointer_slot is not None or self.pen_down:
             try:
-                self.portal.NotifyPointerButton(
-                    self.session_handle, {}, BTN_LEFT, BUTTON_RELEASED)
+                if self.pen_down and getattr(self.touch_backend, "pen_capable", False):
+                    self.touch_backend.release_all()
+                else:
+                    self.portal.NotifyPointerButton(
+                        self.session_handle, {}, BTN_LEFT, BUTTON_RELEASED)
             except Exception:
                 pass
             self.pointer_slot = None

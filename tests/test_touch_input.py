@@ -183,6 +183,38 @@ class PortalTouchInputTests(unittest.TestCase):
             "NotifyPointerButton", "NotifyPointerMotionAbsolute", "NotifyPointerButton"])
         self.assertFalse(touch.pen_down)
 
+    def test_pen_uses_the_eis_backend_when_it_can_carry_a_pointer(self):
+        class Backend:
+            pen_capable = True
+            ready = True
+            def __init__(self):
+                self.calls = []
+            def pen_motion(self, x, y): self.calls.append(("pen_motion", x, y))
+            def pen_down(self, x, y): self.calls.append(("pen_down", x, y))
+            def pen_up(self): self.calls.append(("pen_up",))
+            def release_all(self): self.calls.append(("release_all",))
+        # Granted devices lack POINTER: the portal path would be refused, the
+        # backend carries the pen anyway.
+        touch, portal = controller(TOUCHSCREEN)
+        backend = Backend()
+        touch.touch_backend = backend
+        for event in ({"type": "pen", "action": 3, "x": 0.25, "y": 0.5},
+                      {"type": "pen", "action": 0, "x": 0.25, "y": 0.5},
+                      {"type": "pen", "action": 2, "x": 0.5, "y": 0.75},
+                      {"type": "pen", "action": 1, "x": 0.5, "y": 0.75}):
+            self.assertTrue(touch.handle_message(event))
+        self.assertEqual([c[0] for c in backend.calls],
+                         ["pen_motion", "pen_down", "pen_motion", "pen_up"])
+        self.assertEqual(backend.calls[1][1:], (493.25, 616.0))
+        self.assertEqual(portal.calls, [])
+        # Cancel/disconnect while the tip is down releases through the backend.
+        touch.handle_message({"type": "pen", "action": 0, "x": 0.25, "y": 0.5})
+        touch.release_all()
+        self.assertEqual(backend.calls[-1], ("release_all",))
+        self.assertFalse(touch.pen_down)
+        with self.assertRaises(TouchInputError):
+            touch.handle_message({"type": "pen", "action": 2, "x": 0.5, "y": 0.5})
+
     def test_pen_requires_pointer_and_disconnect_releases_tip(self):
         touch, portal = controller(TOUCHSCREEN)
         self.assertFalse(touch.handle_message(

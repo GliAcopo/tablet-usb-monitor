@@ -27,6 +27,8 @@ EI_DEVICE_CAP_POINTER_ABSOLUTE = 1 << 1
 EI_DEVICE_CAP_TOUCH = 1 << 3
 EI_DEVICE_CAP_BUTTON = 1 << 5
 
+BTN_LEFT = 0x110  # Linux evdev code; libei buttons use evdev codes.
+
 EI_EVENT_CONNECT = 1
 EI_EVENT_DISCONNECT = 2
 EI_EVENT_SEAT_ADDED = 3
@@ -86,6 +88,8 @@ def _load():
         'ei_touch_motion': (None, [P, ctypes.c_double, ctypes.c_double]),
         'ei_touch_up': (None, [P]),
         'ei_touch_unref': (P, [P]),
+        'ei_device_pointer_motion_absolute': (None, [P, ctypes.c_double, ctypes.c_double]),
+        'ei_device_button_button': (None, [P, ctypes.c_uint32, ctypes.c_bool]),
     }
     for fname, (restype, argtypes) in sigs.items():
         fn = getattr(lib, fname)
@@ -121,6 +125,7 @@ class EisTouch:
         self.connected = False
         self._sequence = 0
         self._touches: dict[int, ctypes.c_void_p] = {}
+        self._pen_down = False
         self._devices: dict[int, ctypes.c_void_p] = {}
         self._resumed: set[int] = set()
         self._closed = False
@@ -242,7 +247,15 @@ class EisTouch:
             self._sequence += 1
             self.lib.ei_device_start_emulating(device, self._sequence)
         self.device, self.region, self.ready = device, region, True
+        if changed:
+            log.info('EIS device bound; pen (absolute pointer + button): %s', self.pen_capable)
         return True
+
+    @property
+    def pen_capable(self) -> bool:
+        """Whether the bound device can also carry the S Pen as an absolute pointer."""
+        return bool(self.device) and all(self.lib.ei_device_has_capability(self.device, cap)
+            for cap in (EI_DEVICE_CAP_POINTER_ABSOLUTE, EI_DEVICE_CAP_BUTTON))
 
     # -- injection --------------------------------------------------------------
     def _absolute(self, x: float, y: float) -> tuple[float, float]:
@@ -291,12 +304,48 @@ class EisTouch:
             self.lib.ei_device_frame(self.device, self.lib.ei_now(self.ei))
         self.lib.ei_touch_unref(touch)
 
+    # -- S Pen as an absolute pointer on the same device -----------------------
+    def _require_pen(self):
+        self._require_ready()
+        if not self.pen_capable:
+            raise EisError('EIS device has no absolute pointer for the pen')
+
+    def pen_motion(self, x: float, y: float) -> None:
+        """Hover or tip motion: move the pointer without changing the button."""
+        self._require_pen()
+        ax, ay = self._absolute(x, y)
+        self.lib.ei_device_pointer_motion_absolute(self.device, ax, ay)
+        self.lib.ei_device_frame(self.device, self.lib.ei_now(self.ei))
+
+    def pen_down(self, x: float, y: float) -> None:
+        self._require_pen()
+        if self._pen_down:
+            raise EisError('duplicate EIS pen down')
+        ax, ay = self._absolute(x, y)
+        self.lib.ei_device_pointer_motion_absolute(self.device, ax, ay)
+        self.lib.ei_device_button_button(self.device, BTN_LEFT, True)
+        self.lib.ei_device_frame(self.device, self.lib.ei_now(self.ei))
+        self._pen_down = True
+
+    def pen_up(self) -> None:
+        if not self._pen_down:
+            raise EisError('EIS pen is not down')
+        self._pen_down = False
+        self._require_pen()
+        self.lib.ei_device_button_button(self.device, BTN_LEFT, False)
+        self.lib.ei_device_frame(self.device, self.lib.ei_now(self.ei))
+
     def release_all(self) -> None:
         for slot in list(self._touches):
             try:
                 self.up(slot)
             except Exception:
                 pass
+        if self._pen_down:
+            try:
+                self.pen_up()
+            except Exception:
+                self._pen_down = False
 
     def _release_contacts(self) -> None:
         for touch in self._touches.values():
@@ -305,10 +354,14 @@ class EisTouch:
                     self.lib.ei_touch_up(touch)
             with contextlib.suppress(Exception):
                 self.lib.ei_touch_unref(touch)
-        if self._touches and self.ready and self.device:
+        if self._pen_down and self.ready and self.device:
+            with contextlib.suppress(Exception):
+                self.lib.ei_device_button_button(self.device, BTN_LEFT, False)
+        if (self._touches or self._pen_down) and self.ready and self.device:
             with contextlib.suppress(Exception):
                 self.lib.ei_device_frame(self.device, self.lib.ei_now(self.ei))
         self._touches.clear()
+        self._pen_down = False
 
     def close(self) -> None:
         if self._closed:

@@ -844,7 +844,7 @@ class Host:
             try:
                 self.touch.handle_message(message)
             except (TouchInputError, dbus.DBusException, EisError) as error:
-                followon = 'slot is not active' in str(error)
+                followon = 'slot is not active' in str(error) or 'pen is not down' in str(error)
                 if followon:
                     self.input_followon_rejected += 1
                 else:

@@ -329,11 +329,18 @@ class TouchCapture {
             }
 
             MotionEvent.ACTION_CANCEL -> {
+                // A cancelled pen contact must lift the pen, not a touch slot:
+                // the host tracks the two separately and would otherwise keep
+                // the pointer button pressed until the socket drops.
                 for (i in 0 until pointerCount) {
                     if (isPalm(event, i)) continue
-                    sendTouch(event.getX(i) / vw,
-                        event.getY(i) / vh,
-                        0.0, 1, slotOf(event, i))
+                    if (isPenLike(event, i)) {
+                        sendPenEvent(event, i, 1, vw, vh)
+                    } else {
+                        sendTouch(event.getX(i) / vw,
+                            event.getY(i) / vh,
+                            0.0, 1, slotOf(event, i))
+                    }
                 }
             }
         }
