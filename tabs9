@@ -1,7 +1,44 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$(realpath "$0")")"
-unit=tab-s9-usb-display.service
+unit=${TABS9_UNIT:-tab-s9-usb-display.service}
+status_file=${TABS9_STATUS_FILE:-.local/state/host.status.json}
+
+# Prints "phase<US>message<US>stale" for status_file, cross-checked against
+# the unit's MainPID (pass "" when the unit is not active) via
+# status.status_summary. A phase is 'stale' when it cannot be trusted to
+# describe the process systemd currently tracks: a leftover file from a
+# different pid (e.g. ./tabs9 bench-capture, which writes the same status
+# file outside systemd), a non-terminal phase left behind by a process that
+# is no longer running, or a non-terminal phase old enough to be a stuck
+# write rather than a genuinely long-running one.
+status_line() {
+  local pid="${1:-}"
+  # Use \x1f (unit separator) rather than a tab: IFS classifies tab as
+  # whitespace, so `IFS=$'\t' read` squeezes consecutive tabs and would
+  # misalign fields whenever the message is empty.
+  python3 -c '
+import sys
+sys.path.insert(0, "src")
+from pathlib import Path
+from status import status_summary
+pid = int(sys.argv[2]) if sys.argv[2] else None
+s = status_summary(Path(sys.argv[1]), pid)
+msg = (s["message"] or "").replace("\x1f", " ").replace("\n", " ")
+print((s["phase"] or "") + "\x1f" + msg + "\x1f" + ("1" if s["stale"] else "0"))
+' "$status_file" "$pid" 2>/dev/null || printf '\x1f\x1f0\n'
+}
+
+# Empty string when the unit is not active (systemd reports MainPID=0 then).
+unit_main_pid() {
+  local pid
+  pid=$(systemctl --user show --property=MainPID --value "$unit" 2>/dev/null || true)
+  if [[ -z "$pid" || "$pid" == "0" ]]; then
+    return 0
+  fi
+  printf '%s' "$pid"
+}
+
 case "${1:-help}" in
   setup) exec python3 scripts/setup.py ;;
   doctor) exec python3 scripts/doctor.py ;;
@@ -12,10 +49,79 @@ case "${1:-help}" in
       exit 0
     fi
     python3 scripts/doctor.py --check
+    # Clear stale status before starting
+    rm -f "$status_file"
     systemd-run --user --quiet --collect --unit="$unit" \
       --property=Type=exec --property=TimeoutStopSec=10 --property=KillMode=mixed \
       --working-directory="$PWD" /usr/bin/python3 -u "$PWD/src/host.py" "$@"
-    echo 'USB display started. Complete the KDE sharing dialog(s).'
+    # Wait for the host to report its actual state (bounded timeout)
+    echo 'Waiting for host to initialize...'
+    timeout=60
+    elapsed=0
+    consent_printed=false
+    while (( elapsed < timeout )); do
+      # Check liveness FIRST: a status file must never be able to report
+      # success (or any other stale phase) for a unit that is already gone.
+      if ! systemctl --user is-active --quiet "$unit" 2>/dev/null; then
+        IFS=$'\x1f' read -r phase msg _ < <(status_line "")
+        if [[ "$phase" == "failed" ]]; then
+          echo "✗ USB display failed: $msg"
+        elif [[ "$phase" == "stopped" ]]; then
+          echo "✗ USB display stopped: $msg"
+        else
+          echo '✗ USB display service exited unexpectedly.'
+        fi
+        exit 1
+      fi
+      pid=$(unit_main_pid)
+      IFS=$'\x1f' read -r phase msg stale < <(status_line "$pid")
+      if [[ "$stale" == "1" ]]; then
+        phase=""
+      fi
+      case "$phase" in
+        streaming)
+          # Re-check liveness immediately before declaring success, closing
+          # the window between the read above and this line.
+          if systemctl --user is-active --quiet "$unit" 2>/dev/null; then
+            echo '✓ USB display is streaming.'
+            exit 0
+          fi
+          ;;
+        failed)
+          echo "✗ USB display failed to start: $msg"
+          exit 1
+          ;;
+        stopped)
+          echo "✗ USB display stopped: $msg"
+          exit 1
+          ;;
+        waiting_virtual_consent)
+          if [[ "$consent_printed" == false ]]; then
+            echo ''
+            echo '────────────────────────────────────────────────────────'
+            echo '  Two KDE consent dialogs will appear (one at a time):'
+            echo ''
+            echo '  1. "Share virtual screen" → creates the virtual output'
+            echo '     Click "Share" to allow (prompted each start on KDE).'
+            echo ''
+            echo '  2. Remote-control dialog → click "Allow" (no screen to pick:'
+            echo '     KDE shares every screen and the host selects the virtual'
+            echo '     one). One-time if "Allow restoring" stays checked.'
+            echo '────────────────────────────────────────────────────────'
+            echo ''
+            consent_printed=true
+          fi
+          ;;
+        waiting_capture_consent)
+          # Second dialog — just keep waiting
+          ;;
+      esac
+      sleep 1
+      (( elapsed++ )) || true
+    done
+    echo '⚠ Timeout waiting for host to reach streaming state.'
+    echo '  The service is still running. Check: ./tabs9 status ; ./tabs9 logs'
+    exit 2
     ;;
   stop)
     if systemctl --user is-active --quiet "$unit"; then
@@ -25,9 +131,27 @@ case "${1:-help}" in
     ;;
   status)
     if systemctl --user is-active --quiet "$unit"; then
-      echo 'USB display service: running'
+      pid=$(unit_main_pid)
+      IFS=$'\x1f' read -r phase msg stale < <(status_line "$pid")
+      if [[ "$stale" == "1" ]]; then
+        echo 'USB display service: running (status file does not match this instance)'
+      elif [[ -n "$phase" ]]; then
+        echo "USB display service: running (phase: $phase)"
+        if [[ -n "$msg" ]]; then
+          echo "  $msg"
+        fi
+      else
+        echo 'USB display service: running'
+      fi
     else
-      echo 'USB display service: stopped'
+      IFS=$'\x1f' read -r phase msg stale < <(status_line "")
+      if [[ "$stale" == "1" ]]; then
+        echo 'USB display service: stopped (stale status left over from a previous run)'
+      elif [[ "$phase" == "failed" ]]; then
+        echo "USB display service: stopped (last failure: $msg)"
+      else
+        echo 'USB display service: stopped'
+      fi
     fi
     ;;
   logs) journalctl --user -u "$unit" --no-pager -n 30 -o cat ;;
@@ -37,7 +161,7 @@ case "${1:-help}" in
     echo 'Usage: ./tabs9 {setup|doctor|start [options]|stop|status|logs}'
     echo '              {test-motion [--seconds N]|bench-capture [--seconds N]}'
     echo '  start options: --fps 30|60|90|120  --bitrate 40000  --scale 1.5'
-    echo '                 --width 2960 --height 1848  --capture-memory system|gl'
+    echo '                 --width 2960 --height 1848  --capture-memory va|system|gl'
     echo '  bench-capture compares both capture paths under continuous motion;'
     echo '  it needs the two KDE sharing dialogs answered once per path.'
     ;;

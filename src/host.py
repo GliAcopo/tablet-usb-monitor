@@ -28,9 +28,82 @@ gi.require_version('Gst', '1.0')
 from gi.repository import GLib, GLibUnix, Gst
 from websockets.asyncio.server import serve
 from touch_input import LiveKScreenTarget, FixedTarget, PortalTouchInput, TouchInputError
+from eis_touch import EisTouch, EisError
+from status import StatusWriter
+from tokens import load_tokens, save_token, discard_token
 
 ROOT = Path(__file__).resolve().parents[1]
 ADB = ROOT / '.local/platform-tools/adb'
+STATE_DIR = ROOT / '.local/state'
+STATUS_FILE = STATE_DIR / 'host.status.json'
+TOKENS_FILE = STATE_DIR / 'portal_tokens.json'
+
+# Cap on retrying the capture session after the user selects the wrong output
+# (e.g. the laptop screen instead of the Virtual Output), so a confused user
+# gets a clear failure instead of an unbounded prompt loop that the
+# supervised `tabs9 start` would otherwise report as a silent 60s hang.
+MAX_WRONG_SOURCE_ATTEMPTS = 3
+CAPTURE_DIALOG_HINT = 'Click Allow in the KDE remote-control dialog (keep "Allow restoring" ticked).'
+
+
+def notify(summary, body, urgency='normal'):
+    """Best-effort desktop notification; the terminal is hidden behind the portal dialog."""
+    with contextlib.suppress(Exception):
+        subprocess.run(['notify-send', '-a', 'Tab S9 USB display', '-u', urgency, '-t', '15000', summary, body],
+            capture_output=True, timeout=5)
+
+
+def describe_wrong_source(size, outputs_now, expected):
+    """Name what the user actually picked so the retry hint is concrete."""
+    w, h = size if len(size) == 2 else (0, 0)
+    enabled = [o for o in outputs_now if isinstance(o, dict) and o.get('enabled', False)]
+    logical = {}
+    for o in enabled:
+        scale = o.get('scale', 1.0) or 1.0
+        pw, ph = _resolve_mode_size(o)
+        if _is_rotated_90(o.get('rotation', 1)):
+            pw, ph = ph, pw
+        logical[o['name']] = ((o.get('pos') or {}).get('x', 0), (o.get('pos') or {}).get('y', 0),
+            round(pw / scale), round(ph / scale), pw, ph)
+    if len(logical) > 1:
+        union_w = max(x + lw for x, y, lw, lh, pw, ph in logical.values())
+        union_h = max(y + lh for x, y, lw, lh, pw, ph in logical.values())
+        if (w, h) == (union_w, union_h):
+            return 'the full Workspace (all screens together)'
+    for name, (x, y, lw, lh, pw, ph) in logical.items():
+        if (w, h) in ((lw, lh), (pw, ph)) and (w, h) != expected:
+            return f'the screen {name}'
+    return f'a {w}x{h} source'
+
+
+def select_virtual_stream(streams, expected_logical, expected_pixels, virtual_x=None):
+    """Pick the portal stream that is the virtual output, or None.
+
+    A stream matches by size (KWin reports logical or native pixels depending
+    on version); when several match and positions are present, prefer the one
+    at the virtual output's logical x.
+    """
+    candidates = []
+    for entry in streams:
+        try:
+            node, props = entry
+        except (TypeError, ValueError):
+            continue
+        if int(props.get('source_type', 1) or 1) != 1:
+            continue
+        size = tuple(int(x) for x in props.get('size', []))
+        if size not in (tuple(expected_logical), tuple(expected_pixels)):
+            continue
+        candidates.append((node, props))
+    if not candidates:
+        return None
+    if len(candidates) > 1 and isinstance(virtual_x, int):
+        for node, props in candidates:
+            pos = props.get('position')
+            if pos and int(pos[0]) == virtual_x:
+                return (node, props)
+    return candidates[0]
+
 
 def adb(*args):
     result = subprocess.run([str(ADB), '-d', *args], capture_output=True, timeout=30)
@@ -40,6 +113,91 @@ def adb(*args):
 
 def outputs():
     return json.loads(subprocess.check_output(['kscreen-doctor', '-j']))['outputs']
+
+# libkscreen's Output::Rotation bitmask (as reported by `kscreen-doctor -j`):
+# None=1, Left=2, Inverted=4, Right=8. Left/Right are 90-degree turns that
+# swap logical width and height; Inverted (180 degrees) does not. Some
+# kscreen-doctor builds report the name instead of the bitmask.
+_ROTATED_90_INTS = (2, 8)
+_ROTATED_90_NAMES = ('left', 'right')
+
+# Used only when an output's currentModeId cannot be resolved against its own
+# modes list (incomplete/malformed KScreen data). Guessing a plausible
+# physical size is safer than dropping the output's extent, which would let
+# the virtual output land at (0, 0) directly on top of it.
+_FALLBACK_MODE_SIZE = (1920, 1080)
+
+
+def _is_rotated_90(rotation):
+    if isinstance(rotation, bool):
+        return False
+    if isinstance(rotation, int):
+        return rotation in _ROTATED_90_INTS
+    if isinstance(rotation, str):
+        return rotation.strip().lower() in _ROTATED_90_NAMES
+    return False
+
+
+def _resolve_mode_size(output):
+    """Return (pixel_width, pixel_height) for an output's current mode.
+
+    Falls back to the widest advertised mode, then to a conservative
+    constant, rather than ever reporting a zero-sized extent for an enabled
+    output whose mode data is incomplete.
+    """
+    modes = output.get('modes')
+    modes = [m for m in modes if isinstance(m, dict)] if isinstance(modes, list) else []
+    current_mode_id = output.get('currentModeId')
+    mode = next((m for m in modes if m.get('id') == current_mode_id), None)
+    if mode is None:
+        mode = max(modes, key=lambda m: (m.get('size') or {}).get('width', 0) or 0,
+                   default=None)
+    size = (mode.get('size') if mode else None) or {}
+    width, height = size.get('width'), size.get('height')
+    if not isinstance(width, (int, float)) or isinstance(width, bool) or width <= 0:
+        width = _FALLBACK_MODE_SIZE[0]
+    if not isinstance(height, (int, float)) or isinstance(height, bool) or height <= 0:
+        height = _FALLBACK_MODE_SIZE[1]
+    return width, height
+
+
+def compute_virtual_position(current_outputs, previous_names):
+    """Compute the position to place the virtual output to the RIGHT of all
+    existing enabled physical outputs, using non-negative coordinates.
+
+    Accounts for 90-degree output rotation (which swaps logical width and
+    height) and never lets an incomplete or malformed output description
+    collapse the result to (0, 0) when an enabled physical output exists --
+    that would place the virtual output directly on top of it.
+
+    Returns (x, y) where y is 0 and x is at the right edge of the rightmost
+    physical output's logical extent.
+    """
+    right_edge = 0
+    seen_enabled = False
+    for o in current_outputs:
+        if not isinstance(o, dict) or o.get('name') not in previous_names or not o.get('enabled', False):
+            continue
+        seen_enabled = True
+        pos_x = (o.get('pos') or {}).get('x', 0)
+        if not isinstance(pos_x, (int, float)) or isinstance(pos_x, bool):
+            pos_x = 0
+        o_scale = o.get('scale', 1.0) or 1.0
+        if not isinstance(o_scale, (int, float)) or isinstance(o_scale, bool) or o_scale <= 0:
+            o_scale = 1.0
+        pixel_w, pixel_h = _resolve_mode_size(o)
+        if _is_rotated_90(o.get('rotation', 1)):
+            pixel_w, pixel_h = pixel_h, pixel_w
+        logical_w = round(pixel_w / o_scale)
+        edge = pos_x + logical_w
+        if edge > right_edge:
+            right_edge = edge
+    # If no enabled previously-known output contributed a usable extent,
+    # there is nothing to avoid overlapping; place at the origin.
+    if not seen_enabled:
+        return (0, 0)
+    return (max(0, right_edge), 0)
+
 
 class Host:
     def __init__(self, args):
@@ -83,11 +241,35 @@ class Host:
         self.previous = {o['name'] for o in outputs()}
         self.virtual_name = None
         self.touch = None
+        self.eis = None
         self.closing = False
         self.session_watches = []
         self.reverse_ports = []
         self.ready = threading.Event()
         self.aio = asyncio.new_event_loop()
+        # Status reporting
+        self.status = StatusWriter(STATUS_FILE)
+        # Token persistence
+        self.tokens_file = TOKENS_FILE
+        self._capture_token_used = False
+        self._wrong_source_attempts = 0
+        self.failed = False
+
+    def _fail(self, message):
+        """Report failure and quit the main loop.
+
+        Idempotent: a pipeline error can be followed by the session-closed
+        watcher firing for the same teardown, and the first failure (not a
+        secondary symptom of it) is the one worth keeping in the status file.
+        Also guarantees loop.quit() is requested at most once.
+        """
+        if self.failed:
+            return
+        self.failed = True
+        with contextlib.suppress(Exception):
+            self.status.write('failed', message)
+        print(message, flush=True)
+        self.loop.quit()
 
     def request(self, method, args, callback):
         token = 'tabs9_' + secrets.token_hex(8)
@@ -95,14 +277,12 @@ class Host:
         def response(code, result):
             match.remove()
             if code:
-                print('Sharing was declined or failed.', flush=True)
-                self.loop.quit()
+                self._handle_portal_rejection(code, callback)
             else:
                 try:
                     callback(result)
                 except Exception as error:
-                    print('Portal setup failed:', type(error).__name__, flush=True)
-                    self.loop.quit()
+                    self._fail('Portal setup failed: ' + type(error).__name__)
         match = self.bus.add_signal_receiver(response, signal_name='Response',
             dbus_interface='org.freedesktop.portal.Request', path=path)
         args[-1]['handle_token'] = token
@@ -112,17 +292,58 @@ class Host:
             match.remove()
             raise
 
+    def _handle_portal_rejection(self, code, callback):
+        """Handle portal response code != 0.
+
+        code 1 = user cancelled; code 2 = other error.
+        If we used a restore token for this phase, discard it and retry once
+        interactively.  The token flag is set exactly once per phase, so
+        at most one interactive retry is possible.
+
+        KDE 6.6.6 does not implement persistence for virtual-output creation
+        (ScreenCast type=4): that session never requests persist_mode, so
+        there is no creation-side token to discard here -- only the capture
+        (RemoteDesktop+ScreenCast) session can hold a restore token.
+        """
+        # Capture (RemoteDesktop+ScreenCast) token was attempted and the
+        # rejection arrived at SelectDevices, SelectSources, or Start on the
+        # capture session.  Restart the full capture session because the
+        # portal may have closed the session handle on failure.
+        if self._capture_token_used:
+            self._capture_token_used = False
+            discard_token(self.tokens_file, 'remotedesktop_capture')
+            if self.session:
+                with contextlib.suppress(Exception):
+                    dbus.Interface(self.bus.get_object('org.freedesktop.portal.Desktop', self.session),
+                        'org.freedesktop.portal.Session').Close()
+                self.session = None
+            print('Stored capture token was stale; retrying with interactive consent.', flush=True)
+            self.request_capture_session()
+            return
+        if code == 1:
+            self._fail('Portal sharing was cancelled by the user.')
+        else:
+            self._fail('Portal sharing failed (error code ' + str(code) + ').')
+
     def create(self):
+        self.status.write('waiting_virtual_consent')
         self.request(self.portal.CreateSession, [dbus.Dictionary({
             'session_handle_token': 'tabs9_' + secrets.token_hex(8)}, signature='sv')], self.created)
 
     def created(self, result):
         self.session = result['session_handle']
-        self.request(self.portal.SelectSources, [self.session, dbus.Dictionary({
+        # KDE 6.6.6 does not implement persistence for virtual-output creation
+        # (ScreenCast type=4), so this session never requests persist_mode or
+        # presents a restore_token: doing so would promise a skipped dialog
+        # that this backend cannot deliver. See README's persistence section.
+        options = dbus.Dictionary({
             'types': dbus.UInt32(4), 'multiple': False,
-            'cursor_mode': dbus.UInt32(2)}, signature='sv')], self.selected)
+            'cursor_mode': dbus.UInt32(2),
+        }, signature='sv')
+        self.request(self.portal.SelectSources, [self.session, options], self.selected)
 
     def selected(self, result):
+        # restore_token is returned by Start, not SelectSources; proceed to Start.
         api = self.portal if self.creation_session is None else self.remote
         self.request(api.Start, [self.session, '', dbus.Dictionary({}, signature='sv')], self.started)
 
@@ -131,43 +352,83 @@ class Host:
         # output. KWin binds the first stream to that logical output permanently.
         # Configure extension first, then request a fresh stream of that output.
         if self.creation_session is None:
+            if not result.get('streams') or int(result['streams'][0][1].get('source_type', 0)) != 4:
+                self._fail('Refusing a non-virtual creation source.')
+                return
             self.creation_session = self.session
             self.session = None
             self.watch_session(self.creation_session)
-            if int(result['streams'][0][1].get('source_type', 0)) != 4:
-                print('Refusing a non-virtual creation source.', flush=True)
-                self.loop.quit()
-                return
+            self.status.write('configuring_output')
             GLib.timeout_add_seconds(1, self.configure_output)
             return
-        node, props = result['streams'][0]
+        if not result.get('streams'):
+            self._fail('No streams returned by portal.')
+            return
+        # KDE's RemoteDesktop portal never shows a screen chooser: with
+        # `multiple` it streams every screen, without it the whole workspace.
+        # So ask for all of them and pick the one that is the virtual output.
         expected = (round(self.args.width / self.args.scale), round(self.args.height / self.args.scale))
-        size = tuple(int(x) for x in props.get('size', []))
-        print('Selected capture size:', size, flush=True)
-        if int(props.get('source_type', 0)) != 1 or size not in (expected, (self.args.width, self.args.height)):
-            print('Wrong source: select the existing Virtual Output, not the laptop.', flush=True)
-            dbus.Interface(self.bus.get_object('org.freedesktop.portal.Desktop', self.session),
-                'org.freedesktop.portal.Session').Close()
+        chosen = select_virtual_stream(result['streams'], expected, (self.args.width, self.args.height),
+            self._virtual_x())
+        sizes = [tuple(int(x) for x in props.get('size', [])) for _, props in result['streams']]
+        print('Portal streams:', sizes, flush=True)
+        if chosen is None:
+            picked = describe_wrong_source(sizes[0] if sizes else (), outputs(), expected)
+            print(f'Wrong source: the portal shared {picked}, not the Virtual Output.', flush=True)
+            notify('Wrong screen shared', f'KDE shared {picked} instead of the Virtual Output; retrying.', 'critical')
+            if self._capture_token_used:
+                discard_token(self.tokens_file, 'remotedesktop_capture')
+                self._capture_token_used = False
+            if self.session:
+                with contextlib.suppress(Exception):
+                    dbus.Interface(self.bus.get_object('org.freedesktop.portal.Desktop', self.session),
+                        'org.freedesktop.portal.Session').Close()
+                self.session = None
+            self._wrong_source_attempts += 1
+            if self._wrong_source_attempts > MAX_WRONG_SOURCE_ATTEMPTS:
+                self._fail('Too many incorrect source selections; giving up.')
+                return
             self.request_capture_session()
             return
+        # Virtual Output source is verified; save the capture restore token now
+        restore_token = result.get('restore_token')
+        if restore_token and isinstance(restore_token, str) and len(restore_token) > 0:
+            save_token(self.tokens_file, 'remotedesktop_capture', str(restore_token))
         geometry = LiveKScreenTarget(self.virtual_name).geometry()
-        self.touch = PortalTouchInput.bind(self.remote, str(self.session), result['streams'][0],
+        node, props = chosen
+        print('Selected capture size:', tuple(int(x) for x in props.get('size', [])), flush=True)
+        self.touch = PortalTouchInput.bind(self.remote, str(self.session), chosen,
             FixedTarget(geometry), int(result.get('devices', 0)))
         self.watch_session(self.session)
+        self.connect_eis(geometry)
         print('Tablet input mode:', self.touch.mode, flush=True)
         self.fd = self.portal.OpenPipeWireRemote(self.session, dbus.Dictionary({}, signature='sv')).take()
         self.capture_node = int(node)
         self.start_pipeline()
 
     def start_pipeline(self):
-        conversion = ('! glupload ! glcolorconvert ! video/x-raw(memory:GLMemory),format=RGBA '
-                      if self.memory_mode == 'gl' else '! video/x-raw,format=BGRx ')
+        if self.memory_mode == 'va':
+            # Same-GPU zero copy: KWin's DMA-BUF is imported by the Intel VA
+            # driver that also composites it; no readback, no cross-GPU hop.
+            # The queue lets colour conversion and encoding overlap on the GPU.
+            encode = ('! vapostproc ! video/x-raw(memory:VAMemory),format=NV12 '
+                      '! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream '
+                      f'! vah265enc name=encoder rate-control=cbr bitrate={self.args.bitrate} '
+                      f'key-int-max={self.args.fps} b-frames=0 ref-frames=1 target-usage=7 ')
+        else:
+            conversion = ('! glupload ! glcolorconvert ! video/x-raw(memory:GLMemory),format=RGBA '
+                          if self.memory_mode == 'gl' else '! video/x-raw,format=BGRx ')
+            encode = (conversion +
+                f'! nvh265enc name=encoder preset=p1 tune=ultra-low-latency rc-mode=cbr bitrate={self.args.bitrate} '
+                f'gop-size={self.args.fps} bframes=0 zerolatency=true repeat-sequence-header=true ')
+        # KWin offers only 2..4 buffers (default 3).  Ask for 4 and never park
+        # more than one of them in the queue, or KWin has nothing to render into
+        # at 120 Hz and drops frames.
         description = (
             f'pipewiresrc name=capture fd={self.fd} path={self.capture_node} do-timestamp=true keepalive-time=1000 '
-            '! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream '
-            + conversion +
-            f'! nvh265enc name=encoder preset=p1 tune=ultra-low-latency rc-mode=cbr bitrate={self.args.bitrate} '
-            f'gop-size={self.args.fps} bframes=0 zerolatency=true repeat-sequence-header=true '
+            'min-buffers=4 max-buffers=4 '
+            '! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream '
+            + encode +
             '! video/x-h265,profile=main '
             '! h265parse config-interval=-1 ! video/x-h265,stream-format=byte-stream,alignment=au '
             '! appsink name=encoded emit-signals=true sync=false max-buffers=2 drop=true'
@@ -184,6 +445,7 @@ class Host:
             self.pipeline.set_state(Gst.State.PLAYING)
             if self.report_timer is None:
                 self.report_timer = GLib.timeout_add_seconds(5, self.report)
+            self.status.write('streaming')
             print('Capture authorized; starting encoder. Memory path:', self.memory_mode, flush=True)
         except Exception as error:
             print('Encoder setup failed:', type(error).__name__, flush=True)
@@ -196,8 +458,8 @@ class Host:
         self.fallback_or_stop()
 
     def fallback_or_stop(self):
-        if self.memory_mode != 'gl':
-            self.loop.quit()
+        if self.memory_mode not in ('gl', 'va'):
+            self._fail('Video pipeline failed.')
             return
         self.memory_mode = 'system'
         if self.pipeline_bus:
@@ -238,8 +500,7 @@ class Host:
         try:
             return self._configure_output()
         except Exception as error:
-            print('Display setup failed:', type(error).__name__, flush=True)
-            self.loop.quit()
+            self._fail('Display setup failed: ' + type(error).__name__)
             return False
 
     def _configure_output(self):
@@ -254,11 +515,10 @@ class Host:
         def configure(*settings):
             subprocess.run(['kscreen-doctor', *settings], capture_output=True, check=True)
         configure(f'output.{name}.addCustomMode.{a.width}.{a.height}.{a.fps * 1000}.reduced')
-        left = min((o.get('pos', {}).get('x', 0)
-                    for o in current if o['name'] in self.previous and o['enabled']), default=0)
-        x = left - round(a.width / a.scale)
+        # Place virtual output to the RIGHT of all existing physical outputs
+        x, y = compute_virtual_position(current, self.previous)
         configure(f'output.{name}.mode.{a.width}x{a.height}@{a.fps}',
-            f'output.{name}.scale.{a.scale}', f'output.{name}.position.{x},0', f'output.{name}.enable')
+            f'output.{name}.scale.{a.scale}', f'output.{name}.position.{x},{y}', f'output.{name}.enable')
         final = next(o for o in outputs() if o['name'] == name)
         mode = next(m for m in final['modes'] if m['id'] == final['currentModeId'])
         print('Extended output:', json.dumps({'size': mode['size'], 'Hz': mode['refreshRate'],
@@ -267,28 +527,69 @@ class Host:
         self.request_capture_session()
         return False
 
+    def connect_eis(self, geometry):
+        """Prefer libei for touch; fall back to the portal's own calls."""
+        if not self.touch.touch_enabled:
+            return
+        try:
+            fd = self.remote.ConnectToEIS(self.session, dbus.Dictionary({}, signature='sv')).take()
+            self.eis = EisTouch(fd, lambda: (geometry.x, geometry.y, *geometry.logical_size))
+        except (dbus.DBusException, EisError, AttributeError) as error:
+            print('EIS unavailable, using portal touch:', type(error).__name__, error, flush=True)
+            return
+        def pump(*_):
+            try:
+                self.eis.dispatch()
+            except Exception as error:
+                print('EIS dispatch failed:', type(error).__name__, error, flush=True)
+                return False
+            return True
+        GLib.io_add_watch(self.eis.fd, GLib.PRIORITY_DEFAULT, GLib.IOCondition.IN, pump)
+        self.touch.touch_backend = self.eis
+        # A touch before the EIS device is resumed raises and is counted as rejected.
+
+    def _virtual_x(self):
+        with contextlib.suppress(Exception):
+            return next(o['pos']['x'] for o in outputs() if o['name'] == self.virtual_name)
+        return '?'
+
     def request_capture_session(self):
+        self.status.write('waiting_capture_consent')
         self.request(self.remote.CreateSession, [dbus.Dictionary({
             'session_handle_token': 'tabs9_capture_' + secrets.token_hex(8)}, signature='sv')], self.capture_created)
 
     def watch_session(self, session):
         def closed(*args):
             if not self.closing:
-                print('KDE sharing session ended.', flush=True)
-                self.loop.quit()
+                self._fail('KDE sharing session ended unexpectedly.')
         self.session_watches.append(self.bus.add_signal_receiver(closed,
             signal_name='Closed', dbus_interface='org.freedesktop.portal.Session', path=str(session)))
 
     def capture_created(self, result):
         self.session = result['session_handle']
         print('Choose the existing virtual monitor in the sharing dialog.', flush=True)
-        self.request(self.remote.SelectDevices, [self.session, dbus.Dictionary({
-            'types': dbus.UInt32(6)}, signature='sv')], self.capture_devices_selected)
+        notify('Allow screen sharing and input', CAPTURE_DIALOG_HINT)
+        options = dbus.Dictionary({
+            'types': dbus.UInt32(6),
+            'persist_mode': dbus.UInt32(2),
+        }, signature='sv')
+        tokens = load_tokens(self.tokens_file)
+        if 'remotedesktop_capture' in tokens:
+            options['restore_token'] = tokens['remotedesktop_capture']
+            self._capture_token_used = True
+        self.request(self.remote.SelectDevices, [self.session, options], self.capture_devices_selected)
 
     def capture_devices_selected(self, result):
-        self.request(self.portal.SelectSources, [self.session, dbus.Dictionary({
-            'types': dbus.UInt32(1), 'multiple': False,
-            'cursor_mode': dbus.UInt32(2)}, signature='sv')], self.selected)
+        self._do_capture_select_sources()
+
+    def _do_capture_select_sources(self):
+        """Issue SelectSources for the capture session."""
+        # multiple=True: KDE then streams one node per screen (see started()).
+        options = dbus.Dictionary({
+            'types': dbus.UInt32(1), 'multiple': True,
+            'cursor_mode': dbus.UInt32(2),
+        }, signature='sv')
+        self.request(self.portal.SelectSources, [self.session, options], self.selected)
 
     def sample(self, sink):
         sample = sink.emit('pull-sample')
@@ -424,8 +725,11 @@ class Host:
         if self.touch is not None:
             try:
                 self.touch.handle_message(message)
-            except (TouchInputError, dbus.DBusException):
+            except (TouchInputError, dbus.DBusException, EisError) as error:
                 self.input_rejected += 1
+                if self.input_rejected <= 5 or self.input_rejected % 100 == 0:
+                    print(f'Tablet input rejected ({self.input_rejected}): {type(error).__name__}: {error}',
+                        flush=True)
                 self.release_touch()
         return False
 
@@ -518,11 +822,16 @@ class Host:
         return True
 
     def run(self):
+        # A failing status write here must never prevent startup or skip the
+        # `finally` cleanup below -- nothing has been created yet, so there is
+        # nothing to leak, but the host should still try to run.
+        with contextlib.suppress(Exception):
+            self.status.write('starting')
         def worker():
             asyncio.set_event_loop(self.aio)
             self.aio.run_until_complete(self.servers())
-        threading.Thread(target=worker, daemon=True).start()
         try:
+            threading.Thread(target=worker, daemon=True).start()
             if not self.ready.wait(5): raise RuntimeError('Local streaming ports unavailable')
             # Report from the moment the sockets are up, not from the moment
             # capture starts: while the KDE sharing dialogs are still open this
@@ -537,21 +846,42 @@ class Host:
             for sig in (signal.SIGINT, signal.SIGTERM):
                 GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, sig, lambda: self.loop.quit() or False)
             self.loop.run()
+        except Exception as error:
+            # RuntimeErrors raised in this method carry static, non-sensitive
+            # messages we wrote ourselves (e.g. "Local streaming ports
+            # unavailable", adb()'s "USB device command failed..."); keep
+            # them, since they are far more actionable than the type name
+            # alone. Other exception types may carry paths or other detail
+            # from lower-level libraries, so only the type name is reported.
+            detail = str(error) if isinstance(error, RuntimeError) else type(error).__name__
+            self._fail('Host startup error: ' + detail)
         finally:
             self.closing = True
-            self.release_touch()
-            if self.pipeline: self.pipeline.set_state(Gst.State.NULL)
+            if not getattr(self, 'failed', False):
+                with contextlib.suppress(Exception):
+                    self.status.write('stopped')
+            with contextlib.suppress(Exception):
+                self.release_touch()
+            if getattr(self, 'eis', None) is not None:
+                with contextlib.suppress(Exception):
+                    self.eis.close()
+            if self.pipeline:
+                with contextlib.suppress(Exception):
+                    self.pipeline.set_state(Gst.State.NULL)
             for session in (self.session, self.creation_session):
                 if session:
-                    with contextlib.suppress(dbus.DBusException):
+                    with contextlib.suppress(Exception):
                         dbus.Interface(self.bus.get_object('org.freedesktop.portal.Desktop', session),
                             'org.freedesktop.portal.Session').Close()
-            for watch in self.session_watches: watch.remove()
+            for watch in self.session_watches:
+                with contextlib.suppress(Exception):
+                    watch.remove()
             if self.fd is not None:
-                with contextlib.suppress(OSError): os.close(self.fd)
+                with contextlib.suppress(OSError):
+                    os.close(self.fd)
             for port in self.reverse_ports:
-                try: adb('reverse', '--remove', f'tcp:{port}')
-                except Exception: pass
+                with contextlib.suppress(Exception):
+                    adb('reverse', '--remove', f'tcp:{port}')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -560,7 +890,7 @@ if __name__ == '__main__':
     parser.add_argument('--fps', type=int, choices=[30, 60, 90, 120], default=120)
     parser.add_argument('--bitrate', type=int, default=60000)
     parser.add_argument('--scale', type=float, default=1.5)
-    parser.add_argument('--capture-memory', choices=['system', 'gl'], default='system')
+    parser.add_argument('--capture-memory', choices=['va', 'system', 'gl'], default='va')
     args = parser.parse_args()
     if args.capture_memory == 'gl':
         os.environ['__NV_PRIME_RENDER_OFFLOAD'] = '1'
