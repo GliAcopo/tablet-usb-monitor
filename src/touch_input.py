@@ -181,6 +181,9 @@ class PortalTouchInput:
         self.active_slots: set[int] = set()
         self.pointer_slot: int | None = None
         self.pen_down = False
+        # Optional libei backend (see eis_touch.py); when set, touch contacts
+        # bypass the portal's NotifyTouch* calls.  Pen/pointer stay on the portal.
+        self.touch_backend = None
 
     @classmethod
     def bind(cls, portal: Portal, session_handle: str, stream: tuple[Any, Mapping[str, Any]],
@@ -226,7 +229,9 @@ class PortalTouchInput:
 
     @property
     def mode(self) -> str:
-        return "touchscreen" if self.touch_enabled else "pointer-fallback"
+        if self.touch_enabled:
+            return "touchscreen-eis" if self.touch_backend is not None else "touchscreen"
+        return "pointer-fallback"
 
     def _position(self, message: Mapping[str, Any]) -> tuple[float, float]:
         x = message.get("x")
@@ -273,17 +278,26 @@ class PortalTouchInput:
             if slot in self.active_slots:
                 raise TouchInputError("touch slot received a duplicate down")
             x, y = self._position(message)
-            self.portal.NotifyTouchDown(self.session_handle, {}, self.stream_id, slot, x, y)
+            if self.touch_backend is not None:
+                self.touch_backend.down(slot, x, y)
+            else:
+                self.portal.NotifyTouchDown(self.session_handle, {}, self.stream_id, slot, x, y)
             self.active_slots.add(slot)
             return True
         if slot not in self.active_slots:
             raise TouchInputError("touch slot is not active")
         if action == TOUCH_MOTION:
             x, y = self._position(message)
-            self.portal.NotifyTouchMotion(self.session_handle, {}, self.stream_id, slot, x, y)
+            if self.touch_backend is not None:
+                self.touch_backend.motion(slot, x, y)
+            else:
+                self.portal.NotifyTouchMotion(self.session_handle, {}, self.stream_id, slot, x, y)
         else:
-            self.portal.NotifyTouchUp(self.session_handle, {}, slot)
             self.active_slots.remove(slot)
+            if self.touch_backend is not None:
+                self.touch_backend.up(slot)
+            else:
+                self.portal.NotifyTouchUp(self.session_handle, {}, slot)
         return True
 
     def _handle_pointer(self, action: int, slot: int, message: Mapping[str, Any]) -> bool:
@@ -373,7 +387,10 @@ class PortalTouchInput:
         if self.touch_enabled:
             for slot in sorted(self.active_slots):
                 try:
-                    self.portal.NotifyTouchUp(self.session_handle, {}, slot)
+                    if self.touch_backend is not None:
+                        self.touch_backend.up(slot)
+                    else:
+                        self.portal.NotifyTouchUp(self.session_handle, {}, slot)
                 except Exception:
                     # Continue releasing the other contacts. The portal session
                     # itself will also be closed by the host after this call.

@@ -61,7 +61,29 @@ class PortalTouchInputTests(unittest.TestCase):
             {"type": "touch", "action": 2, "slot": 3, "x": 0.5, "y": 0.25})
         self.assertEqual(portal.calls[-1][1][-2:], (740.0, 231.0))
 
-    def test_multitouch_lifecycle_and_disconnect_release(self):
+    def test_touch_backend_replaces_portal_touch_calls(self):
+        class Backend:
+            def __init__(self):
+                self.calls = []
+            def down(self, slot, x, y):
+                self.calls.append(("down", slot, x, y))
+            def motion(self, slot, x, y):
+                self.calls.append(("motion", slot, x, y))
+            def up(self, slot):
+                self.calls.append(("up", slot))
+        touch, portal = controller()
+        backend = Backend()
+        touch.touch_backend = backend
+        self.assertEqual(touch.mode, "touchscreen-eis")
+        touch.handle_message({"type": "touch", "action": 0, "slot": 2, "x": 0.5, "y": 0.25})
+        touch.handle_message({"type": "touch", "action": 2, "slot": 2, "x": 0.25, "y": 0.5})
+        touch.handle_message({"type": "touch", "action": 0, "slot": 3, "x": 0.1, "y": 0.1})
+        touch.release_all()
+        self.assertEqual(backend.calls, [("down", 2, 986.5, 308.0), ("motion", 2, 493.25, 616.0),
+                                         ("down", 3, 197.3, 123.2), ("up", 2), ("up", 3)])
+        self.assertEqual([c for c in portal.calls if c[0].startswith("NotifyTouch")], [])
+        self.assertEqual(touch.active_slots, set())
+
         touch, portal = controller()
         for slot in (4, 1):
             touch.handle_message(
