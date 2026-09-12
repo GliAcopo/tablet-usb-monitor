@@ -131,8 +131,13 @@ Lifecycle, HEAD host + protocol-2 APK, motion running (log in
 `.local/bench/lifecycle-2026-09-12.log`): HOME then relaunch → 58.7 fps
 acked again within 8 s; host `stop` + `start` while the app stays up →
 reconnects, 58.8 fps, `native_pending` bounded; app frozen with `SIGSTOP`
-for 1.5 s and 3 s under load → picture and acks recover, no stall counters
-left behind. Protocol negotiation was exercised on both sides: the app logs
+for 3 s under load (`/proc/<pid>/status` read `T (stopped)` while held) →
+the window covering the freeze shows capture→ack max 3154 ms, one render
+stall, `client_resyncs` 0 → 6 (host queue full: GOP abandoned, IDR
+requested) and the app logged "Compressed backlog over budget; resuming at
+the next keyframe (total 1)"; the next window is back at 56.8 fps acked,
+capture→ack p95 31.9 ms, `native_pending` 0, and the resync counter stays
+at 6. Both resync paths — host and app — have now fired once and recovered. Protocol negotiation was exercised on both sides: the app logs
 "Host speaks protocol 3, this client 2; using the common subset" against a
 host with `PROTOCOL` bumped, and the host logs the legacy line against the
 previous APK. Not covered tonight: the overload run was meant to hold a

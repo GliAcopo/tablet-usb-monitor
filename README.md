@@ -36,8 +36,9 @@ private was captured.
   render p95 20 ms (worst 24), 0 stalls, 2868 input messages, 0 rejected.
   With the bitrate doubled to 60 Mbit/s the tablet receives 59 Mbit/s and
   capture→ack p95 drops to 22 ms: the ADB transport has ≥ 2× headroom.
-  Background/foreground, host restart under a live app, and a frozen app
-  under load all recover on their own.
+  Background/foreground, host restart under a live app, and an app frozen
+  for 3 s under load (host and app resync paths both fire) all recover on
+  their own within one 5 s window.
 - For comparison on the same run type: `system` (CPU readback → NVENC)
   reached 30–36 fps and stalled the compositor itself to ~80 fps;
   `gl` (cross-GPU DMA-BUF import → NVENC) 13 fps. The encoder was never the
