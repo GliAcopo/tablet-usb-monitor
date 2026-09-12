@@ -191,7 +191,7 @@ def main():
     parser.add_argument('--seconds', type=float, default=30.0,
                         help='measured window per capture path, after warm-up')
     parser.add_argument('--modes', nargs='+', default=['va', 'system'],
-                        choices=['system', 'gl', 'va'])
+                        choices=['native', 'va', 'system', 'gl'])
     parser.add_argument('--runs', type=int, default=3, help='separate runs per candidate')
     parser.add_argument('--json', type=Path, help='also write every run as one JSON document')
     parser.add_argument('--env', action='append', default=[], metavar='KEY=VALUE',

@@ -25,8 +25,20 @@ import time
 import dbus
 from dbus.mainloop.glib import DBusGMainLoop
 import gi
+# GstAllocators/GstVideo typelibs come from gir1.2-gst-plugins-base-1.0, unpacked
+# under .local/sysroot by scripts/setup-native.sh (nothing installed system-wide).
+_SYSROOT_TYPELIBS = str(Path(__file__).resolve().parents[1] / '.local/sysroot/usr/lib/x86_64-linux-gnu/girepository-1.0')
+if os.path.isdir(_SYSROOT_TYPELIBS):
+    os.environ['GI_TYPELIB_PATH'] = _SYSROOT_TYPELIBS + os.pathsep + os.environ.get('GI_TYPELIB_PATH', '')
 gi.require_version('Gst', '1.0')
 from gi.repository import GLib, GLibUnix, Gst
+try:
+    gi.require_version('GstAllocators', '1.0')
+    gi.require_version('GstVideo', '1.0')
+    from gi.repository import GstAllocators, GstVideo
+except (ValueError, ImportError):
+    GstAllocators = GstVideo = None
+from native_capture import NativeCapture, NativeCaptureError
 from websockets.asyncio.server import serve
 from touch_input import LiveKScreenTarget, PortalTouchInput, TouchInputError
 from eis_touch import EisTouch, EisError
@@ -220,6 +232,9 @@ class Host:
         self.fd = None
         self.capture_node = None
         self.memory_mode = args.capture_memory
+        self.native = None
+        self.native_dropped = 0
+        self.native_ready_lag = collections.deque(maxlen=1200)
         self.pipeline_bus = None
         self.report_timer = None
         self.clients = set()
@@ -249,6 +264,7 @@ class Host:
         self.capture_wall = None
         self.capture_intervals = collections.deque(maxlen=1200)
         self.capture_trace = []
+        self.capture_seq = None
         self.capture_pts_intervals = collections.deque(maxlen=1200)
         self.capture_caps = None
         self.rendered = 0
@@ -447,6 +463,8 @@ class Host:
         self.start_pipeline()
 
     def start_pipeline(self):
+        if self.memory_mode == 'native':
+            return self.start_native_pipeline()
         if self.memory_mode == 'va':
             # Same-GPU zero copy: KWin's DMA-BUF is imported by the Intel VA
             # driver that also composites it; no readback, no cross-GPU hop.
@@ -474,7 +492,7 @@ class Host:
             f'pipewiresrc name=capture fd={self.fd} path={self.capture_node} do-timestamp=true '
             f'keepalive-time={os.environ.get("TABS9_KEEPALIVE_MS", "1000")} '
             + os.environ.get('TABS9_PWSRC_EXTRA', '') +
-            'min-buffers=4 max-buffers=4 '
+            f'min-buffers={os.environ.get("TABS9_PW_BUFFERS", "4")} max-buffers={os.environ.get("TABS9_PW_BUFFERS", "4")} '
             '! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream '
             + os.environ.get('TABS9_CAPTURE_CAPS', '')
             + encode +
@@ -531,10 +549,13 @@ class Host:
         self.fallback_or_stop()
 
     def fallback_or_stop(self):
-        if self.memory_mode not in ('gl', 'va'):
+        if self.memory_mode not in ('gl', 'va', 'native'):
             self._fail('Video pipeline failed.')
             return
-        self.memory_mode = 'system'
+        if self.native is not None:
+            self.native.close()
+            self.native = None
+        self.memory_mode = 'va' if self.memory_mode == 'native' else 'system'
         if self.pipeline_bus:
             self.pipeline_bus.remove_signal_watch()
             self.pipeline_bus = None
@@ -587,6 +608,120 @@ class Host:
             return Gst.PadProbeReturn.OK
         self._live_probe = probe   # keep the closure alive for the pad's lifetime
         peer.add_probe(Gst.PadProbeType.QUERY_UPSTREAM, probe)
+
+    # ---- native capture (native/tabs9-capture) ------------------------------
+    def start_native_pipeline(self):
+        """Capture through the native helper; encode its NV12 ring with GStreamer.
+
+        The helper returns KWin's buffers inside PipeWire's process callback
+        (see native/tabs9-capture.c for the measured reason).  Each converted
+        frame arrives here as a slot index; the slot's DMA-BUF is wrapped once
+        in a GstMemory and pushed into an appsrc that never drops (block=true):
+        a slot is handed back to the helper only after the encoder has finished
+        with it, so ring accounting stays exact.  The helper drops on its side
+        when the ring is full, and reports that count.
+        """
+        if GstAllocators is None or GstVideo is None:
+            print('GstAllocators/GstVideo typelibs unavailable; run scripts/setup-native.sh', flush=True)
+            return self.fallback_or_stop()
+        width, height = self.args.width, self.args.height
+        try:
+            self.native = NativeCapture(self.fd, self.capture_node, width, height,
+                                        slots=int(os.environ.get('TABS9_NATIVE_SLOTS', '6')),
+                                        on_frame=self.native_frame, on_exit=self.native_exit)
+        except NativeCaptureError as error:
+            print('Native capture unavailable:', error, flush=True)
+            return self.fallback_or_stop()
+        ring = self.native.ring
+        allocator = GstAllocators.DmaBufAllocator.new()
+        self.native_memories = [GstAllocators.DmaBufAllocator.alloc(allocator, os.dup(fd), size)
+                                for fd, size in zip(self.native.fds, ring.sizes)]
+        self.native_pushed = collections.deque()   # slots in encoder order
+        self.native_last_encoded = None
+        self.native_dropped = 0
+        self.native_ready_lag = collections.deque(maxlen=1200)
+        if self.args.rate_control == 'cqp':
+            rc = f'rate-control=cqp qpi={self.args.qp} qpp={self.args.qp}'
+        else:
+            rc = f'rate-control={self.args.rate_control} bitrate={self.args.bitrate}'
+        caps = (f'video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format={ring.drm_format},'
+                f'width={width},height={height},framerate=0/1,max-framerate={self.args.fps}/1')
+        description = (
+            f'appsrc name=capture is-live=true format=time do-timestamp=true block=true max-buffers=2 '
+            f'caps="{caps}" '
+            # vapostproc imports the ring slot (cached per GstMemory) and copies
+            # it into its own VAMemory pool, exactly the boundary the encoder
+            # already handles; feeding the encoder our DMA-BUFs directly made it
+            # re-import every frame and fail on its reconstruct pool.
+            '! vapostproc ! video/x-raw(memory:VAMemory),format=NV12 '
+            f'! vah265enc name=encoder {rc} '
+            f'key-int-max={self.args.fps} b-frames=0 ref-frames=1 target-usage=7 '
+            '! video/x-h265,profile=main '
+            '! h265parse config-interval=-1 ! video/x-h265,stream-format=byte-stream,alignment=au '
+            '! appsink name=encoded emit-signals=true sync=false max-buffers=4 drop=true')
+        try:
+            self.pipeline = Gst.parse_launch(description)
+            self.pipeline.get_by_name('capture').get_static_pad('src').add_probe(
+                Gst.PadProbeType.BUFFER, self.capture_probe)
+            self.pipeline.get_by_name('encoder').get_static_pad('sink').add_probe(
+                Gst.PadProbeType.BUFFER, self.encoder_in_probe)
+            self.pipeline.get_by_name('encoded').connect('new-sample', self.sample)
+            if os.environ.get('TABS9_STAGE_PROBES'):
+                self.install_stage_probes()
+            bus = self.pipeline.get_bus()
+            self.pipeline_bus = bus
+            bus.add_signal_watch()
+            bus.connect('message::error', self.pipeline_error)
+            self.pipeline.set_state(Gst.State.PLAYING)
+            if self.report_timer is None:
+                self.report_timer = GLib.timeout_add_seconds(5, self.report)
+            self.status.write('streaming')
+            print('Capture authorized; starting encoder. Memory path: native '
+                  f'(ring of {ring.slots} {ring.drm_format} surfaces, pitch {ring.pitches[0][0]})', flush=True)
+        except Exception as error:
+            print('Encoder setup failed:', type(error).__name__, str(error)[:300], flush=True)
+            self.fallback_or_stop()
+        return False
+
+    def native_frame(self, frame):
+        """Reader thread: wrap the slot and push it (blocks while the encoder is busy)."""
+        source = self.pipeline.get_by_name('capture') if self.pipeline else None
+        if source is None or self.closing:
+            self.native.release(frame.slot)
+            return
+        ring = self.native.ring
+        buffer = Gst.Buffer.new()
+        buffer.append_memory(self.native_memories[frame.slot])
+        offsets = list(ring.offsets[frame.slot]) + [0, 0]
+        strides = list(ring.pitches[frame.slot]) + [0, 0]
+        GstVideo.buffer_add_video_meta_full(buffer, GstVideo.VideoFrameFlags.NONE,
+                                            GstVideo.VideoFormat.NV12, ring.width, ring.height,
+                                            2, offsets, strides)
+        buffer.offset = frame.seq
+        now = time.monotonic_ns()
+        self.native_ready_lag.append((now - frame.dequeued_ns) / 1e6)
+        self.native_dropped = frame.dropped
+        if self.capture_pts is not None and frame.pts_ns > self.capture_pts:
+            self.capture_pts_intervals.append((frame.pts_ns - self.capture_pts) / 1e6)
+        self.capture_pts = frame.pts_ns
+        self.native_pushed.append(frame.slot)
+        if source.emit('push-buffer', buffer) != Gst.FlowReturn.OK:
+            self.native_pushed.remove(frame.slot)
+            self.native.release(frame.slot)
+
+    def native_encoded(self):
+        """appsink got a frame: the slot before this one is certainly free."""
+        if self.native is None or not self.native_pushed:
+            return
+        slot = self.native_pushed.popleft()
+        if self.native_last_encoded is not None:
+            self.native.release(self.native_last_encoded)
+        self.native_last_encoded = slot
+
+    def native_exit(self, code):
+        if not self.closing:
+            print(f'Native capture helper exited ({code}); falling back.', flush=True)
+            GLib.idle_add(self.fallback_or_stop)
 
     def install_stage_probes(self):
         """Diagnostics only: per-stage dwell time (ms) from in-process pad probes."""
@@ -650,15 +785,20 @@ class Host:
             if self.capture_wall is not None:
                 self.capture_intervals.append((now - self.capture_wall) * 1000)
                 if TRACE_CAPTURE:
-                    self.capture_trace.append(round((now - self.capture_wall) * 1000, 1))
-                    if len(self.capture_trace) >= 120:
-                        print('TRACE capture intervals:', ' '.join(map(str, self.capture_trace)), flush=True)
+                    # arrival interval / KWin pts interval / KWin seq delta
+                    pts_delta = ((buffer.pts - self.capture_pts) / 1e6 if self.capture_pts is not None
+                                 and buffer.pts != Gst.CLOCK_TIME_NONE else float('nan'))
+                    seq_delta = (buffer.offset - self.capture_seq) if self.capture_seq is not None else 0
+                    self.capture_trace.append(f'{(now - self.capture_wall) * 1000:.1f}/{pts_delta:.1f}/{seq_delta}')
+                    if len(self.capture_trace) >= 90:
+                        print('TRACE capture arrival/pts/seq:', ' '.join(self.capture_trace), flush=True)
                         self.capture_trace.clear()
+            self.capture_seq = buffer.offset
             self.capture_wall = now
             self.capture_arrivals[buffer.pts] = now
             while len(self.capture_arrivals) > 16:
                 self.capture_arrivals.popitem(last=False)
-            if buffer.pts != Gst.CLOCK_TIME_NONE:
+            if buffer.pts != Gst.CLOCK_TIME_NONE and self.native is None:
                 if self.capture_pts is not None and buffer.pts > self.capture_pts:
                     self.capture_pts_intervals.append((buffer.pts - self.capture_pts) / 1000000)
                 self.capture_pts = buffer.pts
@@ -790,6 +930,8 @@ class Host:
         data = buf.extract_dup(0, buf.get_size())
         keyframe = not buf.has_flags(Gst.BufferFlags.DELTA_UNIT)
         self.frames += 1
+        if self.native is not None:
+            self.native_encoded()
         seq = self.frames & 0xffffffff
         # Only aggregate timing metadata is retained, never screen data on disk.
         payload = b'\x01' + struct.pack('!I', seq) + data
@@ -1061,6 +1203,8 @@ class Host:
             'tablet_input_rejected': self.input_rejected,
             'tablet_input_followon_rejected': self.input_followon_rejected,
             'client_resyncs': self.resyncs,
+            'native_dropped': self.native_dropped if self.native is not None else None,
+            'native_convert_ms_p50': pct(sorted(self.native_ready_lag), 0.5) if self.native is not None else None,
             'tablet_input_mode': self.touch.mode if self.touch else None,
             'tablet': self.tablet_stats,
             'capture_interval_ms_p50': round(arrivals[len(arrivals)//2], 2) if arrivals else None,
@@ -1126,6 +1270,9 @@ class Host:
             if getattr(self, 'eis', None) is not None:
                 with contextlib.suppress(Exception):
                     self.eis.close()
+            if getattr(self, 'native', None) is not None:
+                with contextlib.suppress(Exception):
+                    self.native.close()
             if self.pipeline:
                 with contextlib.suppress(Exception):
                     self.pipeline.set_state(Gst.State.NULL)
@@ -1161,7 +1308,7 @@ if __name__ == '__main__':
     parser.add_argument('--fps', type=int, choices=[30, 60, 90, 120])
     parser.add_argument('--bitrate', type=int)
     parser.add_argument('--scale', type=float, default=1.5)
-    parser.add_argument('--capture-memory', choices=['va', 'system', 'gl'], default='va')
+    parser.add_argument('--capture-memory', choices=['native', 'va', 'system', 'gl'], default='va')
     parser.add_argument('--rate-control', choices=['cbr', 'vbr', 'cqp'], default='cbr')
     parser.add_argument('--qp', type=int, default=24)
     args = parser.parse_args()
