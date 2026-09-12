@@ -410,10 +410,16 @@ class Host:
         if self.memory_mode == 'va':
             # Same-GPU zero copy: KWin's DMA-BUF is imported by the Intel VA
             # driver that also composites it; no readback, no cross-GPU hop.
-            # The queue lets colour conversion and encoding overlap on the GPU.
+            if self.args.rate_control == 'cqp':
+                rc = f'rate-control=cqp qpi={self.args.qp} qpp={self.args.qp}'
+            else:
+                rc = f'rate-control={self.args.rate_control} bitrate={self.args.bitrate}'
+            # The queue puts the converter and the encoder on separate threads so
+            # the RGB->NV12 job of frame N+1 overlaps the encode of frame N
+            # (about 6 ms + 3 ms of GPU time per frame; serial they miss 8.33 ms).
             encode = ('! vapostproc ! video/x-raw(memory:VAMemory),format=NV12 '
                       '! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream '
-                      f'! vah265enc name=encoder rate-control=cbr bitrate={self.args.bitrate} '
+                      f'! vah265enc name=encoder {rc} '
                       f'key-int-max={self.args.fps} b-frames=0 ref-frames=1 target-usage=7 ')
         else:
             conversion = ('! glupload ! glcolorconvert ! video/x-raw(memory:GLMemory),format=RGBA '
@@ -428,16 +434,33 @@ class Host:
             f'pipewiresrc name=capture fd={self.fd} path={self.capture_node} do-timestamp=true keepalive-time=1000 '
             'min-buffers=4 max-buffers=4 '
             '! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream '
+            + os.environ.get('TABS9_CAPTURE_CAPS', '')
             + encode +
             '! video/x-h265,profile=main '
             '! h265parse config-interval=-1 ! video/x-h265,stream-format=byte-stream,alignment=au '
             '! appsink name=encoded emit-signals=true sync=false max-buffers=2 drop=true'
         )
+        if os.environ.get('TABS9_DEBUG_TAIL'):
+            # Diagnostics only: replace everything after pipewiresrc's queue.
+            head = description.split('leaky=downstream ', 1)[0] + 'leaky=downstream '
+            description = head + os.environ['TABS9_DEBUG_TAIL']
+            print('DEBUG pipeline tail:', os.environ['TABS9_DEBUG_TAIL'], flush=True)
         try:
             self.pipeline = Gst.parse_launch(description)
             self.pipeline.get_by_name('capture').get_static_pad('src').add_probe(
                 Gst.PadProbeType.BUFFER, self.capture_probe)
-            self.pipeline.get_by_name('encoded').connect('new-sample', self.sample)
+            encoded = self.pipeline.get_by_name('encoded')
+            if encoded is not None:
+                encoded.connect('new-sample', self.sample)
+            if os.environ.get('TABS9_STAGE_PROBES'):
+                self.install_stage_probes()
+                def latency_probe():
+                    query = Gst.Query.new_latency()
+                    enc = self.pipeline.get_by_name('encoder')
+                    ok = enc.get_static_pad('sink').peer_query(query) if enc else False
+                    print('DEBUG latency query at encoder sink:', ok and query.parse_latency(), flush=True)
+                    return False
+                GLib.timeout_add_seconds(3, latency_probe)
             bus = self.pipeline.get_bus()
             self.pipeline_bus = bus
             bus.add_signal_watch()
@@ -477,6 +500,35 @@ class Host:
         print('GPU-memory import unavailable; falling back to the system-memory capture path.', flush=True)
         GLib.idle_add(self.start_pipeline)
 
+    def install_stage_probes(self):
+        """Diagnostics only: per-stage dwell time (ms) from in-process pad probes."""
+        self.stage_marks = {}
+        self.stage_times = collections.defaultdict(lambda: collections.deque(maxlen=600))
+        def mark(name):
+            def probe(pad, info):
+                self.stage_marks.setdefault(name, collections.deque()).append(time.monotonic())
+                return Gst.PadProbeReturn.OK
+            return probe
+        def since(name, previous):
+            def probe(pad, info):
+                now = time.monotonic()
+                starts = self.stage_marks.get(previous)
+                if starts:
+                    self.stage_times[name].append((now - starts.popleft()) * 1000)
+                    if len(starts) > 8:
+                        starts.clear()  # a drop broke the pairing; resync
+                self.stage_marks.setdefault(name, collections.deque()).append(now)
+                return Gst.PadProbeReturn.OK
+            return probe
+        stages = [('capture', 'capture', 'src', None), ('queue', 'vapostproc0', 'sink', 'capture'),
+                  ('convert', 'vapostproc0', 'src', 'queue'), ('encode', 'encoder', 'src', 'convert')]
+        for name, element, padname, previous in stages:
+            el = self.pipeline.get_by_name(element)
+            if el is None:
+                continue
+            pad = el.get_static_pad(padname)
+            pad.add_probe(Gst.PadProbeType.BUFFER, mark(name) if previous is None else since(name, previous))
+
     def capture_probe(self, pad, info):
         buffer = info.get_buffer()
         if buffer is not None:
@@ -489,6 +541,7 @@ class Host:
                 if self.capture_pts is not None and buffer.pts > self.capture_pts:
                     self.capture_pts_intervals.append((buffer.pts - self.capture_pts) / 1000000)
                 self.capture_pts = buffer.pts
+
             if self.capture_caps is None:
                 caps = pad.get_current_caps()
                 if caps is not None:
@@ -808,6 +861,15 @@ class Host:
         elapsed = now - before
         self.last_report = (now, self.frames, self.rendered, self.capture_frames)
         arrivals = sorted(self.capture_intervals)
+        if os.environ.get('TABS9_STAGE_PROBES') and getattr(self, 'stage_times', None):
+            summary = {}
+            for name, values in self.stage_times.items():
+                v = sorted(values)
+                if v:
+                    summary[name] = (round(v[len(v)//2], 1), round(v[int(len(v)*0.9)], 1), round(v[-1], 1))
+            print('STAGES ms p50/p90/max:', summary, flush=True)
+            for values in self.stage_times.values():
+                values.clear()
         timestamps = sorted(self.capture_pts_intervals)
         print(json.dumps({'encoded_frames': self.frames, 'tablet_rendered_acks': self.rendered,
             'capture_fps': round((self.capture_frames - captured) / elapsed, 1),
@@ -817,6 +879,8 @@ class Host:
             'tablet_input_rejected': self.input_rejected,
             'tablet': self.tablet_stats,
             'capture_interval_ms_p50': round(arrivals[len(arrivals)//2], 2) if arrivals else None,
+            'capture_interval_ms_p90': round(arrivals[int(len(arrivals)*0.9)], 2) if arrivals else None,
+            'capture_interval_ms_max': round(arrivals[-1], 1) if arrivals else None,
             'capture_pts_interval_ms_p50': round(timestamps[len(timestamps)//2], 2) if timestamps else None,
             'encode_to_render_ms_p50': round(stats[len(stats)//2], 1) if stats else None}), flush=True)
         return True
@@ -901,6 +965,8 @@ if __name__ == '__main__':
     parser.add_argument('--bitrate', type=int)
     parser.add_argument('--scale', type=float, default=1.5)
     parser.add_argument('--capture-memory', choices=['va', 'system', 'gl'], default='va')
+    parser.add_argument('--rate-control', choices=['cbr', 'vbr', 'cqp'], default='cbr')
+    parser.add_argument('--qp', type=int, default=24)
     args = parser.parse_args()
     for key, value in PROFILES[args.profile].items():
         if getattr(args, key) is None:

@@ -216,3 +216,51 @@ Take-aways:
 The remaining ~10 fps gap to 120 has not been chased; the tablet decoder
 already reports 111 fps and the compositor 117–120, so it is a small,
 distributed cost rather than one stall.
+
+### Not settled: the 40 fps mode (investigation of 2026-09-12 afternoon)
+
+The 110 fps result above is not stable. Across many restarts with the same
+configuration the capture rate sits at either ~110 or ~30–60 fps, while the
+compositor presents the virtual output at 117–120 in every run. Measurements
+taken to locate the cause (all with the OpenGL motion source):
+
+- Signature in the slow mode: bursts of 4 frames 8.33 ms apart, then a stall
+  of ~75–100 ms (`capture_interval_ms_p90` ≈ 75). KWin offers exactly 4
+  buffers; the stall is KWin waiting for them to come back.
+- With `GST_DEBUG=pipewiresrc:6` each KWin buffer was held by the chain for
+  ~113 ms p50 (got → recycle) — far longer than the GPU work on it.
+- Per-stage pad probes (`TABS9_STAGE_PROBES=1`): converter submit 3.5 ms;
+  the encoder stage waits ~70 ms per frame — that wait is the GPU completing
+  the conversion + encode of that frame, not queueing (the pipeline reports
+  `live=True`, so the VA encoder runs synchronously, depth 1).
+- Isolated GPU costs at 2960×1848 (`gst-launch`, tiny source upscaled on the
+  GPU so the source is free): HEVC encode ≈ 3 ms/frame, unchanged while KWin
+  composites 120 fps and the host streams; RGB→NV12 via the scaler path
+  2.4 ms; writing a full-size RGB surface 24 ms (EU kernels); full-size
+  BGRA→NV12 ≈ 6–7 ms by subtraction. CQP vs CBR, H.264, AV1, 2 slices,
+  target-usage: no meaningful difference. AV1 is slower (7.7 ms).
+- Ruled out: rate control (CQP identical), explicit sync (the plain
+  `datas:1` buffer layout was negotiated), GPU clock floor (raising
+  `rps_min_freq` of the render GT to 1500 MHz changed nothing), other GPU
+  clients (idle), the encoder's output delay (live → 0), the KWin pin script.
+- Not testable through GStreamer: a linear modifier (`vapostproc` imports
+  AR24 only as Tile4 `0x0100000000000009`), `always-copy` and
+  `use-bufferpool=false` (both break DMA-BUF negotiation and fall back to
+  the readback path).
+
+What remains consistent with everything: inside the live pipeline the GPU
+takes ~60–70 ms to finish the conversion+encode of a frame whose source is
+KWin's imported Tile4 DMA-BUF, whereas the same operations on VA-allocated
+surfaces take under 10 ms. That points at the DMA-BUF import path in the
+iHD driver (a detiling or synchronisation slow path for foreign Tile4
+buffers) rather than at any GStreamer setting, and the bistability comes
+from KWin's 4-buffer limit: once the chain falls 4 frames behind, KWin
+stops producing until buffers return.
+
+The way to settle it, and the only remaining "low-level" optimisation, is a
+consumer that does not go through GStreamer: libpipewire + libva in C,
+importing each DMA-BUF once (cached per fd), submitting VPP into a ring of
+NV12 surfaces, syncing that VPP and returning KWin's buffer *inside the
+PipeWire process callback*, and encoding asynchronously. That gives
+deterministic buffer return, a direct measurement of the import cost, and
+removes Python from the data path. It is an estimated 600–900 lines of C.
