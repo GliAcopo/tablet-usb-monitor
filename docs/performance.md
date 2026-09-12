@@ -1,5 +1,128 @@
 # Performance analysis
 
+## Settled (2026-09-12, evening): the 30 fps state, and the native consumer
+
+Everything below in this section was measured live on this machine with
+`scripts/gpu-motion-test.py` (OpenGL, native Wayland, one repaint per frame
+callback) on the virtual output at 2960×1848, balanced profile (HEVC, 30 Mbit/s),
+via `./tabs9 bench-capture`, unless stated otherwise. Nothing private was
+captured; the only tablet screenshots are of the synthetic pattern.
+
+### The ladder
+
+Same motion, 20 s windows, `TABS9_DEBUG_TAIL` replacing the pipeline after
+`pipewiresrc`:
+
+| path | capture fps | interval p90 / max |
+|------|------------:|-------------------:|
+| DMA-BUF capture → discard | 58.7 / 59.4 | 16.7 / 33.4 ms |
+| capture → `vapostproc` (NV12, VAMemory) → discard | 59.3 / 59.2 | 16.7 / 33.4 ms |
+| capture → conversion → `vah265enc` → discard | 59.3 / 59.2 | 16.7 / 33.4 ms |
+| full pipeline + tablet, first bench | 33.6 / 50.8 / 33.2 | 50 / 25 / 66.7 ms |
+
+No stage is slow. The full pipeline is bistable: an instance either runs at
+~59 fps for its whole life or at 30 fps for its whole life.
+
+### The encoder held every frame for two frame periods (fixed)
+
+Per-stage pad probes (`TABS9_STAGE_PROBES=1`, paired by PTS) put the encoder's
+sink→src dwell at 33.8 ms p50 at 60 Hz, 67.6 ms at 30 Hz and 17 ms at 120 Hz
+— exactly two frame periods, independent of GPU time (the same encoder does
+310 fps on synthetic frames). `GstVaBaseEnc` asks upstream for liveness once,
+in `set_format`; pipewiresrc 1.6 answers from a field it fills only once the
+stream is STREAMING, and the caps event arrives during negotiation, so the
+encoder took its non-live path (`preferred_output_delay = 4`) and polled
+readiness of the reconstruct surface that frame N+1 was still reading as a
+reference. The host now answers that latency query as live with a pad probe
+(edited through the raw pointer: a PyGObject wrapper would make the query
+read-only). Encoder dwell: **6.0 ms p50 / 6.1 ms p90**.
+
+### The 30 fps state is a buffer-return ratchet (fixed by the native consumer)
+
+`TABS9_TRACE_CAPTURE=1` prints every capture interval, KWin's own PTS
+interval and KWin's sequence delta. In the slow state:
+
+```
+arrival/pts/seq: 16.7/16.7/1 16.7/16.7/1 16.7/16.7/1 66.6/66.7/1 16.7/16.7/1 ...
+```
+
+Four frames at the refresh period, then a 66–83 ms gap, forever; KWin's own
+timestamps show the same gaps and its sequence numbers are contiguous, so
+KWin is *not producing* during the gap. With `TABS9_PW_BUFFERS=3` the burst
+is three frames, with 2 it is two frames: the burst length is the number of
+PipeWire buffers.
+
+Mechanism (pipewire 1.6.2, `src/pipewire/stream.c`, `impl_node_process_input`):
+an input stream recycles **at most one buffer per graph cycle**, by writing a
+single id into `io->buffer_id` *after* the consumer's process callback has
+returned, and KWin only runs a cycle when it has a free buffer to render
+into. GStreamer's `pipewiresrc` hands buffers to a streaming thread and
+releases them later, so every late release (start-up while the pipeline
+warms, any later hiccup) moves one of KWin's 2–4 buffers to the consumer for
+good. Once KWin holds none it records N frames whenever the batch trickles
+back, then waits again: a stable half-rate state. The bench harness, which
+starts motion the instant capture starts, reproduced it 5/5 times.
+
+`native/tabs9-capture` (C, libpipewire + libva, ~450 lines, built against
+headers unpacked under `.local/sysroot` by `scripts/setup-native.sh`)
+consumes the stream with `PW_STREAM_FLAG_RT_PROCESS`, imports each DMA-BUF
+once per `pw_buffer`, converts it on the GPU (VA VPP, sRGB → BT.709 limited
+NV12) into a ring of owned surfaces and **queues the buffer back before the
+process callback returns**, so the same cycle recycles it and KWin never runs
+dry. A completion thread polls the VPP and only then hands the slot to the
+host over a unix socket (the ring is exported once as DMA-BUF fds). The host
+wraps each slot in a `GstMemory` and runs `appsrc ! vapostproc ! vah265enc !
+h265parse ! appsink`; a slot is released after the encoder finished the frame
+that followed it, so ring accounting is exact and the helper drops (and
+counts) only when the ring is full. Nothing in the callback waits for the GPU
+or the network. Colours on the synthetic pattern match the GStreamer path to
+within one code value; bar edges are aligned across rows (no tearing seen).
+
+### Results (3 fresh runs each, 10 s warm-up + 60 s recorded, native path)
+
+| mode | unique fps (capture = encoded = acked) | capture interval p95 / max | capture→ack p50 / p95 | tablet render interval p95 | stalls > 100 ms | host CPU |
+|------|----------------------------------------|---------------------------:|----------------------:|---------------------------:|----------------:|---------:|
+| 60 Hz output, 60 fps | **59.3 / 59.1 / 59.8** | 18.0–19.4 / 19.6–62.5 ms | 22.3–22.6 / 27.2–28.4 ms | 19.9–22.0 ms | 0 | ~9 % of a core |
+| 90 Hz output, 90 fps | 82.1 / 81.9 / 82.3 | 13.8–14.5 / 17.5–19.4 ms | 20.6–20.8 / 24.9–25.8 ms | 15.2–15.8 ms | 0 | ~11 % |
+| 120 Hz output, 120 fps | 112.5 / 110.6 / 111.1 | 10.7–11.0 / 14.0–15.6 ms | 18.4–18.9 / 23.1–23.6 ms | 11.7 ms | 0 | ~14.6 % |
+
+Definitions: "capture→ack" is a host-side software measurement from the
+capture probe to the tablet's rendered acknowledgement (return path
+included; not pixel latency). "Tablet render interval" is computed from the
+tablet's own `OnFrameRendered` timestamps, in the tablet's clock domain.
+Touch rejections during all runs: 0.
+
+Against the acceptance table: **60 fps passes every usable-mode gate**
+(≥ 58 fps, render p95 ≤ 25 ms, capture→ack p95 ≤ 60 ms, no stalls, zero
+rejections). 120 fps passes the latency and stall gates (p95 11.7 ms ≤ 16.7,
+23.6 ms ≤ 40) but records 110–113 unique frames, not ≥ 115.
+
+### The remaining limit at 120 Hz is KWin's recording, not the pipeline
+
+At 120 Hz the source swaps at 120.0 fps, the helper dropped 7 of ~2400
+frames (ring full, counted) and KWin's sequence numbers show no other gaps,
+yet KWin recorded only ~113 frames per second. The trivial consumer —
+`pipewiresrc → fakesink`, no conversion, no encoding, no tablet — records
+the same 111 fps from the same source. So ~6 % of vblanks are frames KWin
+does not record on this virtual output at 120 Hz; nothing downstream of
+KWin can recover them. (See the KWin sources and bug cited under "Current
+result" below for the whole-millisecond rate limiter.)
+
+Other measured facts from this pass:
+
+- Through XWayland the pattern paints at 60 fps but KWin records ~56 unique
+  frames per second (3 × 60 s: 56.4, 56.4, 56.3); on native Wayland 59.3,
+  59.1, 59.8. Benchmarks now force `QT_QPA_PLATFORM=wayland`.
+- GPU clocks are not the discriminator: gt0 sat at 0/800 MHz with 40–80 % RC6
+  residency in both the 59 fps and the 30 fps runs.
+- `pipewiresrc keepalive-time` keeps a copy of the last buffer (via a parent
+  meta) and therefore pins one of KWin's buffers; disabling it did not change
+  the ratchet.
+- Tablet decoder: `c2.qti.hevc.decoder`; `FEATURE_LowLatency` is not declared
+  so `KEY_LOW_LATENCY` is not requested; the Qualcomm vendor hint is not
+  applied by the codec (checked in the applied input format). On-device
+  arrival → release is 12–13 ms, release → on screen ~0.6 ms.
+
 ## Current result
 
 Native 2960x1848 at 60 fps is the reliability milestone. The existing live

@@ -21,20 +21,28 @@ private was captured.
   placed to the right of the laptop panel.
 - **Visible pixels confirmed**: a tablet screenshot shows the synthetic pattern
   rendered on the virtual output at 2960 × 1848.
-- **Frame rate, default `--capture-memory va`**: KWin presents the virtual
-  output at 117–120 fps and stamps screencast frames 8.33 ms apart; the host
-  captures, encodes and the tablet decodes and acknowledges **~110 fps**
-  sustained, encode-to-render p50 ≈ 11 ms. Host CPU 20–40 % of one core,
-  NVIDIA GPU idle.
+- **Frame rate, default `--capture-memory native`** (3 fresh runs each,
+  10 s warm-up + 60 s, `./tabs9 bench-capture`): at 60 Hz **59.3 / 59.1 /
+  59.8 unique fps**, tablet render interval p95 20–22 ms, capture→ack p95
+  27–28 ms, no stalls over 100 ms, ~9 % of one core. At 120 Hz 112.5 / 110.6 /
+  111.1 fps, render p95 11.7 ms, capture→ack p95 23 ms — the missing ~6 %
+  are frames KWin does not record at 120 Hz on this output (the same 111
+  fps appears with capture → discard and no pipeline at all). The earlier
+  GStreamer-only path was bistable (either ~59 or a stable 30 fps); the
+  mechanism and the fix are in [docs/performance.md](docs/performance.md).
 - For comparison on the same run type: `system` (CPU readback → NVENC)
   reached 30–36 fps and stalled the compositor itself to ~80 fps;
   `gl` (cross-GPU DMA-BUF import → NVENC) 13 fps. The encoder was never the
   limit; moving the frame off the Intel GPU was. See
   [docs/performance.md](docs/performance.md).
-- **Touch confirmed end-to-end**: taps on the tablet arrive as native Wayland
-  touch events in a window on the virtual output (multitouch slots, correct
-  position). This needed libei — see "Touch" below for why the portal's own
-  touch calls cannot work on KDE 6.6.
+- **Touch confirmed end-to-end**: taps, drags, a two-finger pinch
+  (`scripts/mt-inject`) and S Pen tap/stroke delivered on the tablet arrive
+  as native Wayland touch/pointer events in a window on the virtual output —
+  11/11 contacts in the expected 3×3 zones (corners, centre), 2 touch points
+  during the pinch, 0 of 690 input messages rejected. This needed libei — see
+  "Touch" below; the pen rides on the same libei device as an absolute
+  pointer because KDE 6.6 refuses the portal's `NotifyPointer*` calls on this
+  session.
 - Consent: **both** portal dialogs are skipped after the first approval via
   stored restore tokens (verified live 2026-09-12: after one accepted "Share
   virtual screen" dialog, `stop`/`start` went straight to streaming twice,
@@ -82,12 +90,21 @@ cannot work. `doctor` deliberately does not print device serial numbers.
 
 ## Start and stop
 
+Recommended launch (the measured usable mode: native resolution, 60 Hz,
+HEVC 30 Mbit/s, native capture):
+
 ```sh
-./tabs9 start --resolution 2960x1848 --fps 60 --bitrate 30000
+./tabs9 start --profile balanced
 ./tabs9 status
 ./tabs9 logs
 ./tabs9 stop
 ```
+
+`./tabs9 start --profile balanced --fps 120` selects the 120 Hz output mode
+(measured 110–113 fps, lower latency, ~15 % of a core). The native capture
+helper must be built once with `scripts/setup-native.sh`; without it the host
+falls back to the GStreamer `va` path, which is subject to the half-rate
+state described in the performance report.
 
 `./tabs9 start` is **supervised**: it waits (up to 60 seconds) for the host to
 reach a terminal state (streaming, failed, or stopped) or a consent-needed
@@ -194,12 +211,16 @@ settings and measured delivery separately.
 
 `--capture-memory` selects the capture/encode route:
 
-- `va` (default): `KWin DMA-BUF → vapostproc → vah265enc` on the Intel GPU.
-  Zero copies; the frame never leaves the GPU that composited it. Falls back
-  to `system` by itself if the VA negotiation fails. Two details matter for
-  cadence: KWin offers only 2–4 PipeWire buffers, so the host negotiates 4 and
-  queues at most one ahead of the converter, and colour conversion and
-  encoding are decoupled by a queue so they overlap.
+- `native` (default): `native/tabs9-capture` consumes the PipeWire stream,
+  converts each KWin DMA-BUF on the Intel GPU into an owned NV12 ring and
+  returns the buffer to KWin inside the process callback (pipewire recycles
+  one buffer per graph cycle, so anything that returns buffers later starves
+  KWin sooner or later); the host encodes the ring with `vah265enc`. Falls
+  back to `va` if the helper is missing or fails.
+- `va`: `KWin DMA-BUF → pipewiresrc → vapostproc → vah265enc`, all GStreamer.
+  Zero copies, but bistable: a start-up or a hiccup can leave it at half the
+  refresh rate for the life of the instance. Falls back to `system` if the
+  VA negotiation fails.
 - `system`: CPU readback (`BGRx`) → `nvh265enc`. Reference path; ~30–36 fps at
   native size because KWin's synchronous readback is the ceiling.
 - `gl`: DMA-BUF imported by NVIDIA EGL → `nvh265enc`. Negotiates and encodes,
@@ -230,10 +251,14 @@ python3 -m unittest discover -s tests -v
 ./tabs9 bench-capture --seconds 30
 ```
 
-`bench-capture` measures the capture paths (`--modes va system gl`) against
-continuous OpenGL motion and prints capture, encode and tablet-acknowledgement
-rates side by side. It performs three separate runs per candidate by default,
-with a warm-up; with stored restore tokens no consent dialog appears.
+`bench-capture` measures the capture paths (`--modes native va system gl`)
+against continuous OpenGL motion and prints, per run, unique frame rates at
+capture / encoder / tablet, capture-interval and capture→ack percentiles,
+stall counts, the tablet's own render-interval p95 and input rejections.
+Three separate runs per candidate by default, 10 s warm-up, `--json` for the
+aggregate; `--env KEY=VALUE` passes diagnostics such as `TABS9_STAGE_PROBES=1`
+or `TABS9_TRACE_CAPTURE=1` to the host. With stored restore tokens no consent
+dialog appears, so it runs unattended.
 
 The motion test displays a synthetic moving pattern on the virtual output and
 reports how many injected touches arrived as native input. Logs contain counts, frame dimensions, timing and negotiated
