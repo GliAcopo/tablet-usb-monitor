@@ -235,6 +235,8 @@ class Host:
         self.native = None
         self.native_dropped = 0
         self.native_ready_lag = collections.deque(maxlen=1200)
+        self.native_last_seq = None
+        self.native_seq_gaps = 0        # KWin sequence numbers never delivered
         self.pipeline_bus = None
         self.report_timer = None
         self.clients = set()
@@ -707,6 +709,9 @@ class Host:
         if self.capture_pts is not None and frame.pts_ns > self.capture_pts:
             self.capture_pts_intervals.append((frame.pts_ns - self.capture_pts) / 1e6)
         self.capture_pts = frame.pts_ns
+        if self.native_last_seq is not None and frame.seq > self.native_last_seq + 1:
+            self.native_seq_gaps += frame.seq - self.native_last_seq - 1
+        self.native_last_seq = frame.seq
         self.native_pushed.append(frame.slot)
         if source.emit('push-buffer', buffer) != Gst.FlowReturn.OK:
             self.native_pushed.remove(frame.slot)
@@ -1217,6 +1222,7 @@ class Host:
             'tablet_input_followon_rejected': self.input_followon_rejected,
             'client_resyncs': self.resyncs,
             'native_dropped': self.native_dropped if self.native is not None else None,
+            'native_seq_gaps': self.native_seq_gaps if self.native is not None else None,
             'native_convert_ms_p50': pct(sorted(self.native_ready_lag), 0.5) if self.native is not None else None,
             'tablet_input_mode': self.touch.mode if self.touch else None,
             'tablet': self.tablet_stats,
@@ -1326,7 +1332,8 @@ if __name__ == '__main__':
     parser.add_argument('--fps', type=int, choices=[30, 60, 90, 120])
     parser.add_argument('--bitrate', type=int)
     parser.add_argument('--scale', type=float, default=1.5)
-    parser.add_argument('--capture-memory', choices=['native', 'va', 'system', 'gl'], default='va')
+    parser.add_argument('--capture-memory', choices=['native', 'va', 'system', 'gl'], default='native',
+                        help='native: PipeWire consumer in native/tabs9-capture (default; falls back to va)')
     parser.add_argument('--rate-control', choices=['cbr', 'vbr', 'cqp'], default='cbr')
     parser.add_argument('--qp', type=int, default=24)
     args = parser.parse_args()

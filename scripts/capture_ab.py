@@ -208,8 +208,8 @@ def main():
                         help='extra host arguments; the -- separator is required, '
                              'e.g. bench-capture --seconds 30 -- --fps 60')
     args = parser.parse_args()
-    if not 5 <= args.seconds <= 600:
-        parser.error('--seconds must be between 5 and 600')
+    if not 5 <= args.seconds <= 3600:
+        parser.error('--seconds must be between 5 and 3600')
     if not 1 <= args.runs <= 10:
         parser.error('--runs must be between 1 and 10')
     if unit_active():
