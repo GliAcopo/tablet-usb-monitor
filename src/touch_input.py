@@ -230,7 +230,9 @@ class PortalTouchInput:
     @property
     def mode(self) -> str:
         if self.touch_enabled:
-            return "touchscreen-eis" if self.touch_backend is not None else "touchscreen"
+            if self.touch_backend is None:
+                return "touchscreen-portal-unverified"
+            return "touchscreen-eis-ready" if self.touch_backend.ready else "touchscreen-eis-waiting"
         return "pointer-fallback"
 
     def _position(self, message: Mapping[str, Any]) -> tuple[float, float]:

@@ -82,7 +82,7 @@ cannot work. `doctor` deliberately does not print device serial numbers.
 ## Start and stop
 
 ```sh
-./tabs9 start --fps 120 --bitrate 60000
+./tabs9 start --resolution 2960x1848 --fps 60 --bitrate 30000
 ./tabs9 status
 ./tabs9 logs
 ./tabs9 stop
@@ -170,8 +170,11 @@ removes the virtual output, and removes the two ADB reverse mappings it created.
 The laptop panel remains enabled. Windows on the removed output are managed by
 KDE's normal display-disconnection behavior.
 
-`--profile smooth|balanced|light` picks 120/60/30 fps with matching bitrate;
-explicit `--fps`/`--bitrate` override it. All profiles use the same zero-copy
+`--profile smooth|balanced|light` picks 120/60/30 fps with matching bitrate.
+Resolution and frame rate are independent: use `--resolution WIDTHxHEIGHT` and
+`--fps 30|60|90|120`; explicit `--fps`/`--bitrate` override the profile. Native
+`2960x1848` remains the default; lower resolutions require an explicit choice.
+All profiles use the same zero-copy
 GPU path — the tablet costs the host 0–1 % CPU while its content is static
 and ~30 % of one core at 110 fps of continuous motion, so the profile only
 matters when things move on it. Bitrate is in kbit/s. Lowering bitrate primarily reduces USB traffic; lowering the frame rate
@@ -217,11 +220,9 @@ python3 -m unittest discover -s tests -v
 ```
 
 `bench-capture` measures the capture paths (`--modes va system gl`) against
-continuous motion and prints capture, encode and tablet-acknowledgement rates
-side by side. It prompts for the consent dialog per path and does the rest
-itself. Note it drives the *raster* Qt pattern, which itself repaints at most
-~30–40 fps; use `python3 scripts/gpu-motion-test.py --seconds 20` with the host
-already running for the OpenGL source that reaches 120.
+continuous OpenGL motion and prints capture, encode and tablet-acknowledgement
+rates side by side. It performs three separate runs per candidate by default,
+with a warm-up, and prompts for each consent dialog.
 
 The motion test displays a synthetic moving pattern on the virtual output and
 reports how many injected touches arrived as native input. Logs contain counts, frame dimensions, timing and negotiated

@@ -1,12 +1,13 @@
 # Performance analysis
 
-## Result
+## Current result
 
-The observed ceiling is about 60 frames/s, but neither NVENC nor the Python/TCP
-transport has a demonstrated 60 frames/s limit.  The next run should measure the
-cadence at three boundaries: PipeWire input, encoded output, and tablet rendered
-acknowledgement.  That single comparison identifies the responsible stage without
-recording screen contents.
+Native 2960x1848 at 60 fps is the reliability milestone. The existing live
+records do not yet demonstrate that it is repeatable: earlier runs ranged from
+about 30 to 110 fps under motion, while the latest roughly 1 fps samples were an
+idle screen plus the one-second keepalive and are not a throughput measurement.
+Keep 90 and 120 fps selectable, but do not describe either as stable until three
+fresh OpenGL-motion runs reproduce it without the 75–100 ms stalls below.
 
 The leading host-side hypothesis is KWin's screencast scheduling plus the cost of
 rendering a 2960x1848 frame.  KWin 6.6.6 emits an output screencast frame when its
@@ -106,11 +107,13 @@ The resolution A/B test is diagnostic, not a proposed permanent downgrade.  If
 input cadence rises substantially at the lower size, KWin's capture render or
 readback cost is confirmed.
 
-## Optimized pipeline direction
+## Pipeline direction
 
-Keep NVIDIA HEVC P1, ultra-low-latency tuning, zero B-frames, leaky queues, and
-the current bounded client queue.  Those choices match the latency goal and the
-measurements do not justify switching to Intel VA.
+The later live measurements supersede the early Intel/NVIDIA recommendation in
+this document. The default remains the same-Intel-GPU VA path because it was the
+only path to reach roughly 110 fps in a live run; the system and cross-GPU GL
+paths remain diagnostic. The result is still bistable, so this is a best-known
+candidate rather than proof of a stable 120 fps profile.
 
 If the probes show that SystemMemory is active and input falls below 120, test
 this memory route behind a capability check:
@@ -213,9 +216,8 @@ Take-aways:
 - The raster Qt motion test (`motion-test.py`) repaints at ~30–40 fps at
   this size and cannot exercise 120; use the OpenGL source for cadence.
 
-The remaining ~10 fps gap to 120 has not been chased; the tablet decoder
-already reports 111 fps and the compositor 117–120, so it is a small,
-distributed cost rather than one stall.
+The gap is not known to be small or distributed. Later measurements found a
+repeatable slow signature: four quick frames followed by a 75–100 ms stall.
 
 ### Not settled: the 40 fps mode (investigation of 2026-09-12 afternoon)
 
@@ -257,10 +259,27 @@ buffers) rather than at any GStreamer setting, and the bistability comes
 from KWin's 4-buffer limit: once the chain falls 4 frames behind, KWin
 stops producing until buffers return.
 
-The way to settle it, and the only remaining "low-level" optimisation, is a
-consumer that does not go through GStreamer: libpipewire + libva in C,
-importing each DMA-BUF once (cached per fd), submitting VPP into a ring of
-NV12 surfaces, syncing that VPP and returning KWin's buffer *inside the
-PipeWire process callback*, and encoding asynchronously. That gives
-deterministic buffer return, a direct measurement of the import cost, and
-removes Python from the data path. It is an estimated 600–900 lines of C.
+The next bounded experiment is to separate capture, VPP and encoding with
+compatible DMA-BUF caps, then test an owned surface pool that returns the source
+after the actual conversion fence completes. A complete native consumer is only
+justified if that experiment shows that ownership changes the source cadence.
+Any native process callback must stay non-blocking; it cannot wait for VPP,
+encoding, or socket writes.
+
+### Instrumentation repaired on 2026-09-12
+
+Capture wall-clock and PTS interval samples are now cleared after each
+five-second telemetry report. Previously the 1200-entry retained deque mixed
+idle keepalive samples with later motion and made p90/max unsuitable for a
+single benchmark run. `bench-capture` now uses the OpenGL motion source, performs
+three separate runs per candidate by default, and reports capture/encoded/tablet
+rates, capture interval p50/p90/max, input rejection deltas, and host CPU as a
+percentage of one core. GPU load remains an external observation when available.
+
+No fresh post-change hardware run is recorded here yet because applying the
+touch fix requires a coordinated service restart and KDE consent. The first
+candidate command is:
+
+```sh
+./tabs9 start --resolution 2960x1848 --fps 60 --bitrate 30000 --capture-memory va
+```

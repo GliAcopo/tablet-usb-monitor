@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import contextlib
 from dataclasses import dataclass
 import logging
 from typing import Callable
@@ -69,6 +70,8 @@ def _load():
         'ei_event_get_seat': (P, [P]),
         'ei_event_get_device': (P, [P]),
         'ei_device_get_name': (ctypes.c_char_p, [P]),
+        'ei_device_ref': (P, [P]),
+        'ei_device_unref': (P, [P]),
         'ei_device_has_capability': (ctypes.c_bool, [P, ctypes.c_int]),
         'ei_device_get_region': (P, [P, ctypes.c_size_t]),
         'ei_region_get_x': (ctypes.c_uint32, [P]),
@@ -115,6 +118,8 @@ class EisTouch:
         self.connected = False
         self._sequence = 0
         self._touches: dict[int, ctypes.c_void_p] = {}
+        self._devices: dict[int, ctypes.c_void_p] = {}
+        self._resumed: set[int] = set()
         self._closed = False
 
     # -- event pump (call from the thread that owns this object) --------------
@@ -136,9 +141,11 @@ class EisTouch:
         if kind == EI_EVENT_CONNECT:
             self.connected = True
         elif kind == EI_EVENT_DISCONNECT:
+            self._release_contacts()
             self.connected = False
             self.ready = False
             self.device = None
+            self.region = None
         elif kind == EI_EVENT_SEAT_ADDED:
             seat = self.lib.ei_event_get_seat(event)
             self.lib.ei_seat_bind_capabilities(seat, ctypes.c_int(EI_DEVICE_CAP_TOUCH),
@@ -147,27 +154,45 @@ class EisTouch:
         elif kind == EI_EVENT_DEVICE_ADDED:
             device = self.lib.ei_event_get_device(event)
             if self.lib.ei_device_has_capability(device, EI_DEVICE_CAP_TOUCH):
-                self.device = device
-                self.region = self._match_region(device)
+                key = self._key(device)
+                if key not in self._devices:
+                    self._devices[key] = self.lib.ei_device_ref(device)
                 name = self.lib.ei_device_get_name(device) or b''
-                log.info('EIS touch device %r regions matched: %s', name.decode(errors='replace'), self.region)
+                log.info('EIS touch candidate %r regions: %s',
+                         name.decode(errors='replace'), self._regions(device))
+                self.refresh_binding()
         elif kind == EI_EVENT_DEVICE_REMOVED:
-            if self.lib.ei_event_get_device(event) == self.device:
+            removed = self.lib.ei_event_get_device(event)
+            key = self._key(removed)
+            if self.device is not None and key == self._key(self.device):
+                self._release_contacts()
                 self.device = None
+                self.region = None
                 self.ready = False
-                self._touches.clear()
+            owned = self._devices.pop(key, None)
+            self._resumed.discard(key)
+            if owned:
+                self.lib.ei_device_unref(owned)
+            self.refresh_binding()
         elif kind == EI_EVENT_DEVICE_RESUMED:
-            if self.lib.ei_event_get_device(event) == self.device:
-                self._sequence += 1
-                self.lib.ei_device_start_emulating(self.device, self._sequence)
-                self.ready = True
+            device = self.lib.ei_event_get_device(event)
+            self._resumed.add(self._key(device))
+            self.refresh_binding()
         elif kind == EI_EVENT_DEVICE_PAUSED:
-            if self.lib.ei_event_get_device(event) == self.device:
+            device = self.lib.ei_event_get_device(event)
+            key = self._key(device)
+            self._resumed.discard(key)
+            if self.device is not None and key == self._key(self.device):
+                self._release_contacts()
+                with contextlib.suppress(Exception):
+                    self.lib.ei_device_stop_emulating(self.device)
                 self.ready = False
-                self._touches.clear()
 
-    def _match_region(self, device) -> Region | None:
-        tx, ty, tw, th = self._target_region()
+    @staticmethod
+    def _key(device) -> int:
+        return int(device.value if isinstance(device, ctypes.c_void_p) else device)
+
+    def _regions(self, device) -> list[Region]:
         regions = []
         index = 0
         while True:
@@ -177,11 +202,42 @@ class EisTouch:
             regions.append(Region(self.lib.ei_region_get_x(region), self.lib.ei_region_get_y(region),
                 self.lib.ei_region_get_width(region), self.lib.ei_region_get_height(region)))
             index += 1
+        return regions
+
+    def _match_region(self, device) -> Region | None:
+        tx, ty, tw, th = self._target_region()
+        regions = self._regions(device)
         for region in regions:
             if (region.x, region.y) == (tx, ty) and abs(region.width - tw) <= 1 and abs(region.height - th) <= 1:
                 return region
         log.warning('no EIS region matches the target %s; regions: %s', (tx, ty, tw, th), regions)
         return None
+
+    def refresh_binding(self) -> bool:
+        """Bind the one resumed touch device whose region matches live KScreen state."""
+        matches = []
+        for key, device in self._devices.items():
+            if key in self._resumed:
+                region = self._match_region(device)
+                if region is not None:
+                    matches.append((device, region))
+        if len(matches) != 1:
+            if self.device is not None:
+                self._release_contacts()
+            self.device = None
+            self.region = None
+            self.ready = False
+            if len(matches) > 1:
+                log.warning('multiple EIS touch devices match the virtual output; refusing to choose')
+            return False
+        device, region = matches[0]
+        changed = self.device is None or self._key(self.device) != self._key(device)
+        if changed:
+            self._release_contacts()
+            self._sequence += 1
+            self.lib.ei_device_start_emulating(device, self._sequence)
+        self.device, self.region, self.ready = device, region, True
+        return True
 
     # -- injection --------------------------------------------------------------
     def _absolute(self, x: float, y: float) -> tuple[float, float]:
@@ -197,6 +253,7 @@ class EisTouch:
             raise EisError('EIS touch device is not ready')
 
     def down(self, slot: int, x: float, y: float) -> None:
+        self.refresh_binding()
         self._require_ready()
         if slot in self._touches:
             raise EisError('duplicate EIS touch slot')
@@ -233,6 +290,18 @@ class EisTouch:
             except Exception:
                 pass
 
+    def _release_contacts(self) -> None:
+        for touch in self._touches.values():
+            if self.ready and self.device:
+                with contextlib.suppress(Exception):
+                    self.lib.ei_touch_up(touch)
+            with contextlib.suppress(Exception):
+                self.lib.ei_touch_unref(touch)
+        if self._touches and self.ready and self.device:
+            with contextlib.suppress(Exception):
+                self.lib.ei_device_frame(self.device, self.lib.ei_now(self.ei))
+        self._touches.clear()
+
     def close(self) -> None:
         if self._closed:
             return
@@ -242,6 +311,10 @@ class EisTouch:
                 self.lib.ei_device_stop_emulating(self.device)
             except Exception:
                 pass
+        for device in self._devices.values():
+            self.lib.ei_device_unref(device)
+        self._devices.clear()
+        self._resumed.clear()
         self._closed = True
         self.lib.ei_unref(self.ei)
         self.ei = None

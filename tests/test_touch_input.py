@@ -65,6 +65,7 @@ class PortalTouchInputTests(unittest.TestCase):
         class Backend:
             def __init__(self):
                 self.calls = []
+                self.ready = True
             def down(self, slot, x, y):
                 self.calls.append(("down", slot, x, y))
             def motion(self, slot, x, y):
@@ -74,7 +75,7 @@ class PortalTouchInputTests(unittest.TestCase):
         touch, portal = controller()
         backend = Backend()
         touch.touch_backend = backend
-        self.assertEqual(touch.mode, "touchscreen-eis")
+        self.assertEqual(touch.mode, "touchscreen-eis-ready")
         touch.handle_message({"type": "touch", "action": 0, "slot": 2, "x": 0.5, "y": 0.25})
         touch.handle_message({"type": "touch", "action": 2, "slot": 2, "x": 0.25, "y": 0.5})
         touch.handle_message({"type": "touch", "action": 0, "slot": 3, "x": 0.1, "y": 0.1})
@@ -167,7 +168,7 @@ class PortalTouchInputTests(unittest.TestCase):
 
     def test_touch_grant_is_preferred_over_pointer(self):
         touch, _ = controller(TOUCHSCREEN | POINTER)
-        self.assertEqual(touch.mode, "touchscreen")
+        self.assertEqual(touch.mode, "touchscreen-portal-unverified")
 
     def test_pen_hover_and_tip_use_granted_absolute_pointer(self):
         touch, portal = controller(TOUCHSCREEN | POINTER)

@@ -27,7 +27,7 @@ import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import GLib, GLibUnix, Gst
 from websockets.asyncio.server import serve
-from touch_input import LiveKScreenTarget, FixedTarget, PortalTouchInput, TouchInputError
+from touch_input import LiveKScreenTarget, PortalTouchInput, TouchInputError
 from eis_touch import EisTouch, EisError
 from status import StatusWriter
 from tokens import load_tokens, save_token, discard_token
@@ -224,6 +224,7 @@ class Host:
         self.tablet_stats = {}
         self.input_messages = 0
         self.input_rejected = 0
+        self.input_followon_rejected = 0
         self.tablet_panel = None
         self.panel_mismatch_reported = False
         self.sent = collections.OrderedDict()
@@ -394,13 +395,14 @@ class Host:
         restore_token = result.get('restore_token')
         if restore_token and isinstance(restore_token, str) and len(restore_token) > 0:
             save_token(self.tokens_file, 'remotedesktop_capture', str(restore_token))
-        geometry = LiveKScreenTarget(self.virtual_name).geometry()
+        target = LiveKScreenTarget(self.virtual_name, cache_seconds=0.2)
+        geometry = target.geometry()
         node, props = chosen
         print('Selected capture size:', tuple(int(x) for x in props.get('size', [])), flush=True)
         self.touch = PortalTouchInput.bind(self.remote, str(self.session), chosen,
-            FixedTarget(geometry), int(result.get('devices', 0)))
+            target, int(result.get('devices', 0)))
         self.watch_session(self.session)
-        self.connect_eis(geometry)
+        self.connect_eis(target)
         print('Tablet input mode:', self.touch.mode, flush=True)
         self.fd = self.portal.OpenPipeWireRemote(self.session, dbus.Dictionary({}, signature='sv')).take()
         self.capture_node = int(node)
@@ -438,7 +440,10 @@ class Host:
             + encode +
             '! video/x-h265,profile=main '
             '! h265parse config-interval=-1 ! video/x-h265,stream-format=byte-stream,alignment=au '
-            '! appsink name=encoded emit-signals=true sync=false max-buffers=2 drop=true'
+            # Dropping an arbitrary encoded HEVC access unit can corrupt every
+            # dependent frame until the next IDR. The async client queues below
+            # provide the bounded backpressure policy and reconnect at a keyframe.
+            '! appsink name=encoded emit-signals=true sync=false max-buffers=2 drop=false'
         )
         if os.environ.get('TABS9_DEBUG_TAIL'):
             # Diagnostics only: replace everything after pipewiresrc's queue.
@@ -580,24 +585,31 @@ class Host:
         self.request_capture_session()
         return False
 
-    def connect_eis(self, geometry):
+    def connect_eis(self, target):
         """Prefer libei for touch; fall back to the portal's own calls."""
         if not self.touch.touch_enabled:
             return
         try:
             fd = self.remote.ConnectToEIS(self.session, dbus.Dictionary({}, signature='sv')).take()
-            self.eis = EisTouch(fd, lambda: (geometry.x, geometry.y, *geometry.logical_size))
+            self.eis = EisTouch(fd, lambda: ((g := target.geometry()).x, g.y, *g.logical_size))
         except (dbus.DBusException, EisError, AttributeError) as error:
             print('EIS unavailable, using portal touch:', type(error).__name__, error, flush=True)
             return
-        def pump(*_):
+        def pump(_fd, condition):
+            if condition & (GLib.IOCondition.HUP | GLib.IOCondition.ERR):
+                print('EIS connection closed; touch is not ready. Reconnect the display session.', flush=True)
+                self.touch.touch_backend = None
+                self.eis.close()
+                self.eis = None
+                return False
             try:
                 self.eis.dispatch()
             except Exception as error:
                 print('EIS dispatch failed:', type(error).__name__, error, flush=True)
                 return False
             return True
-        GLib.io_add_watch(self.eis.fd, GLib.PRIORITY_DEFAULT, GLib.IOCondition.IN, pump)
+        GLib.io_add_watch(self.eis.fd, GLib.PRIORITY_DEFAULT,
+                          GLib.IOCondition.IN | GLib.IOCondition.HUP | GLib.IOCondition.ERR, pump)
         self.touch.touch_backend = self.eis
         # A touch before the EIS device is resumed raises and is counted as rejected.
 
@@ -779,10 +791,15 @@ class Host:
             try:
                 self.touch.handle_message(message)
             except (TouchInputError, dbus.DBusException, EisError) as error:
-                self.input_rejected += 1
-                if self.input_rejected <= 5 or self.input_rejected % 100 == 0:
-                    print(f'Tablet input rejected ({self.input_rejected}): {type(error).__name__}: {error}',
-                        flush=True)
+                followon = 'slot is not active' in str(error)
+                if followon:
+                    self.input_followon_rejected += 1
+                else:
+                    self.input_rejected += 1
+                rejected = self.input_followon_rejected if followon else self.input_rejected
+                label = 'Follow-on input ignored' if followon else 'Tablet input rejected'
+                if rejected <= 5 or rejected % 100 == 0:
+                    print(f'{label} ({rejected}): {type(error).__name__}: {error}', flush=True)
                 self.release_touch()
         return False
 
@@ -861,6 +878,7 @@ class Host:
         elapsed = now - before
         self.last_report = (now, self.frames, self.rendered, self.capture_frames)
         arrivals = sorted(self.capture_intervals)
+        self.capture_intervals.clear()
         if os.environ.get('TABS9_STAGE_PROBES') and getattr(self, 'stage_times', None):
             summary = {}
             for name, values in self.stage_times.items():
@@ -871,12 +889,14 @@ class Host:
             for values in self.stage_times.values():
                 values.clear()
         timestamps = sorted(self.capture_pts_intervals)
+        self.capture_pts_intervals.clear()
         print(json.dumps({'encoded_frames': self.frames, 'tablet_rendered_acks': self.rendered,
             'capture_fps': round((self.capture_frames - captured) / elapsed, 1),
             'encoded_fps': round((self.frames - frames) / elapsed, 1),
             'tablet_ack_fps': round((self.rendered - rendered) / elapsed, 1),
             'tablet_input_messages': self.input_messages,
             'tablet_input_rejected': self.input_rejected,
+            'tablet_input_followon_rejected': self.input_followon_rejected,
             'tablet': self.tablet_stats,
             'capture_interval_ms_p50': round(arrivals[len(arrivals)//2], 2) if arrivals else None,
             'capture_interval_ms_p90': round(arrivals[int(len(arrivals)*0.9)], 2) if arrivals else None,
@@ -959,8 +979,8 @@ PROFILES = {
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--profile', choices=sorted(PROFILES), default='smooth')
-    parser.add_argument('--width', type=int, default=2960)
-    parser.add_argument('--height', type=int, default=1848)
+    parser.add_argument('--resolution', default='2960x1848', metavar='WIDTHxHEIGHT',
+                        help='pixel resolution, independently of --fps (default: 2960x1848)')
     parser.add_argument('--fps', type=int, choices=[30, 60, 90, 120])
     parser.add_argument('--bitrate', type=int)
     parser.add_argument('--scale', type=float, default=1.5)
@@ -968,6 +988,10 @@ if __name__ == '__main__':
     parser.add_argument('--rate-control', choices=['cbr', 'vbr', 'cqp'], default='cbr')
     parser.add_argument('--qp', type=int, default=24)
     args = parser.parse_args()
+    try:
+        args.width, args.height = (int(part) for part in args.resolution.lower().split('x', 1))
+    except (TypeError, ValueError):
+        parser.error('--resolution must be WIDTHxHEIGHT, for example 2960x1848')
     for key, value in PROFILES[args.profile].items():
         if getattr(args, key) is None:
             setattr(args, key, value)

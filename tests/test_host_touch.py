@@ -93,6 +93,7 @@ def bare_host():
     value.tablet_stats = {}
     value.input_messages = 0
     value.input_rejected = 0
+    value.input_followon_rejected = 0
     value.tablet_panel = None
     value.panel_mismatch_reported = False
     return value
@@ -259,6 +260,20 @@ class HostTouchIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result)
         self.assertEqual(value.touch.releases, 1)
+        self.assertEqual(value.input_rejected, 1)
+        self.assertEqual(value.input_followon_rejected, 0)
+
+    async def test_inactive_slot_is_counted_separately_from_root_rejection(self):
+        value = bare_host()
+        value.control_owner = object()
+        value.control_generation = 4
+        value.touch.error = host_module.TouchInputError("touch slot is not active")
+
+        value.handle_touch(
+            {"type": "touch", "action": 2, "slot": 8, "x": 0.2, "y": 0.3}, 4)
+
+        self.assertEqual(value.input_rejected, 0)
+        self.assertEqual(value.input_followon_rejected, 1)
 
 
 if __name__ == "__main__":

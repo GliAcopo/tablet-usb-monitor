@@ -140,7 +140,7 @@ def measure(mode, seconds, extra):
         print('Note: the GL path fell back to system memory.', flush=True)
     fallback = bool(wait_for(started, 'falling back to the system-memory', 1))
 
-    motion = subprocess.Popen([sys.executable, str(ROOT / 'scripts/motion-test.py'),
+    motion = subprocess.Popen([sys.executable, str(ROOT / 'scripts/gpu-motion-test.py'),
                                '--seconds', str(seconds + WARMUP_SECONDS + 2)])
     time.sleep(WARMUP_SECONDS)
     window_start = time.time()
@@ -165,10 +165,15 @@ def measure(mode, seconds, extra):
         'encoded_fps': median([r.get('encoded_fps') for r in window]),
         'tablet_ack_fps': median([r.get('tablet_ack_fps') for r in window]),
         'capture_interval_ms_p50': median([r.get('capture_interval_ms_p50') for r in window]),
+        'capture_interval_ms_p90': median([r.get('capture_interval_ms_p90') for r in window]),
+        'capture_interval_ms_max': max((r.get('capture_interval_ms_max') for r in window
+                                        if isinstance(r.get('capture_interval_ms_max'), (int, float))), default=None),
         'capture_pts_interval_ms_p50': median([r.get('capture_pts_interval_ms_p50') for r in window]),
         'encode_to_render_ms_p50': median([r.get('encode_to_render_ms_p50') for r in window]),
         'tablet_decoder_fps': median([r.get('tablet', {}).get('decoder_fps') for r in window]),
-        'host_cpu_seconds': round(cpu, 1) if cpu is not None else None,
+        'input_rejected_delta': max((r.get('tablet_input_rejected', 0) for r in window), default=0) -
+                                min((r.get('tablet_input_rejected', 0) for r in window), default=0),
+        'host_cpu_percent_one_core': round(cpu / (seconds + WARMUP_SECONDS) * 100, 1) if cpu is not None else None,
     }
 
 
@@ -178,21 +183,27 @@ def main():
                         help='measured window per capture path, after warm-up')
     parser.add_argument('--modes', nargs='+', default=['va', 'system'],
                         choices=['system', 'gl', 'va'])
+    parser.add_argument('--runs', type=int, default=3, help='separate runs per candidate')
     parser.add_argument('rest', nargs='*', metavar='-- HOST ARGS',
                         help='extra host arguments; the -- separator is required, '
                              'e.g. bench-capture --seconds 30 -- --fps 60')
     args = parser.parse_args()
     if not 5 <= args.seconds <= 600:
         parser.error('--seconds must be between 5 and 600')
+    if not 1 <= args.runs <= 10:
+        parser.error('--runs must be between 1 and 10')
     if unit_active():
         parser.error('The USB display host is already running; stop it first.')
 
     results = []
     try:
         for mode in args.modes:
-            result = measure(mode, args.seconds, args.rest)
-            if result:
-                results.append(result)
+            for run in range(1, args.runs + 1):
+                print(f'\nRun {run}/{args.runs}', flush=True)
+                result = measure(mode, args.seconds, args.rest)
+                if result:
+                    result['mode'] = f'{mode}-{run}'
+                    results.append(result)
     finally:
         stop_host()
 

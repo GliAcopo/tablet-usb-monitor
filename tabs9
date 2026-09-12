@@ -163,10 +163,16 @@ case "${1:-help}" in
           || kpackagetool6 --type KWin/Script --upgrade "$PWD/kwin/tabs9-pin" >/dev/null
         kwriteconfig6 --file kwinrc --group Plugins --key tabs9-pinEnabled true
         gdbus call --session --dest org.kde.KWin --object-path /KWin --method org.kde.KWin.reconfigure >/dev/null
+        if ! qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.isScriptLoaded tabs9-pin 2>/dev/null | grep -qx true; then
+          qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript \
+            "$HOME/.local/share/kwin/scripts/tabs9-pin/contents/code/main.js" tabs9-pin >/dev/null
+          qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.start >/dev/null
+        fi
         echo 'Windows on the tablet now stay put when you switch virtual desktops.'
         ;;
       off)
         kwriteconfig6 --file kwinrc --group Plugins --key tabs9-pinEnabled false
+        qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript tabs9-pin >/dev/null 2>&1 || true
         gdbus call --session --dest org.kde.KWin --object-path /KWin --method org.kde.KWin.reconfigure >/dev/null
         echo 'Tablet windows follow virtual desktops again.'
         ;;
@@ -179,8 +185,8 @@ case "${1:-help}" in
     echo 'Usage: ./tabs9 {setup|doctor|start [options]|stop|status|logs|pin-desktop on|off}'
     echo '              {test-motion [--seconds N]|bench-capture [--seconds N]}'
     echo '  start options: --profile smooth|balanced|light (120/60/30 fps)'
-    echo '                 --fps 30|60|90|120  --bitrate 40000  --scale 1.5'
-    echo '                 --width 2960 --height 1848  --capture-memory va|system|gl'
+    echo '                 --resolution 2960x1848  --fps 30|60|90|120'
+    echo '                 --bitrate 40000  --scale 1.5  --capture-memory va|system|gl'
     echo '  bench-capture compares both capture paths under continuous motion;'
     echo '  it needs the two KDE sharing dialogs answered once per path.'
     ;;
