@@ -35,9 +35,10 @@ private was captured.
   touch events in a window on the virtual output (multitouch slots, correct
   position). This needed libei — see "Touch" below for why the portal's own
   touch calls cannot work on KDE 6.6.
-- Consent: the "Share virtual screen" dialog prompts on every start; the
-  capture/input dialog is **skipped after the first approval** via the stored
-  restore token (verified live: the second session is restored in ~100 ms).
+- Consent: **both** portal dialogs are skipped after the first approval via
+  stored restore tokens (verified live 2026-09-12: after one accepted "Share
+  virtual screen" dialog, `stop`/`start` went straight to streaming twice,
+  input mode `touchscreen-eis-ready`, nobody at the keyboard).
 - Host → tablet settings sync and tablet → host input transport verified as
   before.
 - Pen-only mode (tablet as a graphics tablet for the laptop's own screen) is
@@ -126,7 +127,7 @@ same consented session and drives KWin's EIS backend through libei
 device with a region per output, and every contact is framed. Pen input
 still uses the portal's pointer calls, which KDE maps correctly.
 
-### Portal token persistence (one-time consent for capture)
+### Portal token persistence (one-time consent)
 
 The capture/RemoteDesktop session requests `persist_mode=2`. Per the XDG
 RemoteDesktop spec, if the portal's **"Allow restoring on future sessions"**
@@ -140,12 +141,22 @@ stored token is stale or rejected by the portal, it is discarded and the host
 retries once with interactive consent — no silent retry loop (this recovery
 path is unit-tested).
 
-The first dialog, "Share virtual screen" (virtual-output creation), never
-requests `persist_mode`: KDE 6.6.6 does not implement persistence for that
-session type, so asking would only promise a skipped dialog this backend
-cannot deliver. Because no persistence is ever requested for it, this dialog
-necessarily prompts on every start — that follows from the request the host
-sends, not from an additional live measurement.
+The first dialog, "Share virtual screen" (virtual-output creation), is
+persisted the same way under the `screencast_create` key. This works because
+`xdg-desktop-portal-kde` 6.6.6 restores a ScreenCast selection by output
+`uniqueId`, and the "Share virtual screen" entry has the fixed id `Virtual`
+(`screencast.cpp` / `outputsmodel.cpp`). Confirmed live: after one accepted
+dialog with "Allow restoring on future sessions" ticked, later starts show no
+dialog at all. A stale creation token is discarded and the host retries once
+interactively, like the capture token.
+
+One caveat seen live: if KWin's saved output layout
+(`~/.config/kwinoutputconfig.json`) remembers the virtual output as
+*disabled*, every new virtual output is created disabled, the portal's Start
+fails with "error code 2" (`Could not find output` in the journal) and no
+dialog is involved. Enable it once with `kscreen-doctor
+output.Virtual-virtual-xdp-kde-.enable` and restart
+`plasma-xdg-desktop-portal-kde.service` to drop leftover outputs.
 
 ### Status reporting
 
@@ -222,7 +233,7 @@ python3 -m unittest discover -s tests -v
 `bench-capture` measures the capture paths (`--modes va system gl`) against
 continuous OpenGL motion and prints capture, encode and tablet-acknowledgement
 rates side by side. It performs three separate runs per candidate by default,
-with a warm-up, and prompts for each consent dialog.
+with a warm-up; with stored restore tokens no consent dialog appears.
 
 The motion test displays a synthetic moving pattern on the virtual output and
 reports how many injected touches arrived as native input. Logs contain counts, frame dimensions, timing and negotiated
