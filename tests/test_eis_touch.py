@@ -41,6 +41,7 @@ def controller(regions, target):
     value._touches = {}
     value._devices = {key: key for key in regions}
     value._resumed = set(regions)
+    value._layout_changed = None
     value._closed = False
     return value
 
@@ -65,6 +66,23 @@ class EisBindingTests(unittest.TestCase):
                            [(0, 0, 1973, 1232)])
         self.assertFalse(touch.refresh_binding())
         self.assertFalse(touch.ready)
+
+    def test_device_events_invalidate_cached_layout_but_touches_do_not(self):
+        target = [(1463, 0, 1973, 1232)]
+        touch = controller({1: [(0, 0, 1973, 1232)]}, target)
+        invalidations = []
+        touch._layout_changed = lambda: (invalidations.append(1), target.__setitem__(0, (0, 0, 1973, 1232)))
+        self.assertFalse(touch.refresh_binding())
+        self.assertEqual(invalidations, [])
+        self.assertTrue(touch.refresh_binding(layout_changed=True))
+        self.assertEqual(invalidations, [1])
+        # A bound device is not re-matched (and KScreen not re-read) per contact.
+        touch.lib.ei_device_touch_new = lambda device: 7
+        touch.lib.ei_touch_down = lambda *a: None
+        touch.lib.ei_device_frame = lambda *a: None
+        touch.lib.ei_now = lambda ei: 0
+        touch.down(1, 10, 10)
+        self.assertEqual(invalidations, [1])
 
     def test_layout_change_drops_old_binding_until_matching_region_arrives(self):
         target = [(0, 0, 1973, 1232)]

@@ -98,6 +98,10 @@ class LiveKScreenTarget:
             raise TouchInputError("KScreen returned no output list")
         return outputs
 
+    def invalidate(self) -> None:
+        """Force the next geometry() to re-read KScreen (the layout changed)."""
+        self._read_at = -math.inf
+
     def geometry(self) -> OutputGeometry:
         now = time.monotonic()
         if self._cached is not None and now - self._read_at < self.cache_seconds:

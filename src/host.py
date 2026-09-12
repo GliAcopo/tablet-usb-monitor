@@ -13,6 +13,7 @@ import json
 import math
 import os
 from pathlib import Path
+import sys
 import secrets
 import signal
 import socket
@@ -199,6 +200,9 @@ def compute_virtual_position(current_outputs, previous_names):
     return (max(0, right_edge), 0)
 
 
+RESYNC = object()  # queue marker: the client must wait for the next keyframe
+
+
 class Host:
     def __init__(self, args):
         self.args = args
@@ -225,6 +229,7 @@ class Host:
         self.input_messages = 0
         self.input_rejected = 0
         self.input_followon_rejected = 0
+        self.resyncs = 0
         self.tablet_panel = None
         self.panel_mismatch_reported = False
         self.sent = collections.OrderedDict()
@@ -395,10 +400,15 @@ class Host:
         restore_token = result.get('restore_token')
         if restore_token and isinstance(restore_token, str) and len(restore_token) > 0:
             save_token(self.tokens_file, 'remotedesktop_capture', str(restore_token))
-        target = LiveKScreenTarget(self.virtual_name, cache_seconds=0.2)
+        # Cached for the touch path (no kscreen-doctor call per contact); EIS
+        # device events and output changes invalidate it.
+        target = LiveKScreenTarget(self.virtual_name, cache_seconds=5.0)
         geometry = target.geometry()
         node, props = chosen
-        print('Selected capture size:', tuple(int(x) for x in props.get('size', [])), flush=True)
+        # Same-instant geometry evidence (no pixels): portal stream vs KScreen.
+        print('Selected capture size:', tuple(int(x) for x in props.get('size', [])),
+              'position:', tuple(int(x) for x in props.get('position', [])),
+              'kscreen:', (geometry.x, geometry.y, *geometry.logical_size), flush=True)
         self.touch = PortalTouchInput.bind(self.remote, str(self.session), chosen,
             target, int(result.get('devices', 0)))
         self.watch_session(self.session)
@@ -440,10 +450,11 @@ class Host:
             + encode +
             '! video/x-h265,profile=main '
             '! h265parse config-interval=-1 ! video/x-h265,stream-format=byte-stream,alignment=au '
-            # Dropping an arbitrary encoded HEVC access unit can corrupt every
-            # dependent frame until the next IDR. The async client queues below
-            # provide the bounded backpressure policy and reconnect at a keyframe.
-            '! appsink name=encoded emit-signals=true sync=false max-buffers=2 drop=false'
+            # The appsink must never block the encoder (a blocked encoder stops
+            # returning KWin's four capture buffers).  sample() drains it at
+            # once, so the drop here only fires if Python itself stalls; the
+            # per-client queues in distribute() hold the real backlog policy.
+            '! appsink name=encoded emit-signals=true sync=false max-buffers=4 drop=true'
         )
         if os.environ.get('TABS9_DEBUG_TAIL'):
             # Diagnostics only: replace everything after pipewiresrc's queue.
@@ -591,7 +602,8 @@ class Host:
             return
         try:
             fd = self.remote.ConnectToEIS(self.session, dbus.Dictionary({}, signature='sv')).take()
-            self.eis = EisTouch(fd, lambda: ((g := target.geometry()).x, g.y, *g.logical_size))
+            self.eis = EisTouch(fd, lambda: ((g := target.geometry()).x, g.y, *g.logical_size),
+                                layout_changed=target.invalidate)
         except (dbus.DBusException, EisError, AttributeError) as error:
             print('EIS unavailable, using portal touch:', type(error).__name__, error, flush=True)
             return
@@ -678,16 +690,34 @@ class Host:
         self.aio.call_soon_threadsafe(self.distribute, packet, keyframe, seq)
         return Gst.FlowReturn.OK
 
+    def request_keyframe(self):
+        """Ask the encoder for an IDR so a client can resume at the next AU."""
+        if self.pipeline is None:
+            return False
+        encoder = self.pipeline.get_by_name('encoder')
+        if encoder is not None:
+            # Same layout as gst_video_event_new_upstream_force_key_unit (the
+            # GstVideo typelib is not installed here).
+            structure = Gst.Structure.from_string(
+                f'GstForceKeyUnit, running-time=(guint64){Gst.CLOCK_TIME_NONE}, '
+                'all-headers=(boolean)true, count=(uint)0')[0]
+            encoder.send_event(Gst.Event.new_custom(Gst.EventType.CUSTOM_UPSTREAM, structure))
+        return False
+
     def distribute(self, packet, keyframe, seq):
         self.sent[seq] = time.monotonic()
         while len(self.sent) > 1200:
             self.sent.popitem(last=False)
         for queue in tuple(self.clients):
             if queue.full():
-                # Reconnect at a keyframe rather than deliver a corrupt or stale GOP.
-                self.clients.discard(queue)
+                # The socket is behind by more than the queue: abandon this
+                # GOP (never send a dependent frame without its references),
+                # and ask for an IDR so the client resumes at the next
+                # keyframe instead of waiting for the periodic one.
                 while not queue.empty(): queue.get_nowait()
-                queue.put_nowait(None)
+                queue.put_nowait(RESYNC)
+                self.resyncs += 1
+                GLib.idle_add(self.request_keyframe)
             else:
                 queue.put_nowait((packet, keyframe))
 
@@ -709,6 +739,9 @@ class Host:
             while True:
                 item = await queue.get()
                 if item is None: break
+                if item is RESYNC:
+                    waiting = True
+                    continue
                 packet, keyframe = item
                 if waiting and not keyframe: continue
                 waiting = False
@@ -847,6 +880,14 @@ class Host:
         bitrate = message.get('bitrate', self.args.bitrate)
         if type(fps) is not int or fps not in (30, 60, 90, 120) or type(bitrate) is not int or not 1000 <= bitrate <= 150000:
             return False
+        if generation is not None and getattr(self.args, 'settings_locked', False) \
+                and (fps, bitrate) != (self.args.fps, self.args.bitrate):
+            # The host was launched with an explicit profile: the tablet's
+            # remembered settings are a request, answered with what is in force.
+            print(f'Tablet asked for {fps} fps / {bitrate} kbps; keeping the launch profile '
+                  f'({self.args.fps} fps / {self.args.bitrate} kbps).', flush=True)
+            self.aio.call_soon_threadsafe(lambda: asyncio.create_task(self.broadcast_settings()))
+            return False
         try:
             if self.virtual_name and fps != self.args.fps:
                 output = next(o for o in outputs() if o['name'] == self.virtual_name)
@@ -897,6 +938,7 @@ class Host:
             'tablet_input_messages': self.input_messages,
             'tablet_input_rejected': self.input_rejected,
             'tablet_input_followon_rejected': self.input_followon_rejected,
+            'client_resyncs': self.resyncs,
             'tablet': self.tablet_stats,
             'capture_interval_ms_p50': round(arrivals[len(arrivals)//2], 2) if arrivals else None,
             'capture_interval_ms_p90': round(arrivals[int(len(arrivals)*0.9)], 2) if arrivals else None,
@@ -995,6 +1037,10 @@ if __name__ == '__main__':
     for key, value in PROFILES[args.profile].items():
         if getattr(args, key) is None:
             setattr(args, key, value)
+    # An explicit --profile/--fps/--bitrate on the command line wins over the
+    # tablet's remembered settings; the bare default stays adjustable from it.
+    args.settings_locked = any(a.split('=', 1)[0] in ('--profile', '--fps', '--bitrate')
+                               for a in sys.argv[1:])
     if args.capture_memory == 'gl':
         os.environ['__NV_PRIME_RENDER_OFFLOAD'] = '1'
         os.environ['GST_GL_PLATFORM'] = 'egl'

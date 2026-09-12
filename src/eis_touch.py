@@ -101,7 +101,7 @@ class EisTouch:
     """One libei sender bound to KWin's absolute device, driving one output."""
 
     def __init__(self, fd: int, target_region: Callable[[], tuple[int, int, int, int]], *,
-                 name: str = 'tabs9-usb-display'):
+                 name: str = 'tabs9-usb-display', layout_changed: Callable[[], None] | None = None):
         self.lib = _load()
         self.ei = self.lib.ei_new_sender(None)
         if not self.ei:
@@ -112,6 +112,9 @@ class EisTouch:
             raise EisError('ei_setup_backend_fd failed')
         self.fd = self.lib.ei_get_fd(self.ei)
         self._target_region = target_region
+        # KWin re-announces its EIS devices whenever the output layout changes,
+        # so device events are the moment to drop any cached KScreen geometry.
+        self._layout_changed = layout_changed
         self.device = None
         self.region: Region | None = None
         self.ready = False
@@ -160,7 +163,7 @@ class EisTouch:
                 name = self.lib.ei_device_get_name(device) or b''
                 log.info('EIS touch candidate %r regions: %s',
                          name.decode(errors='replace'), self._regions(device))
-                self.refresh_binding()
+                self.refresh_binding(layout_changed=True)
         elif kind == EI_EVENT_DEVICE_REMOVED:
             removed = self.lib.ei_event_get_device(event)
             key = self._key(removed)
@@ -173,11 +176,11 @@ class EisTouch:
             self._resumed.discard(key)
             if owned:
                 self.lib.ei_device_unref(owned)
-            self.refresh_binding()
+            self.refresh_binding(layout_changed=True)
         elif kind == EI_EVENT_DEVICE_RESUMED:
             device = self.lib.ei_event_get_device(event)
             self._resumed.add(self._key(device))
-            self.refresh_binding()
+            self.refresh_binding(layout_changed=True)
         elif kind == EI_EVENT_DEVICE_PAUSED:
             device = self.lib.ei_event_get_device(event)
             key = self._key(device)
@@ -213,8 +216,10 @@ class EisTouch:
         log.warning('no EIS region matches the target %s; regions: %s', (tx, ty, tw, th), regions)
         return None
 
-    def refresh_binding(self) -> bool:
+    def refresh_binding(self, layout_changed: bool = False) -> bool:
         """Bind the one resumed touch device whose region matches live KScreen state."""
+        if layout_changed and self._layout_changed is not None:
+            self._layout_changed()
         matches = []
         for key, device in self._devices.items():
             if key in self._resumed:
@@ -253,7 +258,10 @@ class EisTouch:
             raise EisError('EIS touch device is not ready')
 
     def down(self, slot: int, x: float, y: float) -> None:
-        self.refresh_binding()
+        # Binding is refreshed on device events; the touch path only retries a
+        # binding that is currently missing, without re-reading the layout.
+        if not self.ready:
+            self.refresh_binding()
         self._require_ready()
         if slot in self._touches:
             raise EisError('duplicate EIS touch slot')

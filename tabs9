@@ -172,11 +172,25 @@ case "${1:-help}" in
         ;;
       off)
         kwriteconfig6 --file kwinrc --group Plugins --key tabs9-pinEnabled false
+        # Release the pins first: main.js only remembers them in memory.
+        release="$HOME/.local/share/kwin/scripts/tabs9-pin/contents/code/release.js"
+        if [[ -f "$release" ]]; then
+          qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript "$release" tabs9-pin-release >/dev/null 2>&1 \
+            && qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.start >/dev/null 2>&1 || true
+          qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript tabs9-pin-release >/dev/null 2>&1 || true
+        fi
         qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript tabs9-pin >/dev/null 2>&1 || true
         gdbus call --session --dest org.kde.KWin --object-path /KWin --method org.kde.KWin.reconfigure >/dev/null
         echo 'Tablet windows follow virtual desktops again.'
         ;;
-      *) echo 'Usage: ./tabs9 pin-desktop on|off'; exit 1 ;;
+      status)
+        if qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.isScriptLoaded tabs9-pin 2>/dev/null | grep -qx true; then
+          echo 'pin-desktop: on (KWin script loaded)'
+        else
+          echo "pin-desktop: off (config: $(kreadconfig6 --file kwinrc --group Plugins --key tabs9-pinEnabled --default false))"
+        fi
+        ;;
+      *) echo 'Usage: ./tabs9 pin-desktop on|off|status'; exit 1 ;;
     esac
     ;;
   test-motion) shift; exec python3 scripts/motion-test.py "$@" ;;
