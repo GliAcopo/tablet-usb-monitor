@@ -1075,8 +1075,9 @@ class Host:
                 elif msg.get('type') == 'config':
                     protocol = msg.get('protocol')
                     if type(protocol) is not int:
-                        print('Tablet client speaks protocol 1 (legacy mode: no render timestamps, '
-                              'no keyframe requests).', flush=True)
+                        print('Tablet client sent no protocol version: treating it as protocol 1 '
+                              '(render timestamps and keyframe requests are used if it sends them).',
+                              flush=True)
                     elif protocol > self.PROTOCOL:
                         print(f'Tablet client speaks protocol {protocol}, host {self.PROTOCOL}: '
                               'update the host; continuing with the common subset.', flush=True)

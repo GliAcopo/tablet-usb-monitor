@@ -97,6 +97,52 @@ Against the acceptance table: **60 fps passes every usable-mode gate**
 rejections). 120 fps passes the latency and stall gates (p95 11.7 ms ≤ 16.7,
 23.6 ms ≤ 40) but records 110–113 unique frames, not ≥ 115.
 
+### 30-minute soak, transport headroom, lifecycle (2026-09-12, night)
+
+Soak: `./tabs9 bench-capture --seconds 1800 --runs 1 --modes native --
+--profile balanced` with the motion pattern on the virtual output and an
+`adb shell input` tap or swipe on the tablet every 15 s
+(`.local/bench/soak-60fps-1800s.json`, per-window telemetry in
+`soak-60fps-windows.jsonl`). Steady state (361 five-second windows, 30.1
+min, after the client connected):
+
+| unique fps mean / median / min / max | capture→ack p95 median / worst window | render interval p95 median / worst | stalls > 100 ms | input messages / rejected | helper drops / KWin seq gaps |
+|---|---|---|---|---|---|
+| **58.2 / 58.2 / 56.4 / 59.8** | 27.2 / 33.4 ms | 20.2 / 23.9 ms | 0 (capture, render, ack) | 2868 / 0 | 1 / 1 |
+
+Every usable-mode gate holds for the whole half hour. The worst three-minute
+segment (56.4 fps, 33.4 ms) coincides with a Gradle build of the APK on the
+same laptop (minute 18–19): the soak was not run on an idle machine. The
+fps sits ~1 fps under the 60 s runs because the periodic ADB taps land on
+the pattern window and cost a repaint or two per second; the totals confirm
+it (105 208 encoded frames, 105 207 acked). The host under test predates
+commits 0c05b1a/062c7c0 (slot return and arrival pairing moved to the
+appsink pad probe); those were re-checked with a 60 s run on HEAD and the
+rebuilt APK: 58.9 fps, capture→ack p95 28.6 ms, render p95 19.6 ms,
+`native_pending` 0.
+
+Transport headroom: the same 60 s bench with `--bitrate 60000` (twice the
+profile) received 58–59 Mbit/s on the tablet at 58.8 unique fps,
+capture→ack p95 **21.6 ms**, render p95 19.6 ms, 0 stalls, 11 % of a core.
+ADB forwarding over the 5 Gbit/s link has at least 2× headroom, so no
+transport replacement is warranted (plan phase 4, criterion satisfied).
+
+Lifecycle, HEAD host + protocol-2 APK, motion running (log in
+`.local/bench/lifecycle-2026-09-12.log`): HOME then relaunch → 58.7 fps
+acked again within 8 s; host `stop` + `start` while the app stays up →
+reconnects, 58.8 fps, `native_pending` bounded; app frozen with `SIGSTOP`
+for 1.5 s and 3 s under load → picture and acks recover, no stall counters
+left behind. Protocol negotiation was exercised on both sides: the app logs
+"Host speaks protocol 3, this client 2; using the common subset" against a
+host with `PROTOCOL` bumped, and the host logs the legacy line against the
+previous APK. Not covered tonight: the overload run was meant to hold a
+two-finger contact during the freeze, but an earlier step in the same script
+put the tablet to sleep (`KEYCODE_SLEEP`) and the lock screen has a
+password, so touches from then on went to the keyguard, not the app — the
+input counters read 0 for those steps. Re-run
+`scripts/mt-inject` + freeze once the tablet is unlocked; never send
+`KEYCODE_SLEEP` to it from a script.
+
 ### The remaining limit at 120 Hz is KWin's recording, not the pipeline
 
 At 120 Hz the source swaps at 120.0 fps, the helper dropped 7 of ~2400

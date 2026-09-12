@@ -30,6 +30,14 @@ private was captured.
   fps appears with capture → discard and no pipeline at all). The earlier
   GStreamer-only path was bistable (either ~59 or a stable 30 fps); the
   mechanism and the fix are in [docs/performance.md](docs/performance.md).
+- **30-minute soak at the usable mode** (`--profile balanced`, taps every
+  15 s): 58.2 unique fps mean and median (worst 5 s window 56.4, during an
+  APK build on the same laptop), capture→ack p95 27 ms (worst window 33),
+  render p95 20 ms (worst 24), 0 stalls, 2868 input messages, 0 rejected.
+  With the bitrate doubled to 60 Mbit/s the tablet receives 59 Mbit/s and
+  capture→ack p95 drops to 22 ms: the ADB transport has ≥ 2× headroom.
+  Background/foreground, host restart under a live app, and a frozen app
+  under load all recover on their own.
 - For comparison on the same run type: `system` (CPU readback → NVENC)
   reached 30–36 fps and stalled the compositor itself to ~80 fps;
   `gl` (cross-GPU DMA-BUF import → NVENC) 13 fps. The encoder was never the
