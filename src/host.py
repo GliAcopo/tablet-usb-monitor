@@ -883,15 +883,28 @@ class Host:
                 with contextlib.suppress(Exception):
                     adb('reverse', '--remove', f'tcp:{port}')
 
+# Presets for `--profile`; explicit --fps/--bitrate still win.  All of them
+# stay on the zero-copy VA path; they only change how much the compositor and
+# encoder have to do per second when the tablet's content is moving.
+PROFILES = {
+    'smooth': {'fps': 120, 'bitrate': 60000},    # full panel rate
+    'balanced': {'fps': 60, 'bitrate': 30000},   # half the GPU/USB work
+    'light': {'fps': 30, 'bitrate': 15000},      # static-content use
+}
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+    parser.add_argument('--profile', choices=sorted(PROFILES), default='smooth')
     parser.add_argument('--width', type=int, default=2960)
     parser.add_argument('--height', type=int, default=1848)
-    parser.add_argument('--fps', type=int, choices=[30, 60, 90, 120], default=120)
-    parser.add_argument('--bitrate', type=int, default=60000)
+    parser.add_argument('--fps', type=int, choices=[30, 60, 90, 120])
+    parser.add_argument('--bitrate', type=int)
     parser.add_argument('--scale', type=float, default=1.5)
     parser.add_argument('--capture-memory', choices=['va', 'system', 'gl'], default='va')
     args = parser.parse_args()
+    for key, value in PROFILES[args.profile].items():
+        if getattr(args, key) is None:
+            setattr(args, key, value)
     if args.capture_memory == 'gl':
         os.environ['__NV_PRIME_RENDER_OFFLOAD'] = '1'
         os.environ['GST_GL_PLATFORM'] = 'egl'

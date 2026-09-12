@@ -1,0 +1,13 @@
+{
+    "KPackageStructure": "KWin/Script",
+    "KPlugin": {
+        "Id": "tabs9-pin",
+        "Name": "Tab S9 display: keep windows across virtual desktops",
+        "Description": "Windows on the USB tablet output stay visible on every virtual desktop, so switching desktops on the laptop leaves the tablet untouched.",
+        "Version": "1.0",
+        "License": "MIT",
+        "Authors": [{"Name": "Use-Tab-S9-Ultra-as-a-screen"}]
+    },
+    "X-Plasma-API": "javascript",
+    "X-Plasma-MainScript": "code/main.js"
+}

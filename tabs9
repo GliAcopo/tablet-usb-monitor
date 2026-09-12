@@ -155,12 +155,31 @@ case "${1:-help}" in
     fi
     ;;
   logs) journalctl --user -u "$unit" --no-pager -n 30 -o cat ;;
+  pin-desktop)
+    # Keep windows on the tablet output visible on every virtual desktop.
+    case "${2:-}" in
+      on)
+        kpackagetool6 --type KWin/Script --install "$PWD/kwin/tabs9-pin" >/dev/null 2>&1 \
+          || kpackagetool6 --type KWin/Script --upgrade "$PWD/kwin/tabs9-pin" >/dev/null
+        kwriteconfig6 --file kwinrc --group Plugins --key tabs9-pinEnabled true
+        gdbus call --session --dest org.kde.KWin --object-path /KWin --method org.kde.KWin.reconfigure >/dev/null
+        echo 'Windows on the tablet now stay put when you switch virtual desktops.'
+        ;;
+      off)
+        kwriteconfig6 --file kwinrc --group Plugins --key tabs9-pinEnabled false
+        gdbus call --session --dest org.kde.KWin --object-path /KWin --method org.kde.KWin.reconfigure >/dev/null
+        echo 'Tablet windows follow virtual desktops again.'
+        ;;
+      *) echo 'Usage: ./tabs9 pin-desktop on|off'; exit 1 ;;
+    esac
+    ;;
   test-motion) shift; exec python3 scripts/motion-test.py "$@" ;;
   bench-capture) shift; exec python3 scripts/capture_ab.py "$@" ;;
   *)
-    echo 'Usage: ./tabs9 {setup|doctor|start [options]|stop|status|logs}'
+    echo 'Usage: ./tabs9 {setup|doctor|start [options]|stop|status|logs|pin-desktop on|off}'
     echo '              {test-motion [--seconds N]|bench-capture [--seconds N]}'
-    echo '  start options: --fps 30|60|90|120  --bitrate 40000  --scale 1.5'
+    echo '  start options: --profile smooth|balanced|light (120/60/30 fps)'
+    echo '                 --fps 30|60|90|120  --bitrate 40000  --scale 1.5'
     echo '                 --width 2960 --height 1848  --capture-memory va|system|gl'
     echo '  bench-capture compares both capture paths under continuous motion;'
     echo '  it needs the two KDE sharing dialogs answered once per path.'

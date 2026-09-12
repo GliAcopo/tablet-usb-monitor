@@ -170,8 +170,11 @@ removes the virtual output, and removes the two ADB reverse mappings it created.
 The laptop panel remains enabled. Windows on the removed output are managed by
 KDE's normal display-disconnection behavior.
 
-For a lighter profile, start with `--fps 60 --bitrate 30000`. Bitrate is in
-kbit/s. Lowering bitrate primarily reduces USB traffic; lowering the frame rate
+`--profile smooth|balanced|light` picks 120/60/30 fps with matching bitrate;
+explicit `--fps`/`--bitrate` override it. All profiles use the same zero-copy
+GPU path — the tablet costs the host 0–1 % CPU while its content is static
+and ~30 % of one core at 110 fps of continuous motion, so the profile only
+matters when things move on it. Bitrate is in kbit/s. Lowering bitrate primarily reduces USB traffic; lowering the frame rate
 reduces rendering and encoding work. The application reports the host's applied
 settings and measured delivery separately.
 
@@ -187,6 +190,23 @@ settings and measured delivery separately.
   native size because KWin's synchronous readback is the ceiling.
 - `gl`: DMA-BUF imported by NVIDIA EGL → `nvh265enc`. Negotiates and encodes,
   but the cross-GPU import stalls (~13 fps); kept for diagnosis only.
+
+## Virtual desktops and the tablet
+
+KWin's virtual desktops are global to the workspace: there is no per-output
+current desktop, so "switch desktops on the laptop only" cannot be done
+natively or by script. What can be done is to keep the tablet out of it:
+
+```sh
+./tabs9 pin-desktop on    # tablet windows stay visible on every desktop
+./tabs9 pin-desktop off
+```
+
+This installs and enables the KWin script in `kwin/tabs9-pin`: any window
+that lands on the `Virtual-*` output is set to *all desktops*, and released
+again when it moves back to a physical screen (including when the output is
+removed at `./tabs9 stop`). Verified live: with the script on, a window on the
+tablet survived a desktop switch; with it off, the tablet went blank.
 
 ## Verification and privacy
 
