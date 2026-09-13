@@ -8,6 +8,7 @@ import kotlin.math.cos
 import kotlin.math.sin
 import kotlinx.coroutines.*
 import okhttp3.*
+import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
@@ -24,6 +25,8 @@ class TouchCapture {
         const val TAG = "UScreenTouch"
         /** Control-channel contract this client implements (see host.py PROTOCOL). */
         const val PROTOCOL = 2
+        /** Optional capabilities this client implements; the host enables each only when named here. */
+        val FEATURES = listOf("video_heartbeat")
         const val WS_URL = "ws://127.0.0.1:8891"
         private const val TOOL_TYPE_PALM = 6
         const val RECONNECT_DELAY_MS = 2000L
@@ -42,6 +45,19 @@ class TouchCapture {
     var onStreamConfigKnown: ((HostStreamConfig) -> Unit)? = null
     /** Host protocol version from its greeting (1 when it sends none). */
     var onProtocolKnown: ((Int) -> Unit)? = null
+    /** Feature names the host listed in its greeting (empty for a legacy host). */
+    var onHostFeaturesKnown: ((Set<String>) -> Unit)? = null
+
+    /**
+     * While the picture is known to be unavailable (video recovering) no new
+     * gesture is forwarded: the user cannot see what they would be touching.
+     * Contacts that were down when it started are lifted so nothing stays
+     * pressed on the desktop.
+     */
+    @Volatile private var inputSuspended = false
+    private val activeTouches = HashMap<Int, Pair<Float, Float>>()
+    private var penContact: Pair<Double, Double>? = null
+    private val contactLock = Object()
 
     @Volatile var hostStreamConfig = HostStreamConfig()
         private set
@@ -118,6 +134,14 @@ class TouchCapture {
             // ignored, this channel is otherwise ours to talk on.
             try {
                 val o = JSONObject(text)
+                if (o.has("features")) {
+                    val list = o.optJSONArray("features")
+                    val names = HashSet<String>()
+                    if (list != null) for (i in 0 until list.length()) list.optString(i, null)?.let { names.add(it) }
+                    onHostFeaturesKnown?.invoke(names)
+                } else if (o.has("status")) {
+                    onHostFeaturesKnown?.invoke(emptySet())
+                }
                 if (o.has("protocol")) {
                     val hostProtocol = o.optInt("protocol", 1)
                     if (hostProtocol != PROTOCOL) {
@@ -265,6 +289,7 @@ class TouchCapture {
 
     fun handleMotionEvent(event: MotionEvent, width: Int, height: Int): Boolean {
         if (!isConnected) return false
+        if (inputSuspended) return true
 
         val vw = width.coerceAtLeast(1).toFloat()
         val vh = height.coerceAtLeast(1).toFloat()
@@ -463,6 +488,12 @@ class TouchCapture {
             put("eraser", eraser)
             put("action", action)
         }
+        synchronized(contactLock) {
+            when (action) {
+                0, 2 -> penContact = Pair(x, y)
+                1 -> penContact = null
+            }
+        }
         webSocket?.send(msg.toString())
     }
 
@@ -505,7 +536,33 @@ class TouchCapture {
             put("action", action)
             put("slot", slot)
         }
+        synchronized(contactLock) {
+            if (action == 1) activeTouches.remove(slot) else activeTouches[slot] = Pair(x, y)
+        }
         webSocket?.send(msg.toString())
+    }
+
+    /**
+     * Stop (or resume) forwarding gestures. Suspending lifts every contact
+     * currently down, at its last known position, so the desktop sees a
+     * clean release rather than a finger held until the socket drops.
+     */
+    fun setInputSuspended(suspended: Boolean) {
+        if (inputSuspended == suspended) return
+        inputSuspended = suspended
+        if (!suspended) return
+        val touches: List<Pair<Int, Pair<Float, Float>>>
+        val pen: Pair<Double, Double>?
+        synchronized(contactLock) {
+            touches = activeTouches.entries.map { Pair(it.key, it.value) }
+            pen = penContact
+        }
+        for ((slot, at) in touches) sendTouch(at.first, at.second, 0.0, 1, slot)
+        pen?.let { emitPen(it.first, it.second, 0.0, 0.0, 0.0, false, 1) }
+        if (touches.isNotEmpty() || pen != null) {
+            Log.i(TAG, "Input suspended: lifted ${touches.size} touch contact(s)" +
+                if (pen != null) " and the pen" else "")
+        }
     }
 
     /**
@@ -517,6 +574,7 @@ class TouchCapture {
         val msg = JSONObject().apply {
             put("type", "config")
             put("protocol", PROTOCOL)
+            put("features", JSONArray(FEATURES))
             put("bitrate", bitrateKbps)
             put("fps", fps)
         }

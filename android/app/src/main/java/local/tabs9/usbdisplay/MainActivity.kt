@@ -35,6 +35,11 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
+    companion object {
+        /** Set while the activity is alive; the debug DrillReceiver calls it with the drill action. */
+        @Volatile var drillHook: ((String) -> Unit)? = null
+    }
+
     /// Mirrors the host's mode so the UI can say what is going on.
     private var penOnlyMode by mutableStateOf(false)
     private var hostStreamConfig by mutableStateOf(HostStreamConfig())
@@ -42,6 +47,7 @@ class MainActivity : ComponentActivity() {
     private var showThanks by mutableStateOf(false)
     /** Host protocol version from its greeting; 0 until known. */
     private var hostProtocol by mutableStateOf(0)
+    private var videoState by mutableStateOf(VideoReceiver.VideoState.DISCONNECTED)
     private var videoReceiver: VideoReceiver? = null
     private var touchCapture: TouchCapture? = null
     private lateinit var prefs: Prefs
@@ -70,7 +76,24 @@ class MainActivity : ComponentActivity() {
             }
         }
         videoReceiver?.onKeyframeNeeded = { touchCapture?.sendKeyframeRequest() }
+        drillHook = { action ->
+            when (action) {
+                "local.tabs9.usbdisplay.DRILL_DROP_VIDEO" -> videoReceiver?.debugDropSocket()
+                "local.tabs9.usbdisplay.DRILL_RESET_DECODER" -> videoReceiver?.debugResetDecoder()
+            }
+        }
         touchCapture?.onProtocolKnown = { version -> runOnUiThread { hostProtocol = version } }
+        touchCapture?.onHostFeaturesKnown = { features ->
+            videoReceiver?.hostHeartbeats = "video_heartbeat" in features
+        }
+        // The picture drives the input: while video is being rebuilt the user
+        // cannot see what a tap would land on, so gestures pause and any held
+        // contact is lifted; they resume with the first rendered frame.
+        videoReceiver?.onStateChanged = { state ->
+            touchCapture?.setInputSuspended(
+                state == VideoReceiver.VideoState.RECOVERING || state == VideoReceiver.VideoState.DISCONNECTED)
+            runOnUiThread { videoState = state }
+        }
         videoReceiver?.onStatsUpdated = { decoderFps, receivedMbps ->
             runOnUiThread {
                 actualPanelHz = currentPanelRefreshRate()
@@ -123,6 +146,7 @@ class MainActivity : ComponentActivity() {
                     showThanks = showThanks,
                     onDismissThanks = { showThanks = false },
                     hostProtocol = hostProtocol,
+                    videoState = videoState,
                     videoReceiver = videoReceiver,
                     touchCapture = touchCapture,
                     prefs = prefs,
@@ -321,6 +345,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        drillHook = null
         super.onDestroy()
         stopService(Intent(this, StreamingService::class.java))
     }
@@ -356,27 +381,20 @@ fun UScreenMain(
     showThanks: Boolean = false,
     onDismissThanks: () -> Unit = {},
     hostProtocol: Int = 0,
+    videoState: VideoReceiver.VideoState = VideoReceiver.VideoState.DISCONNECTED,
     onSurfaceDestroyed: () -> Unit = {},
     videoReceiver: VideoReceiver? = null,
     touchCapture: TouchCapture? = null,
     prefs: Prefs? = null,
 ) {
-    var isConnected by remember { mutableStateOf(false) }
+    val isConnected = videoState == VideoReceiver.VideoState.STREAMING
+    val recovering = videoState == VideoReceiver.VideoState.RECOVERING
     var fps by remember { mutableStateOf(0f) }
     var mbps by remember { mutableStateOf(0f) }
     var showSettings by remember { mutableStateOf(false) }
     var showStats by remember { mutableStateOf(prefs?.showStats ?: false) }
 
     val context = LocalContext.current
-
-    LaunchedEffect(videoReceiver) {
-        videoReceiver?.onConnected = {
-            (context as? ComponentActivity)?.runOnUiThread { isConnected = true }
-        }
-        videoReceiver?.onDisconnected = {
-            (context as? ComponentActivity)?.runOnUiThread { isConnected = false }
-        }
-    }
 
     LaunchedEffect(isConnected, showStats) {
         while (isConnected) {
@@ -428,14 +446,45 @@ fun UScreenMain(
             PenOnlyScreen()
         }
 
-        // Connection screen
+        // Startup screen: nothing of this session has been shown yet, or
+        // recovery gave up. A short video interruption after a picture was
+        // shown keeps that picture and only says so (below).
         AnimatedVisibility(
-            visible = !isConnected && !penOnly,
+            visible = !isConnected && !recovering && !penOnly,
             enter = fadeIn(),
             exit = fadeOut(),
             modifier = Modifier.fillMaxSize()
         ) {
             ConnectionScreen()
+        }
+
+        AnimatedVisibility(
+            visible = recovering && !penOnly,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier.align(Alignment.TopCenter).padding(top = 12.dp)
+        ) {
+            Surface(
+                color = Color(0xCC20202C),
+                shape = RoundedCornerShape(8.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                ) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(14.dp),
+                        strokeWidth = 2.dp,
+                        color = Color(0xFFB0B0C0)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = "Reconnecting video…",
+                        fontSize = 12.sp,
+                        color = Color(0xFFB0B0C0)
+                    )
+                }
+            }
         }
 
         // Stats chip (top-left, only while streaming)

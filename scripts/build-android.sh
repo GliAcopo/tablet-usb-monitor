@@ -64,7 +64,14 @@ sdkmanager --sdk_root="$SDK_ROOT" \
     "build-tools;34.0.0"
 
 cd "$PROJECT_ROOT/android"
-./gradlew --no-daemon --console=plain clean :app:assembleDebug
+# JVM unit tests (packet framing etc.) run before the APK is assembled;
+# TABS9_SKIP_ANDROID_TESTS=1 skips them.
+gradle_tasks=(clean)
+if [[ -z "${TABS9_SKIP_ANDROID_TESTS:-}" ]]; then
+    gradle_tasks+=(:app:testDebugUnitTest)
+fi
+gradle_tasks+=(:app:assembleDebug)
+./gradlew --no-daemon --console=plain "${gradle_tasks[@]}"
 
 mkdir -p "$PROJECT_ROOT/.local/artifacts"
 built_apk="$PROJECT_ROOT/android/app/build/outputs/apk/debug/app-debug.apk"

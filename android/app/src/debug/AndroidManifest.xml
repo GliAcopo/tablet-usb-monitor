@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Debug builds only (merged from the debug source set): a broadcast
+     receiver that triggers the same recovery paths as a real fault, so the
+     drills in docs can be driven from adb. Not present in release builds. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <receiver
+            android:name=".DrillReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="local.tabs9.usbdisplay.DRILL_DROP_VIDEO" />
+                <action android:name="local.tabs9.usbdisplay.DRILL_RESET_DECODER" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

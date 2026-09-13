@@ -83,4 +83,6 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.2")
+    // JVM unit tests for the pure-Kotlin parts (packet framing); no device needed.
+    testImplementation("junit:junit:4.13.2")
 }

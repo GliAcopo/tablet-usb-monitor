@@ -44,10 +44,17 @@ def load_gl() -> ctypes.CDLL:
 
 
 class GpuPattern(QOpenGLWindow):
-    def __init__(self, screen, seconds: float, gl: ctypes.CDLL) -> None:
+    def __init__(self, screen, seconds: float, gl: ctypes.CDLL,
+                 motion: float = 0.0, static: float = 0.0) -> None:
         super().__init__(QOpenGLWindow.UpdateBehavior.NoPartialUpdate)
         self.gl = gl
         self.seconds = seconds
+        # Optional duty cycle: `motion` seconds of animation, then `static`
+        # seconds without a single repaint (the compositor then sends no
+        # frame at all, exactly like an idle desktop).
+        self.motion = motion
+        self.static = static
+        self.static_phases = 0
         self.started = time.monotonic()
         self.last_report = self.started
         self.last_paints = 0
@@ -115,8 +122,19 @@ class GpuPattern(QOpenGLWindow):
 
     def on_frame_swapped(self) -> None:
         self.swaps += 1
-        if time.monotonic() - self.started < self.seconds:
-            self.update()
+        elapsed = time.monotonic() - self.started
+        if elapsed >= self.seconds:
+            return
+        if self.motion > 0 and self.static > 0:
+            phase = elapsed % (self.motion + self.static)
+            if phase >= self.motion:
+                self.static_phases += 1
+                resume = self.motion + self.static - phase
+                print(json.dumps({"event": "static", "seconds": round(self.static, 1),
+                                  "elapsed": round(elapsed, 1)}), flush=True)
+                QTimer.singleShot(round(resume * 1000), self.update)
+                return
+        self.update()
 
     def zone(self, point) -> str:
         # Coarse 3x3 zone name only (no positions are stored).
@@ -190,7 +208,13 @@ class GpuPattern(QOpenGLWindow):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--seconds", type=float, default=20.0)
+    parser.add_argument("--motion", type=float, default=0.0,
+                        help="with --static: seconds of motion per cycle")
+    parser.add_argument("--static", type=float, default=0.0,
+                        help="with --motion: seconds per cycle with no repaint at all")
     args = parser.parse_args()
+    if (args.motion > 0) != (args.static > 0):
+        parser.error("--motion and --static go together")
     if not (0.5 <= args.seconds <= 3600.0):
         parser.error("--seconds must be between 0.5 and 3600")
     return args
@@ -211,7 +235,7 @@ def main() -> None:
     if len(screens) != 1:
         raise SystemExit("Expected exactly one existing virtual screen; refusing ambiguous placement")
 
-    window = GpuPattern(screens[0], args.seconds, load_gl())
+    window = GpuPattern(screens[0], args.seconds, load_gl(), args.motion, args.static)
     app.aboutToQuit.connect(window.final_report)
     window.showFullScreen()
     window.update()

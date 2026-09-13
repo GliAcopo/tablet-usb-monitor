@@ -10,7 +10,6 @@ import android.util.Log
 import android.view.Surface
 import android.view.SurfaceView
 import kotlinx.coroutines.*
-import java.io.InputStream
 import java.net.Socket
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -25,11 +24,19 @@ class VideoReceiver {
         const val MIME_TYPE_HEVC = "video/hevc"
         const val TAG = "UScreenVideo"
         const val MAX_FRAME_SIZE = 8 * 1024 * 1024
-        const val PACKET_TYPE_CONFIG = 0
-        const val PACKET_TYPE_FRAME = 1
+        const val FRAME_HEADER_SIZE = StreamFramer.FRAME_HEADER_SIZE
 
-        /** type byte + 4-byte big-endian sequence number */
-        const val FRAME_HEADER_SIZE = 5
+        /**
+         * Transport deadline. Refreshed by every complete packet, heartbeats
+         * included; with a heartbeat-capable host its expiry is a real fault.
+         */
+        const val READ_TIMEOUT_MS = 10_000
+        /** RECOVERING turns into DISCONNECTED (full startup screen) after this long. */
+        const val RECOVERY_GRACE_NANOS = 15_000_000_000L
+        /** Frames submitted with no output before the decoder is suspected. */
+        const val WATCHDOG_MIN_FRAMES = 8
+        const val WATCHDOG_STALL_NANOS = 3_000_000_000L
+        const val KEYFRAME_REQUEST_MIN_INTERVAL_NANOS = 500_000_000L
 
         /**
          * Acknowledge every Nth rendered frame.
@@ -47,15 +54,53 @@ class VideoReceiver {
         const val ARRIVAL_RING = 64
     }
 
-    private var socket: Socket? = null
-    private var inputStream: InputStream? = null
+    /**
+     * What the picture on screen means right now.
+     *  WAITING      no frame of this session has been shown yet (startup screen)
+     *  STREAMING    frames of the current connection are being rendered
+     *  RECOVERING   the video socket dropped after frames were shown; the last
+     *               picture stays up while the connection is rebuilt
+     *  DISCONNECTED recovery has not succeeded for a while, or stop() was called
+     */
+    enum class VideoState { WAITING, STREAMING, RECOVERING, DISCONNECTED }
+
+    /** The socket, reader and codec callbacks of one connection attempt. */
+    private class Connection(val generation: Int, val socket: Socket)
+
+    @Volatile private var current: Connection? = null
+    private val connectionCounter = AtomicInteger(0)
     private var mediaCodec: MediaCodec? = null
     @Volatile private var isRunning = false
     @Volatile private var codecAlive = false
 
-    var onConnected: (() -> Unit)? = null
-    var onDisconnected: (() -> Unit)? = null
+    @Volatile var state = VideoState.DISCONNECTED; private set
+    var onStateChanged: ((VideoState) -> Unit)? = null
     var onStatsUpdated: ((decoderFps: Float, receivedMbps: Float) -> Unit)? = null
+
+    /**
+     * Whether the host sends heartbeat packets while the desktop is idle
+     * (negotiated on the control channel from its greeting). With them, a
+     * silent socket is a dead socket; without them silence only means
+     * nothing changed, and the last picture must stay.
+     */
+    @Volatile var hostHeartbeats = false
+
+    /** Sequence of the last frame received / submitted / rendered, for diagnostics. */
+    @Volatile private var lastReceivedSeq = -1
+    @Volatile private var lastRenderedSeq = -1
+    @Volatile private var renderedInConnection = false
+    @Volatile private var recoveringSinceNanos = 0L
+    @Volatile private var lastKeyframeRequestNanos = 0L
+    private var failedAttempts = 0
+
+    /**
+     * Decoder watchdog input: frames handed to the codec since the last
+     * rendered output, and when that run started. An idle desktop submits
+     * nothing, so it never trips the watchdog.
+     */
+    private val submittedSinceRender = AtomicInteger(0)
+    @Volatile private var unrenderedSinceNanos = 0L
+    @Volatile private var watchdogStage = 0
 
     /**
      * Invoked with the host's frame sequence number once that frame is
@@ -361,7 +406,7 @@ class VideoReceiver {
 
                 override fun onError(c: MediaCodec, e: MediaCodec.CodecException) {
                     Log.e(TAG, "Decoder error: ${e.diagnosticInfo}", e)
-                    if (generation == codecGeneration) handler.post { resetCodec() }
+                    if (generation == codecGeneration) handler.post { recoverDecoder("codec error") }
                 }
 
                 override fun onOutputFormatChanged(c: MediaCodec, f: MediaFormat) {
@@ -382,8 +427,18 @@ class VideoReceiver {
             val cbThread = HandlerThread("uscreen-frame-cb").apply { start() }
             frameCallbackThread = cbThread
             codec.setOnFrameRenderedListener({ _, presentationTimeUs, nanoTime ->
+                submittedSinceRender.set(0)
+                watchdogStage = 0
+                val seq = seqForPts(presentationTimeUs)
+                if (seq >= 0) lastRenderedSeq = seq
+                if (!renderedInConnection) {
+                    // "Streaming" means a frame of this connection is on screen,
+                    // not that bytes arrived.
+                    renderedInConnection = true
+                    failedAttempts = 0
+                    setState(VideoState.STREAMING)
+                }
                 if (renderedCount.incrementAndGet() % ACK_EVERY == 0L) {
-                    val seq = seqForPts(presentationTimeUs)
                     if (seq >= 0) onFrameRendered?.invoke(seq, decodeMicrosFor(seq), nanoTime)
                 }
             }, Handler(cbThread.looper))
@@ -427,7 +482,7 @@ class VideoReceiver {
                         lastDropLogNanos = unit.arrivalNanos
                         Log.w(TAG, "Compressed backlog over budget; resuming at the next keyframe (total $droppedForAge)")
                     }
-                    onKeyframeNeeded?.invoke()
+                    requestKeyframe("compressed backlog discarded")
                 }
                 if (waitingForKeyframe && !unit.keyframe) {
                     return
@@ -455,7 +510,10 @@ class VideoReceiver {
                 buffer.put(unit.data, 0, unit.size)
                 val flags = if (unit.isConfig) MediaCodec.BUFFER_FLAG_CODEC_CONFIG else 0
                 val pts = unit.arrivalNanos / 1000L
-                if (!unit.isConfig) rememberPts(pts, unit.seq)
+                if (!unit.isConfig) {
+                    rememberPts(pts, unit.seq)
+                    if (submittedSinceRender.getAndIncrement() == 0) unrenderedSinceNanos = System.nanoTime()
+                }
                 codec.queueInputBuffer(index, 0, unit.size, pts, flags)
             } catch (e: IllegalStateException) {
                 Log.w(TAG, "Submit: codec gone", e)
@@ -474,8 +532,16 @@ class VideoReceiver {
             job = newJob
             scope = newScope
 
+            setState(VideoState.WAITING)
             newScope.launch {
                 connectAndReceive()
+            }
+
+            newScope.launch {
+                while (isRunning) {
+                    delay(1000)
+                    watchdogTick()
+                }
             }
 
             newScope.launch {
@@ -497,6 +563,8 @@ class VideoReceiver {
 
     private suspend fun connectAndReceive() {
         while (isRunning) {
+            var connection: Connection? = null
+            var reason = "stopped"
             try {
                 // Wait for surface to be ready before connecting
                 while (isRunning && !surfaceReady.get()) {
@@ -524,10 +592,11 @@ class VideoReceiver {
                     continue
                 }
 
-                Log.i(TAG, "Connecting to $HOST:$PORT...")
-                socket = Socket(HOST, PORT).apply {
+                val generation = connectionCounter.incrementAndGet()
+                Log.i(TAG, "Video connection $generation: connecting to $HOST:$PORT...")
+                val socket = Socket(HOST, PORT).apply {
                     tcpNoDelay = true
-                    soTimeout = 10000 // 10s read timeout
+                    soTimeout = READ_TIMEOUT_MS
                     // Small on purpose. A 1 MB receive buffer let the host run
                     // ahead and park whole frames here, where they are pure
                     // delay that neither side can see or skip past. Keeping it
@@ -535,105 +604,160 @@ class VideoReceiver {
                     // know how to drop stale frames.
                     receiveBufferSize = 128 * 1024
                 }
-                inputStream = socket?.getInputStream()
+                connection = Connection(generation, socket)
+                if (!isRunning) { socket.close(); return }
+                current = connection
                 token?.let { t ->
-                    socket?.getOutputStream()?.apply {
+                    socket.getOutputStream().apply {
                         write(t.toByteArray(Charsets.US_ASCII))
                         flush()
                     }
                 }
-                Log.i(TAG, "Connected to video stream")
+                // Every connection starts at an IDR: whatever the decoder held
+                // belongs to a stream it will never see the rest of.
+                synchronized(queueLock) { inputQueue.removeAll { !it.isConfig }; waitingForKeyframe = true }
+                renderedInConnection = false
+                requestKeyframe("connection $generation")
+                Log.i(TAG, "Video connection $generation: connected, waiting for a keyframe " +
+                    "(host heartbeats: $hostHeartbeats)")
 
-                val sizeHeader = ByteArray(4)
-                // Reused across frames to avoid 60 allocations/s of multi-MB arrays
-                var packetBuf = ByteArray(512 * 1024)
-                var firstFrame = true
+                val framer = StreamFramer(socket.getInputStream(), MAX_FRAME_SIZE)
+                var idleLogged = false
+                val connectedNanos = System.nanoTime()
 
-                receiveLoop@ while (isRunning) {
+                receiveLoop@ while (isRunning && current === connection) {
                     val codec = mediaCodec ?: break
-
-                    readExact(inputStream!!, sizeHeader, 4)
-
-                    val frameSize = ((sizeHeader[0].toInt() and 0xFF) shl 24) or
-                            ((sizeHeader[1].toInt() and 0xFF) shl 16) or
-                            ((sizeHeader[2].toInt() and 0xFF) shl 8) or
-                            (sizeHeader[3].toInt() and 0xFF)
-
-                    if (frameSize <= 1 || frameSize > MAX_FRAME_SIZE + 1) {
-                        Log.w(TAG, "Invalid packet size: $frameSize, reconnecting")
-                        break // Reconnect
-                    }
-
-                    if (packetBuf.size < frameSize) {
-                        packetBuf = ByteArray(frameSize + frameSize / 2)
-                    }
-                    readExact(inputStream!!, packetBuf, frameSize)
-                    byteCounter.addAndGet(frameSize.toLong())
-
-                    val packetType = packetBuf[0].toInt() and 0xFF
-                    when (packetType) {
-                        PACKET_TYPE_CONFIG -> {
-                            val payloadSize = frameSize - 1
-                            Log.i(TAG, "Received codec config: ${payloadSize}B")
-                            enqueueAccessUnit(codec, AccessUnit(packetBuf.copyOfRange(1, 1 + payloadSize),
-                                payloadSize, true, true, -1, System.nanoTime()))
-                        }
-                        PACKET_TYPE_FRAME -> {
-                            if (frameSize <= FRAME_HEADER_SIZE) {
-                                Log.w(TAG, "Truncated frame packet: $frameSize, reconnecting")
-                                break@receiveLoop
-                            }
-                            // 4-byte big-endian sequence number after the type
-                            // byte, carried through the decoder as the
-                            // presentation timestamp and echoed to the host.
-                            val seq = ((packetBuf[1].toInt() and 0xFF) shl 24) or
-                                    ((packetBuf[2].toInt() and 0xFF) shl 16) or
-                                    ((packetBuf[3].toInt() and 0xFF) shl 8) or
-                                    (packetBuf[4].toInt() and 0xFF)
-                            if (firstFrame) {
-                                firstFrame = false
-                                onConnected?.invoke()
-                            }
-                            noteArrival(seq)
-                            val size = frameSize - FRAME_HEADER_SIZE
-                            enqueueAccessUnit(codec, AccessUnit(
-                                packetBuf.copyOfRange(FRAME_HEADER_SIZE, FRAME_HEADER_SIZE + size),
-                                size, false, isKeyframe(packetBuf, FRAME_HEADER_SIZE, size),
-                                seq, System.nanoTime()))
-                        }
-                        else -> {
-                            Log.w(TAG, "Unknown packet type: $packetType, reconnecting")
+                    val packet = try {
+                        framer.next()
+                    } catch (e: java.net.SocketTimeoutException) {
+                        if (hostHeartbeats) {
+                            reason = "no packet for ${READ_TIMEOUT_MS / 1000} s (host heartbeats expected)"
                             break@receiveLoop
                         }
+                        // Legacy host: silence is an idle desktop, not a fault. A dead
+                        // peer on this loopback link shows up as EOF or a reset.
+                        if (!idleLogged) {
+                            idleLogged = true
+                            Log.i(TAG, "Video connection $generation: idle for ${READ_TIMEOUT_MS / 1000} s, " +
+                                "host sends no heartbeat; keeping the connection")
+                        }
+                        continue@receiveLoop
+                    }
+                    byteCounter.addAndGet(packet.size.toLong())
+
+                    when (packet.type) {
+                        StreamFramer.TYPE_HEARTBEAT -> {
+                            // Liveness only: not a frame, not decoded, not counted.
+                        }
+                        StreamFramer.TYPE_CONFIG -> {
+                            val payloadSize = packet.size - 1
+                            Log.i(TAG, "Received codec config: ${payloadSize}B")
+                            enqueueAccessUnit(codec, AccessUnit(packet.buffer.copyOfRange(1, 1 + payloadSize),
+                                payloadSize, true, true, -1, System.nanoTime()))
+                        }
+                        StreamFramer.TYPE_FRAME -> {
+                            val seq = packet.seq()
+                            lastReceivedSeq = seq
+                            noteArrival(seq)
+                            val size = packet.size - FRAME_HEADER_SIZE
+                            enqueueAccessUnit(codec, AccessUnit(
+                                packet.buffer.copyOfRange(FRAME_HEADER_SIZE, FRAME_HEADER_SIZE + size),
+                                size, false, isKeyframe(packet.buffer, FRAME_HEADER_SIZE, size),
+                                seq, System.nanoTime()))
+                        }
                     }
                 }
+                if (current !== connection) reason = "superseded"
+                Log.i(TAG, "Video connection $generation: ended after " +
+                    "${(System.nanoTime() - connectedNanos) / 1_000_000_000} s, " +
+                    "${framer.packets} packets, last seq received $lastReceivedSeq rendered $lastRenderedSeq")
             } catch (e: java.io.EOFException) {
-                if (isRunning) {
-                    Log.i(TAG, "Stream ended (server closed)")
-                    onDisconnected?.invoke()
-                    delay(1000)
-                }
-            } catch (e: java.net.SocketTimeoutException) {
-                if (isRunning) {
-                    Log.w(TAG, "Stream read timeout, reconnecting")
-                    onDisconnected?.invoke()
-                    delay(500)
-                }
+                reason = "host closed the stream"
+            } catch (e: FramingException) {
+                reason = "framing: ${e.message}"
             } catch (e: Exception) {
-                if (isRunning) {
-                    Log.e(TAG, "Stream error: ${e.message}")
-                    onDisconnected?.invoke()
-                    delay(1000)
-                }
+                reason = if (isRunning && current === connection) "error: ${e.javaClass.simpleName}: ${e.message}"
+                         else "closed by stop()"
             } finally {
-                try {
-                    socket?.close()
-                } catch (_: Exception) {}
-                socket = null
-                inputStream = null
+                try { connection?.socket?.close() } catch (_: Exception) {}
+                if (current === connection) current = null
             }
+            if (!isRunning) return
+            onConnectionLost(reason)
+            delay(reconnectDelayMs())
         }
     }
+
+    /** Called on the network coroutine when a connection ends for any reason. */
+    private fun onConnectionLost(reason: String) {
+        val cameFromStreaming = state == VideoState.STREAMING
+        Log.w(TAG, "Video connection lost: $reason")
+        if (cameFromStreaming) {
+            recoveringSinceNanos = System.nanoTime()
+            setState(VideoState.RECOVERING)
+        } else if (state == VideoState.RECOVERING &&
+                   System.nanoTime() - recoveringSinceNanos > RECOVERY_GRACE_NANOS) {
+            setState(VideoState.DISCONNECTED)
+        }
+        failedAttempts++
+    }
+
+    /** 500 ms, 1 s, 2 s, 4 s, then 4 s: quick first retry, no reconnect storm. */
+    private fun reconnectDelayMs(): Long = (500L shl (failedAttempts - 1).coerceIn(0, 3))
+
+    private fun setState(next: VideoState) {
+        val previous = state
+        if (previous == next) return
+        state = next
+        Log.i(TAG, "Video state: $previous -> $next (connection ${connectionCounter.get()})")
+        onStateChanged?.invoke(next)
+    }
+
+    /** One IDR request per half second at most, whatever the trigger. */
+    private fun requestKeyframe(why: String) {
+        val now = System.nanoTime()
+        if (now - lastKeyframeRequestNanos < KEYFRAME_REQUEST_MIN_INTERVAL_NANOS) return
+        lastKeyframeRequestNanos = now
+        Log.i(TAG, "Requesting a keyframe: $why")
+        onKeyframeNeeded?.invoke()
+    }
+
+    /**
+     * Frames keep going into the decoder but nothing comes out: first ask for
+     * an IDR (a lost reference is the common case), then rebuild the decoder
+     * once, then rebuild the connection. Never fires on an idle desktop, where
+     * nothing is submitted.
+     */
+    private fun watchdogTick() {
+        val pending = submittedSinceRender.get()
+        if (pending < WATCHDOG_MIN_FRAMES) return
+        val stalledFor = System.nanoTime() - unrenderedSinceNanos
+        if (stalledFor < WATCHDOG_STALL_NANOS * (watchdogStage + 1)) return
+        when (watchdogStage) {
+            0 -> { watchdogStage = 1; requestKeyframe("decoder produced nothing for $pending frames") }
+            1 -> { watchdogStage = 2; codecHandler?.post { recoverDecoder("no output for $pending frames after a keyframe request") } }
+            else -> { watchdogStage = 3; dropConnection("decoder still silent after a reset") }
+        }
+    }
+
+    /** Serialized on the codec thread: rebuild the decoder and resume at an IDR. */
+    private fun recoverDecoder(why: String) {
+        Log.w(TAG, "Rebuilding the decoder: $why")
+        resetCodec()
+        submittedSinceRender.set(0)
+        requestKeyframe("decoder rebuilt")
+    }
+
+    /** Close the live socket; the network coroutine reconnects with backoff. */
+    private fun dropConnection(why: String) {
+        val connection = current ?: return
+        Log.w(TAG, "Dropping video connection ${connection.generation}: $why")
+        try { connection.socket.close() } catch (_: Exception) {}
+    }
+
+    /** Recovery drills (debug builds): behave exactly like the real faults. */
+    fun debugDropSocket() = dropConnection("debug drill")
+    fun debugResetDecoder() { codecHandler?.post { recoverDecoder("debug drill") } ?: Log.w(TAG, "No decoder to reset") }
 
     /**
      * Whether this access unit starts with (or contains) an IDR/I slice, so
@@ -693,27 +817,18 @@ class VideoReceiver {
         }
     }
 
-    private fun readExact(stream: InputStream, buffer: ByteArray, length: Int) {
-        var offset = 0
-        while (offset < length) {
-            val read = stream.read(buffer, offset, length - offset)
-            if (read < 0) throw java.io.EOFException("Stream closed")
-            offset += read
-        }
-    }
-
     fun getFps(): Float = currentFps
     fun getMbps(): Float = currentMbps
 
     fun stop() {
         isRunning = false
         codecAlive = false
-        // Close socket first to unblock any pending reads
-        try {
-            socket?.close()
-        } catch (_: Exception) {}
-        socket = null
-        inputStream = null
+        // Close the live socket first to unblock any pending read. Only the
+        // current connection is touched: a later start() owns its own.
+        val connection = current
+        current = null
+        try { connection?.socket?.close() } catch (_: Exception) {}
+        setState(VideoState.DISCONNECTED)
 
         // Then cancel coroutines. The job is dropped rather than reused: a new
         // one is created by the next start().
