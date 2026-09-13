@@ -162,7 +162,7 @@ same laptop (minute 18–19): the soak was not run on an idle machine. The
 fps sits ~1 fps under the 60 s runs because the periodic ADB taps land on
 the pattern window and cost a repaint or two per second; the totals confirm
 it (105 208 encoded frames, 105 207 acked). The host under test predates
-commits c1bdda4/24fd9c9 (slot return and arrival pairing moved to the
+commits f2218fb/29c5b4b (slot return and arrival pairing moved to the
 appsink pad probe); those were re-checked with a 60 s run on HEAD and the
 rebuilt APK: 58.9 fps, capture→ack p95 28.6 ms, render p95 19.6 ms,
 `native_pending` 0.
