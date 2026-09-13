@@ -219,7 +219,9 @@ class HostTokenIntegrationTests(unittest.TestCase):
             'restore_token': 'wrong_laptop_token',
         }
 
-        with patch('host.dbus.Interface'):
+        # Naming the wrong output asks kscreen-doctor; the test must not
+        # depend on a KDE session being present (CI has none).
+        with patch('host.dbus.Interface'), patch.object(host_module, 'outputs', return_value=[]):
             h.started(wrong_result)
 
         # Token should be discarded
@@ -327,7 +329,7 @@ class HostTokenIntegrationTests(unittest.TestCase):
         wrong_result = {
             'streams': [(100, {'source_type': 1, 'size': [2560, 1600]})],
         }
-        with patch('host.dbus.Interface'):
+        with patch('host.dbus.Interface'), patch.object(host_module, 'outputs', return_value=[]):
             for _ in range(host_module.MAX_WRONG_SOURCE_ATTEMPTS):
                 h.started(wrong_result)
         self.assertFalse(h.failed)
@@ -335,7 +337,7 @@ class HostTokenIntegrationTests(unittest.TestCase):
                           host_module.MAX_WRONG_SOURCE_ATTEMPTS)
 
         # One more wrong selection past the cap must fail instead of retrying.
-        with patch('host.dbus.Interface'):
+        with patch('host.dbus.Interface'), patch.object(host_module, 'outputs', return_value=[]):
             h.started(wrong_result)
         h._fail.assert_called_once()
         self.assertTrue(h.failed)
