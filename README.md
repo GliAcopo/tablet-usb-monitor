@@ -86,7 +86,7 @@ over ADB; `./tabs9 status`, `./tabs9 logs` and `./tabs9 stop` do what they
 say. `--profile balanced` (native resolution, 60 Hz, HEVC 30 Mbit/s) is the
 measured usable mode; `--fps 120` is available and reaches 110–113 fps.
 
-## Measured results (2026-09-12, commit 5049a41, one machine)
+## Measured results (2026-09-12, commit b0979c0, one machine)
 
 All of the following were measured on the Tab S9 Ultra with the synthetic OpenGL
 motion pattern on the virtual output (`scripts/gpu-motion-test.py`); nothing
@@ -137,7 +137,7 @@ private was captured.
 
 **Read together with the 2026-09-13 fix.** The runs above were recorded on a
 boot where `/dev/dri/renderD128` happened to be the Intel GPU. Commit
-`449bd62` made the helper take the render node from the VA encoder instead of
+`b88b11f` made the helper take the render node from the VA encoder instead of
 assuming it (on a hybrid laptop the numbering changes across boots, and the
 silent fallback landed on a slower path). Two fresh 30 s runs after the fix,
 same profile, same synthetic motion: **56.8 / 56.6 unique fps**, capture→ack
