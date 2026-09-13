@@ -544,7 +544,7 @@ class Host:
             self.pipeline.set_state(Gst.State.PLAYING)
             if self.report_timer is None:
                 self.report_timer = GLib.timeout_add_seconds(5, self.report)
-            self.status.write('streaming')
+            self.status.write('streaming', self.capture_status())
             print('Capture authorized; starting encoder. Memory path:', self.memory_mode, flush=True)
         except Exception as error:
             print('Encoder setup failed:', type(error).__name__, str(error)[:300], flush=True)
@@ -556,6 +556,13 @@ class Host:
         print('Video pipeline error:', error.message, flush=True)
         self.fallback_or_stop()
 
+    def capture_status(self):
+        message = (f'Capture: {self.memory_mode}; {self.args.width}x{self.args.height}, '
+                   f'target {self.args.fps} fps (not measured throughput).')
+        if self.memory_mode != self.args.capture_memory:
+            message += f' WARNING: fallback from {self.args.capture_memory}; performance may be reduced.'
+        return message
+
     def fallback_or_stop(self):
         if self.memory_mode not in ('gl', 'va', 'native'):
             self._fail('Video pipeline failed.')
@@ -563,7 +570,8 @@ class Host:
         if self.native is not None:
             self.native.close()
             self.native = None
-        self.memory_mode = 'va' if self.memory_mode == 'native' else 'system'
+        previous_mode = self.memory_mode
+        self.memory_mode = 'va' if previous_mode == 'native' else 'system'
         if self.pipeline_bus:
             self.pipeline_bus.remove_signal_watch()
             self.pipeline_bus = None
@@ -572,11 +580,18 @@ class Host:
             self.pipeline = None
         if self.fd is not None:
             os.close(self.fd)
-        self.fd = self.portal.OpenPipeWireRemote(self.session, dbus.Dictionary({}, signature='sv')).take()
+            self.fd = None
+        try:
+            self.fd = self.portal.OpenPipeWireRemote(self.session, dbus.Dictionary({}, signature='sv')).take()
+        except dbus.DBusException:
+            self._fail('Screen-sharing session is unavailable; restart the USB display.')
+            return
         self.capture_caps = None
         self.capture_wall = None
         self.capture_pts = None
-        print('GPU-memory import unavailable; falling back to the system-memory capture path.', flush=True)
+        message = f'Capture path {previous_mode} failed; falling back to {self.memory_mode}. Performance may be reduced.'
+        print(message, flush=True)
+        notify('USB display using fallback capture', message, urgency='critical')
         GLib.idle_add(self.start_pipeline)
 
     def force_live_encoder(self):
@@ -634,8 +649,13 @@ class Host:
             return self.fallback_or_stop()
         width, height = self.args.width, self.args.height
         try:
+            encoder = Gst.ElementFactory.make('vah265enc')
+            if encoder is None:
+                raise NativeCaptureError('VA HEVC encoder unavailable')
+            render_node = encoder.get_property('device-path')
             self.native = NativeCapture(self.fd, self.capture_node, width, height,
                                         slots=int(os.environ.get('TABS9_NATIVE_SLOTS', '6')),
+                                        render_node=render_node,
                                         on_frame=self.native_frame, on_exit=self.native_exit)
         except NativeCaptureError as error:
             print('Native capture unavailable:', error, flush=True)
@@ -686,7 +706,7 @@ class Host:
             self.pipeline.set_state(Gst.State.PLAYING)
             if self.report_timer is None:
                 self.report_timer = GLib.timeout_add_seconds(5, self.report)
-            self.status.write('streaming')
+            self.status.write('streaming', self.capture_status())
             print('Capture authorized; starting encoder. Memory path: native '
                   f'(ring of {ring.slots} {ring.drm_format} surfaces, pitch {ring.pitches[0][0]})', flush=True)
         except Exception as error:
@@ -1248,6 +1268,7 @@ class Host:
         timestamps = sorted(self.capture_pts_intervals)
         self.capture_pts_intervals.clear()
         print(json.dumps({'encoded_frames': self.frames, 'tablet_rendered_acks': self.rendered,
+            'capture_memory': self.memory_mode,
             'capture_fps': round((self.capture_frames - captured) / elapsed, 1),
             'encoded_fps': round((self.frames - frames) / elapsed, 1),
             'tablet_ack_fps': round((self.rendered - rendered) / elapsed, 1),

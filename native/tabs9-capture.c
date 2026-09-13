@@ -148,7 +148,7 @@ static void va_setup(void)
 	S.dpy = vaGetDisplayDRM(S.drm_fd);
 	if (!S.dpy || vaInitialize(S.dpy, &major, &minor) != VA_STATUS_SUCCESS)
 		die("vaInitialize failed");
-	fprintf(stderr, "tabs9-capture: VA %d.%d %s\n", major, minor, vaQueryVendorString(S.dpy));
+	fprintf(stderr, "tabs9-capture: device %s VA %d.%d %s\n", S.render_node, major, minor, vaQueryVendorString(S.dpy));
 
 	VASurfaceAttrib attr = {
 		.type = VASurfaceAttribPixelFormat, .flags = VA_SURFACE_ATTRIB_SETTABLE,
@@ -559,7 +559,9 @@ int main(int argc, char **argv)
 	S.sock_fd = 4;
 	S.slots = 6;
 	S.modifier = 0x0100000000000009ull; /* I915_FORMAT_MOD_4_TILED */
-	S.render_node = "/dev/dri/renderD128";
+	/* The host selects the encoder's Intel device. DRM numbering changes
+	 * across boots on hybrid-GPU machines; never guess renderD128 here. */
+	S.render_node = NULL;
 	static const struct option opts[] = {
 		{ "node", required_argument, NULL, 'n' },
 		{ "width", required_argument, NULL, 'w' },
@@ -587,6 +589,8 @@ int main(int argc, char **argv)
 	}
 	if (!S.node_id || !S.width || !S.height || S.slots < 2 || S.slots > MAX_SLOTS)
 		die("usage: --node ID --width W --height H [--slots 2..8]");
+	if (!S.render_node)
+		die("--render-node is required (use the host's detected Intel VA device)");
 	if (fcntl(S.pw_fd, F_GETFD) < 0 || fcntl(S.sock_fd, F_GETFD) < 0)
 		die("--pw-fd / --sock-fd are not open file descriptors");
 	pthread_mutex_init(&S.va_lock, NULL);

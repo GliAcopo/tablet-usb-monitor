@@ -1,5 +1,51 @@
 # Performance analysis
 
+## 2026-09-13 regression: native capture selected the wrong GPU
+
+The reported unusable `./tabs9 start --profile balanced` session did not use
+the native path measured below. The helper hardcoded `/dev/dri/renderD128`.
+On this boot that node belongs to NVIDIA (PCI vendor `0x10de`); Intel
+(`0x8086`) is `/dev/dri/renderD129`. Startup attempted `nvidia_drv_video.so`,
+failed `vaInitialize`, and fell back to the all-GStreamer `va` path. The
+fallback message incorrectly called this system-memory capture, while CLI
+status said only "streaming". Thus a successful launch did not establish
+that the optimized path was active.
+
+The host now passes the VA encoder's device path explicitly to the helper,
+validates its Intel identity through sysfs, and never assumes a numbered GPU.
+The standalone helper requires `--render-node`. Failed helper startup cleans
+up its process/socket, and a missing portal during fallback produces failed
+status rather than an uncaught callback exception. CLI status and telemetry
+identify the actual capture route; fallback produces a visible warning.
+Benchmarks identify actual paths rather than matching one warning string.
+
+The initial post-fix 100-second synthetic-motion session negotiated Intel
+iHD, Tile4 NV12, and native 2960x1848 at a 60 Hz target. Inspected steady-state
+windows delivered approximately 56–57 fps, capture-to-ack p95 around 30 ms,
+and no >100 ms stalls. The synthetic image was visually verified on the
+tablet, and a tablet-side test tap produced one center-region touch in the
+host test window. These results establish recovery of the native path and
+responsive delivery; they are not a claim of a locked 60 fps or a new
+30-minute soak. Earlier benchmark results below describe a different boot
+and must not be treated as a universal guarantee.
+
+Two further fresh starts, each with ten seconds of warmup and thirty seconds
+of recorded synthetic motion, confirmed the fix:
+
+| measured result | run 1 | run 2 |
+|---|---:|---:|
+| actual capture path | native | native |
+| captured / encoded / acknowledged fps (median window) | 56.8 | 56.6 |
+| capture-to-ack p95 (worst window) | 31.1 ms | 30.9 ms |
+| render interval p95 (worst window) | 22.6 ms | 21.8 ms |
+| capture or render stalls >100 ms | 0 | 0 |
+| fallback | no | no |
+
+Reproduce with `./tabs9 stop` followed by
+`./tabs9 bench-capture --seconds 30 --runs 2 --modes native --json .local/bench/gpu-selection-fix-2026-09-13.json -- --profile balanced`.
+This benchmark stops the host afterward; restore normal use with
+`./tabs9 start --profile balanced`. Results are saved in the named JSON file.
+
 ## Settled (2026-09-12, evening): the 30 fps state, and the native consumer
 
 Everything below in this section was measured live on this machine with

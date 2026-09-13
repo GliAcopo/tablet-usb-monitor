@@ -12,6 +12,14 @@ SPEC.loader.exec_module(capture_ab)
 
 
 class ReportParsingTests(unittest.TestCase):
+    def test_native_fallback_is_detected_from_actual_path_not_warning_wording(self):
+        self.assertEqual(capture_ab.actual_capture_modes(
+            [{'capture_memory': 'va'}], ['Capture authorized; starting encoder. Memory path: va']), ['va'])
+        self.assertEqual(capture_ab.actual_capture_modes(
+            [{'capture_memory': 'va'}], ['Capture authorized; starting encoder. Memory path: native (ring)']),
+            ['native', 'va'])
+        self.assertEqual(capture_ab.actual_capture_modes([], []), [])
+
     def test_only_telemetry_lines_are_parsed(self):
         lines = [
             "Started tab-s9-usb-display.service",

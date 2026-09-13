@@ -125,6 +125,17 @@ def median(values):
     return round(statistics.median(values), 1) if values else None
 
 
+def actual_capture_modes(window, log_lines):
+    """Identify what ran, including fallback after startup, without guessing."""
+    modes = {r['capture_memory'] for r in window if r.get('capture_memory')}
+    for line in log_lines:
+        if 'Memory path:' in line:
+            tail = line.split('Memory path:', 1)[1].split()
+            if tail:
+                modes.add(tail[0])
+    return sorted(modes)
+
+
 def measure(mode, seconds, extra, env=()):
     print(f'\n=== capture path: {mode} ===', flush=True)
     if not stop_host():
@@ -136,10 +147,6 @@ def measure(mode, seconds, extra, env=()):
         print(f'Capture never started for {mode}; skipping this path.', flush=True)
         stop_host()
         return None
-    actual = wait_for(started, 'Memory path:', 5) or ''
-    if mode != 'system' and mode not in actual.split('Memory path:')[-1]:
-        print('Note: the GL path fell back to system memory.', flush=True)
-    fallback = bool(wait_for(started, 'falling back to the system-memory', 1))
 
     # Native Wayland: through XWayland the pattern paints at 60 but KWin
     # records ~56 unique frames per second on the virtual output.
@@ -150,6 +157,10 @@ def measure(mode, seconds, extra, env=()):
     window_start = time.time()
     time.sleep(seconds)
     window = reports(journal_since(window_start))
+    actual = actual_capture_modes(window, journal_since(started))
+    fallback = any(value != mode for value in actual) if actual else None
+    if fallback:
+        print(f'WARNING: requested {mode}, measured capture paths {actual}.', flush=True)
     cpu = cpu_seconds()
     motion.terminate()
     try:
@@ -163,6 +174,7 @@ def measure(mode, seconds, extra, env=()):
         return None
     return {
         'mode': mode,
+        'actual_capture_modes': actual,
         'fell_back': fallback,
         'windows': len(window),
         'capture_fps': median([r.get('capture_fps') for r in window]),

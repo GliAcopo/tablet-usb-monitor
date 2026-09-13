@@ -35,6 +35,29 @@ class NativeCaptureError(RuntimeError):
     """The helper is missing, failed to negotiate, or died."""
 
 
+def select_render_node(preferred: str | None = None, *,
+                       sys_root: Path = Path('/sys/class/drm'),
+                       dev_root: Path = Path('/dev/dri')) -> str:
+    """Find Intel by PCI vendor, never by the boot-dependent renderD number.
+
+    The current helper negotiates Intel Tile4 surfaces. When the encoder
+    supplies its device, require that exact GPU rather than a cross-GPU copy.
+    """
+    candidates = [Path(preferred).resolve()] if preferred else sorted(dev_root.glob('renderD*'))
+    intel = []
+    for node in candidates:
+        try:
+            vendor = (sys_root / node.name / 'device/vendor').read_text().strip().lower()
+        except OSError:
+            continue
+        if node.exists() and vendor == '0x8086':
+            intel.append(node)
+    if len(intel) != 1:
+        raise NativeCaptureError('native Tile4 capture needs one identified Intel render node'
+                                 + (' matching the VA encoder' if preferred else ''))
+    return str(intel[0])
+
+
 class Ring:
     """Geometry of the exported NV12 ring, as sent by the helper."""
 
@@ -90,18 +113,40 @@ class NativeCapture:
 
     def __init__(self, pipewire_fd: int, node_id: int, width: int, height: int, *,
                  slots: int = 6, on_frame: Callable[[Frame], None], on_exit: Callable[[int], None],
-                 helper: Path = HELPER):
+                 helper: Path = HELPER, render_node: str | None = None):
         if not helper.exists():
             raise NativeCaptureError(f'{helper} is not built (run make -C native)')
+        self.render_node = select_render_node(render_node)
+        print(f'Native capture render device: {self.render_node}', flush=True)
         self.sock, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.process = subprocess.Popen(
-            [str(helper), '--node', str(node_id), '--width', str(width), '--height', str(height),
-             '--slots', str(slots), '--pw-fd', str(pipewire_fd), '--sock-fd', str(child.fileno())],
-            pass_fds=(pipewire_fd, child.fileno()), stdin=subprocess.DEVNULL, close_fds=True)
-        child.close()
+        self.process = None
+        try:
+            self.process = subprocess.Popen(
+                [str(helper), '--node', str(node_id), '--width', str(width), '--height', str(height),
+                 '--render-node', self.render_node,
+                 '--slots', str(slots), '--pw-fd', str(pipewire_fd), '--sock-fd', str(child.fileno())],
+                pass_fds=(pipewire_fd, child.fileno()), stdin=subprocess.DEVNULL, close_fds=True)
+        except OSError as error:
+            self.sock.close()
+            raise NativeCaptureError(f'cannot start capture helper: {error}') from error
+        finally:
+            child.close()
         self.on_frame = on_frame
         self.on_exit = on_exit
-        self.ring, self.fds = recv_ring(self.sock)
+        try:
+            self.sock.settimeout(10)
+            self.ring, self.fds = recv_ring(self.sock)
+            self.sock.settimeout(None)
+        except (OSError, NativeCaptureError) as error:
+            self.sock.close()
+            if self.process.poll() is None:
+                self.process.terminate()
+            try:
+                self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+            raise NativeCaptureError(str(error)) from error
         self.lock = threading.Lock()
         self.busy: set[int] = set()
         self.closed = False
@@ -158,4 +203,3 @@ class NativeCapture:
                 os.close(fd)
             except OSError:
                 pass
-

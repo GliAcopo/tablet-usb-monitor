@@ -225,7 +225,9 @@ settings and measured delivery separately.
   returns the buffer to KWin inside the process callback (pipewire recycles
   one buffer per graph cycle, so anything that returns buffers later starves
   KWin sooner or later); the host encodes the ring with `vah265enc`. Falls
-  back to `va` if the helper is missing or fails.
+  back to `va` if the helper is missing or fails. The helper uses the VA
+  encoder's detected Intel render device; it does not assume `renderD128`
+  belongs to Intel (GPU numbering can change after reboot).
 - `va`: `KWin DMA-BUF → pipewiresrc → vapostproc → vah265enc`, all GStreamer.
   Zero copies, but bistable: a start-up or a hiccup can leave it at half the
   refresh rate for the life of the instance. Falls back to `system` if the
@@ -234,6 +236,12 @@ settings and measured delivery separately.
   native size because KWin's synchronous readback is the ceiling.
 - `gl`: DMA-BUF imported by NVIDIA EGL → `nvh265enc`. Negotiates and encodes,
   but the cross-GPU import stalls (~13 fps); kept for diagnosis only.
+
+`./tabs9 status` shows the active capture path and warns when it differs from
+the requested path. The fps shown there is a target, not measured delivery;
+the tablet overlay and benchmark telemetry report measured frames. A fallback
+also raises a desktop notification. After updating native source, rebuild with
+`make -C native` before restarting the service.
 
 ## Virtual desktops and the tablet
 

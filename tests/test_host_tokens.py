@@ -44,6 +44,30 @@ class HostTokenIntegrationTests(unittest.TestCase):
         import shutil
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
+    def test_capture_status_distinguishes_requested_and_fallback_path(self):
+        h = make_test_host(self.tmpdir)
+        h.args.capture_memory = 'native'
+        h.memory_mode = 'native'
+        self.assertIn('Capture: native', h.capture_status())
+        self.assertIn('not measured throughput', h.capture_status())
+        self.assertNotIn('WARNING', h.capture_status())
+        h.memory_mode = 'va'
+        self.assertIn('Capture: va', h.capture_status())
+        self.assertIn('WARNING: fallback from native', h.capture_status())
+
+    def test_fallback_with_dead_portal_fails_visibly_instead_of_leaving_streaming(self):
+        h = make_test_host(self.tmpdir)
+        h.native = None
+        h.memory_mode = 'native'
+        h.pipeline_bus = None
+        h.pipeline = None
+        h.fd = None
+        h.portal.OpenPipeWireRemote.side_effect = host_module.dbus.DBusException('session gone')
+        h.fallback_or_stop()
+        self.assertTrue(h.failed)
+        self.assertEqual(read_status(h.status.path)['phase'], 'failed')
+        h.loop.quit.assert_called_once()
+
     def test_capture_token_rejection_retries_capture_session(self):
         """Stale capture token is discarded and a fresh capture session is requested."""
         h = make_test_host(self.tmpdir)

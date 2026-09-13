@@ -84,6 +84,9 @@ case "${1:-help}" in
           # the window between the read above and this line.
           if systemctl --user is-active --quiet "$unit" 2>/dev/null; then
             echo '✓ USB display is streaming.'
+            if [[ -n "$msg" ]]; then
+              echo "  $msg"
+            fi
             exit 0
           fi
           ;;
