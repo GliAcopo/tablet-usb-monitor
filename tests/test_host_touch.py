@@ -96,6 +96,7 @@ def bare_host():
     value.input_followon_rejected = 0
     value.tablet_panel = None
     value.panel_mismatch_reported = False
+    value.client_features = set()
     return value
 
 
@@ -228,6 +229,28 @@ class HostTouchIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(value.input_messages, 1)
         self.assertEqual(value.tablet_panel, (2960, 1848))
         self.assertFalse(value.panel_mismatch_reported)
+
+    async def test_config_features_are_recorded_and_advertised_back(self):
+        """The greeting names the host's features; the client's config names
+        the ones it implements (only well-formed strings are kept), so the
+        video socket sends heartbeats only to clients that can parse them."""
+        value = bare_host()
+        ws = FakeWebSocket(value.token)
+        task = asyncio.create_task(value.control(ws))
+        await self._settle()
+        self.glib.drain()
+        self.assertIn('video_heartbeat', ws.sent[0]['features'])
+
+        ws.push({"type": "config", "protocol": 2, "fps": 120, "bitrate": 60000,
+                 "features": ["video_heartbeat", 7, "x" * 40]})
+        await self._settle()
+        self.assertEqual(value.client_features, {'video_heartbeat'})
+        ws.push({"type": "config", "protocol": 2, "fps": 120, "bitrate": 60000})
+        await self._settle()
+        self.assertEqual(value.client_features, {'video_heartbeat'})  # absent list: unchanged
+        ws.stop()
+        await task
+        self.glib.drain()
 
     async def test_mismatched_tablet_panel_is_reported_once(self):
         value = bare_host()

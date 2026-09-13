@@ -250,6 +250,14 @@ class Host:
         self.input_rejected = 0
         self.input_followon_rejected = 0
         self.resyncs = 0
+        # Video-socket liveness (see video()): features the tablet advertised
+        # on the control channel, per-connection generation, and counters.
+        self.client_features = set()
+        self.video_generation = 0
+        self.video_connects = 0
+        self.video_disconnects = 0
+        self.last_video_disconnect = None
+        self.heartbeats_sent = 0
         self.tablet_panel = None
         self.panel_mismatch_reported = False
         self.sent = collections.OrderedDict()
@@ -1017,14 +1025,34 @@ class Host:
             else:
                 queue.put_nowait((packet, keyframe))
 
+    # Idle-liveness heartbeat on the video socket. KWin sends no frame while
+    # the desktop is static, so without it a client cannot tell "nothing
+    # changed" from "the host is gone" and its read deadline fires. Sent only
+    # to clients that advertised `video_heartbeat`: an older client treats an
+    # unknown packet type as a framing error and reconnects.
+    HEARTBEAT_INTERVAL = 1.0
+    DRAIN_TIMEOUT = 2.0
+    PACKET_HEARTBEAT = b'\x02'
+
     async def video(self, reader, writer):
         queue = asyncio.Queue(maxsize=8)
         watcher = None
+        generation = None
+        reason = 'stopped'
         try:
             token = await asyncio.wait_for(reader.readexactly(64), 3)
-            if not hmac.compare_digest(token, self.token.encode()): return
+            if not hmac.compare_digest(token, self.token.encode()):
+                reason = 'unauthorized'
+                return
             writer.get_extra_info('socket').setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.video_generation += 1
+            self.video_connects += 1
+            generation = self.video_generation
+            print(f'Video client {generation} connected; requesting a keyframe.', flush=True)
             self.clients.add(queue)
+            # A fresh connection starts at an IDR (`waiting` below); ask for one
+            # now instead of leaving the client to wait for the periodic one.
+            GLib.idle_add(self.request_keyframe)
             async def disconnected():
                 await reader.read(1)
                 self.clients.discard(queue)
@@ -1032,9 +1060,22 @@ class Host:
                 queue.put_nowait(None)
             watcher = asyncio.create_task(disconnected())
             waiting = True
+            heartbeat = 0
             while True:
-                item = await queue.get()
-                if item is None: break
+                try:
+                    item = await asyncio.wait_for(queue.get(), self.HEARTBEAT_INTERVAL)
+                except asyncio.TimeoutError:
+                    if 'video_heartbeat' not in self.client_features:
+                        continue
+                    heartbeat += 1
+                    payload = self.PACKET_HEARTBEAT + struct.pack('!I', heartbeat & 0xffffffff)
+                    writer.write(struct.pack('!I', len(payload)) + payload)
+                    await asyncio.wait_for(writer.drain(), self.DRAIN_TIMEOUT)
+                    self.heartbeats_sent += 1
+                    continue
+                if item is None:
+                    reason = 'client closed'
+                    break
                 if item is RESYNC:
                     waiting = True
                     continue
@@ -1042,11 +1083,17 @@ class Host:
                 if waiting and not keyframe: continue
                 waiting = False
                 writer.write(packet)
-                await asyncio.wait_for(writer.drain(), 2)
-        except (asyncio.TimeoutError, ConnectionError, asyncio.IncompleteReadError):
-            pass
+                await asyncio.wait_for(writer.drain(), self.DRAIN_TIMEOUT)
+        except asyncio.TimeoutError:
+            reason = 'write timeout' if generation is not None else 'auth timeout'
+        except (ConnectionError, asyncio.IncompleteReadError):
+            reason = 'connection error'
         finally:
             self.clients.discard(queue)
+            if generation is not None:
+                self.video_disconnects += 1
+                self.last_video_disconnect = reason
+                print(f'Video client {generation} disconnected: {reason}.', flush=True)
             if watcher:
                 watcher.cancel()
                 with contextlib.suppress(asyncio.CancelledError, ConnectionError):
@@ -1066,6 +1113,7 @@ class Host:
                 return
             self.control_owner = ws
             owns_control = True
+            self.client_features = set()   # re-learned from this client's config
             self.control_generation += 1
             generation = self.control_generation
             GLib.idle_add(self.begin_control, generation)
@@ -1093,6 +1141,9 @@ class Host:
                 elif msg.get('type') == 'keyframe':
                     GLib.idle_add(self.request_keyframe)
                 elif msg.get('type') == 'config':
+                    features = msg.get('features')
+                    if isinstance(features, list):
+                        self.client_features = {f for f in features if isinstance(f, str) and len(f) <= 32}
                     protocol = msg.get('protocol')
                     if type(protocol) is not int:
                         print('Tablet client sent no protocol version: treating it as protocol 1 '
@@ -1192,7 +1243,7 @@ class Host:
         return {'status': 'connected', 'protocol': self.PROTOCOL, 'width': self.args.width,
                 'height': self.args.height, 'codec': 'hevc', 'pen_only': False,
                 'fps': self.args.fps, 'bitrate': self.args.bitrate,
-                'features': ['keyframe_request', 'render_ns']}
+                'features': ['keyframe_request', 'render_ns', 'video_heartbeat']}
 
     async def broadcast_settings(self):
         payload = json.dumps(self.settings())
@@ -1239,6 +1290,15 @@ class Host:
             self.ready.set()
             await asyncio.Future()
 
+    def drop_video_clients(self):
+        print(f'Dropping {len(self.clients)} video client(s) on request (recovery drill).', flush=True)
+        def drop():
+            for queue in tuple(self.clients):
+                while not queue.empty(): queue.get_nowait()
+                queue.put_nowait(None)
+        self.aio.call_soon_threadsafe(drop)
+        return True
+
     def report(self):
         stats = sorted(self.stats)
         self.stats.clear()
@@ -1276,6 +1336,9 @@ class Host:
             'tablet_input_rejected': self.input_rejected,
             'tablet_input_followon_rejected': self.input_followon_rejected,
             'client_resyncs': self.resyncs,
+            'video_clients': len(self.clients), 'video_connects': self.video_connects,
+            'video_disconnects': self.video_disconnects, 'last_video_disconnect': self.last_video_disconnect,
+            'heartbeats_sent': self.heartbeats_sent,
             'native_dropped': self.native_dropped if self.native is not None else None,
             'native_pending': len(self.native_pushed) if self.native is not None else None,
             'native_seq_gaps': self.native_seq_gaps if self.native is not None else None,
@@ -1330,6 +1393,10 @@ class Host:
             self.create()
             for sig in (signal.SIGINT, signal.SIGTERM):
                 GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, sig, lambda: self.loop.quit() or False)
+            # Recovery drill: SIGUSR1 drops every video client (the socket
+            # closes, the tablet must reconnect and resume at a keyframe)
+            # without touching the control channel or the capture pipeline.
+            GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, self.drop_video_clients)
             self.loop.run()
         except Exception as error:
             # RuntimeErrors raised in this method carry static, non-sensitive
