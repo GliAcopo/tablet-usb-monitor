@@ -1,0 +1,250 @@
+"""Three- and four-finger swipes on the tablet, recognised on the host.
+
+The tablet forwards every contact as it happens; KWin only gets to see them
+here, so this is the one place a multi-finger swipe can be kept off the
+desktop.  The desktop must never see the first fingers of a swipe: a contact
+that goes down and is lifted a few milliseconds later is a tap to every
+toolkit, and a three-finger swipe would click whatever it started on.  So
+contacts are held back for a short window (``hold_ms``) after the first one
+lands.  A third finger inside that window makes the sequence a gesture and
+nothing from it is delivered; otherwise the held contacts are replayed, in
+order, and the rest of the sequence goes straight through.  A tap or lift
+inside the window is replayed immediately, so clicks are not delayed at all;
+a drag starts on the desktop ``hold_ms`` late and then catches up.
+
+KWin's own touchscreen gestures do the same job for a locally attached panel
+(GlobalShortcutFilter, 250 ms between fingers) but cover three fingers only
+and cannot be remapped; they never fire through this path because the
+gesture's contacts are not forwarded.
+
+The recogniser is pure: the host supplies delivery, the action, the clock
+and a one-shot timer, so the state machine is exercised in tests without
+GLib or a portal.
+"""
+from __future__ import annotations
+
+import math
+import time
+from typing import Any, Callable, Mapping
+
+TOUCH_DOWN = 0
+TOUCH_UP = 1
+TOUCH_MOTION = 2
+
+# Normalised travel (fraction of the tablet's width or height) of the
+# fingers' mean position that fires the swipe: about 20 mm on the Tab S9
+# Ultra's 285 mm panel.
+DEFAULT_THRESHOLD = 0.07
+# Fingers must all be down within this many ms of the first for the
+# sequence to be a gesture; it is also the most a single-finger drag is
+# delayed. KWin's own touchscreen gestures allow 250 ms between fingers.
+DEFAULT_HOLD_MS = 120
+
+IDLE = 'idle'        # no contact down
+HOLD = 'hold'        # contacts buffered until the sequence is classified
+PASS = 'pass'        # ordinary touches, forwarded as they arrive
+GESTURE = 'gesture'  # a swipe: contacts are consumed here
+
+
+class GestureFilter:
+    """Route tablet touch messages: ordinary ones on, swipes to ``act``."""
+
+    def __init__(self, forward: Callable[[Mapping[str, Any]], Any],
+                 act: Callable[[int, str], Any], *,
+                 schedule: Callable[[int, Callable[[], None]], Any],
+                 cancel: Callable[[Any], None],
+                 now: Callable[[], float] = time.monotonic,
+                 hold_ms: int = DEFAULT_HOLD_MS, threshold: float = DEFAULT_THRESHOLD,
+                 min_fingers: int = 3, max_fingers: int = 4):
+        if not 1 <= hold_ms <= 1000:
+            raise ValueError('hold_ms must be between 1 and 1000')
+        if not 0.0 < threshold <= 1.0:
+            raise ValueError('threshold must be a fraction of the screen')
+        if not 2 <= min_fingers <= max_fingers <= 10:
+            raise ValueError('finger counts must satisfy 2 <= min <= max <= 10')
+        self.forward = forward
+        self.act = act
+        self.schedule = schedule
+        self.cancel = cancel
+        self.now = now
+        self.hold_ms = hold_ms
+        self.threshold = threshold
+        self.min_fingers = min_fingers
+        self.max_fingers = max_fingers
+        self.state = IDLE
+        self.recognised = 0
+        # slot -> [x0, y0, x, y]: where each finger landed and where it is.
+        self.contacts: dict[int, list[float]] = {}
+        self.buffer: list[Mapping[str, Any]] = []
+        self.timer = None
+        self.first_down = -math.inf
+        self.last_down = -math.inf
+        self.fingers = 0
+        self.fired = False
+        self.ended = False
+        # Slots that landed too late or too many to join a gesture: their
+        # whole sequence is dropped, the desktop never saw them start.
+        self.ignored: set[int] = set()
+
+    # -- public ---------------------------------------------------------------
+    def handle(self, message: Mapping[str, Any]) -> None:
+        """Route one ``{"type": "touch", ...}`` message."""
+        parsed = self._parse(message)
+        if parsed is None:
+            # Let the validator behind ``forward`` reject it in its usual way;
+            # anything held back goes first so the order is preserved.
+            self._flush()
+            self.forward(message)
+            return
+        action, slot, x, y = parsed
+        if self.state == IDLE:
+            self._idle(message, action, slot, x, y)
+        elif self.state == HOLD:
+            self._hold(message, action, slot, x, y)
+        elif self.state == PASS:
+            self._pass(message, action, slot, x, y)
+        else:
+            self._gesture(action, slot, x, y)
+
+    def reset(self) -> None:
+        """Forget every contact and anything held back (the host released input)."""
+        self._cancel_timer()
+        self.contacts.clear()
+        self.buffer.clear()
+        self.ignored.clear()
+        self.state = IDLE
+        self.fingers = 0
+        self.fired = False
+        self.ended = False
+
+    def expire(self) -> None:
+        """The hold window ended without a third finger: an ordinary sequence."""
+        self.timer = None   # the one-shot has fired; nothing to cancel
+        if self.state == HOLD:
+            self._leave_hold()
+
+    # -- states ---------------------------------------------------------------
+    def _idle(self, message, action, slot, x, y):
+        if action != TOUCH_DOWN:
+            # A stray motion/up with nothing down: the validator's business.
+            self.forward(message)
+            return
+        self.contacts[slot] = [x, y, x, y]
+        self.buffer.append(message)
+        self.first_down = self.last_down = self.now()
+        self.state = HOLD
+        self.timer = self.schedule(self.hold_ms, self.expire)
+
+    def _hold(self, message, action, slot, x, y):
+        if self.now() - self.first_down > self.hold_ms / 1000.0:
+            # The timer is late (the loop was busy): classify by the clock.
+            self._leave_hold()
+            self.handle(message)
+            return
+        if action == TOUCH_DOWN:
+            self.contacts[slot] = [x, y, x, y]
+            self.buffer.append(message)
+            self.last_down = self.now()
+            if len(self.contacts) >= self.min_fingers:
+                self._begin_gesture()
+            return
+        if action == TOUCH_MOTION:
+            if slot in self.contacts:
+                self.contacts[slot][2:] = [x, y]
+            self.buffer.append(message)
+            return
+        # A lift this early is a tap, or a finger that changed its mind:
+        # deliver everything now rather than after the window.
+        self.contacts.pop(slot, None)
+        self.buffer.append(message)
+        self._leave_hold()
+
+    def _pass(self, message, action, slot, x, y):
+        if action == TOUCH_DOWN:
+            self.contacts[slot] = [x, y, x, y]
+        elif action == TOUCH_UP:
+            self.contacts.pop(slot, None)
+        self.forward(message)
+        if not self.contacts:
+            self.state = IDLE
+
+    def _gesture(self, action, slot, x, y):
+        if action == TOUCH_DOWN:
+            late = self.now() - self.last_down > self.hold_ms / 1000.0
+            if self.fired or self.ended or late or len(self.contacts) >= self.max_fingers:
+                self.ignored.add(slot)
+                return
+            self.contacts[slot] = [x, y, x, y]
+            self.fingers = len(self.contacts)
+            self.last_down = self.now()
+            return
+        if action == TOUCH_MOTION:
+            if slot in self.contacts:
+                self.contacts[slot][2:] = [x, y]
+                if not self.fired and not self.ended:
+                    self._check_swipe()
+            return
+        # The first finger to lift ends the swipe; the others just finish.
+        if self.contacts.pop(slot, None) is not None:
+            self.ended = True
+        self.ignored.discard(slot)
+        if not self.contacts and not self.ignored:
+            self.reset()
+
+    # -- helpers --------------------------------------------------------------
+    def _leave_hold(self):
+        self._flush()
+        self.state = PASS if self.contacts else IDLE
+
+    def _begin_gesture(self):
+        self._cancel_timer()
+        self.buffer.clear()
+        self.state = GESTURE
+        self.fingers = len(self.contacts)
+        self.fired = False
+        self.ended = False
+
+    def _check_swipe(self):
+        n = len(self.contacts)
+        dx = sum(c[2] - c[0] for c in self.contacts.values()) / n
+        dy = sum(c[3] - c[1] for c in self.contacts.values()) / n
+        if max(abs(dx), abs(dy)) < self.threshold:
+            return
+        if abs(dx) >= abs(dy):
+            direction = 'left' if dx < 0 else 'right'
+        else:
+            direction = 'up' if dy < 0 else 'down'
+        self.fired = True
+        self.recognised += 1
+        self.act(self.fingers, direction)
+
+    def _flush(self):
+        self._cancel_timer()
+        while self.buffer:
+            # Pop first: if delivery raises, the host releases input and
+            # resets this filter, and the failed message must not replay.
+            self.forward(self.buffer.pop(0))
+
+    def _cancel_timer(self):
+        if self.timer is not None:
+            timer, self.timer = self.timer, None
+            self.cancel(timer)
+
+    @staticmethod
+    def _parse(message):
+        if not isinstance(message, Mapping) or message.get('type') != 'touch':
+            return None
+        action = message.get('action')
+        slot = message.get('slot')
+        x = message.get('x')
+        y = message.get('y')
+        if (type(action) is not int or type(slot) is not int or
+                action not in (TOUCH_DOWN, TOUCH_UP, TOUCH_MOTION)):
+            return None
+        if action == TOUCH_UP:
+            return action, slot, 0.0, 0.0
+        if (isinstance(x, bool) or isinstance(y, bool) or
+                not isinstance(x, (int, float)) or not isinstance(y, (int, float)) or
+                not math.isfinite(x) or not math.isfinite(y)):
+            return None
+        return action, slot, float(x), float(y)

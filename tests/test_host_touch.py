@@ -8,6 +8,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import host as host_module  # noqa: E402
+import gestures  # noqa: E402
 
 
 STOP = object()
@@ -97,7 +98,48 @@ def bare_host():
     value.tablet_panel = None
     value.panel_mismatch_reported = False
     value.client_features = set()
+    value.gestures = None
+    value.gestures_fired = 0
+    value.kglobalaccel = None
     return value
+
+
+class FakeShortcuts:
+    def __init__(self):
+        self.invoked = []
+
+    def invokeShortcut(self, name, reply_handler=None, error_handler=None):
+        self.invoked.append(name)
+
+
+def gesture_host():
+    """A host whose touch path goes through the gesture filter (timers by hand)."""
+    value = bare_host()
+    value.control_owner = object()
+    value.control_generation = 4
+    value.kglobalaccel = FakeShortcuts()
+    value.timers = {}
+
+    def schedule(ms, callback):
+        handle = len(value.timers) + 1
+        value.timers[handle] = callback
+        return handle
+
+    value.gestures = host_module.GestureFilter(
+        value._deliver_input, value.perform_gesture,
+        schedule=schedule, cancel=value.timers.pop, hold_ms=120)
+    return value
+
+
+def swipe(value, slots, dx):
+    for i, slot in enumerate(slots):
+        value.handle_touch({"type": "touch", "action": 0, "slot": slot, "x": 0.3 + 0.05 * i, "y": 0.5}, 4)
+    for step in (1, 2, 3):
+        for i, slot in enumerate(slots):
+            value.handle_touch({"type": "touch", "action": 2, "slot": slot,
+                                "x": 0.3 + 0.05 * i + dx * step / 3, "y": 0.5}, 4)
+    for slot in slots:
+        value.handle_touch({"type": "touch", "action": 1, "slot": slot, "x": 0.0, "y": 0.0}, 4)
 
 
 class HostTouchIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -297,6 +339,94 @@ class HostTouchIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(value.input_rejected, 0)
         self.assertEqual(value.input_followon_rejected, 1)
+
+    async def test_three_finger_swipe_walks_windows_and_never_reaches_the_desktop(self):
+        value = gesture_host()
+
+        swipe(value, [0, 1, 2], -0.2)
+
+        self.assertEqual(value.kglobalaccel.invoked, ["Walk Through Windows"])
+        self.assertEqual(value.touch.messages, [])
+        self.assertEqual(value.gestures_fired, 1)
+        self.assertEqual(value.input_rejected, 0)
+        self.assertEqual(value.timers, {})
+
+    async def test_four_finger_swipes_switch_desktops_both_ways(self):
+        value = gesture_host()
+
+        swipe(value, [0, 1, 2, 3], -0.2)
+        swipe(value, [0, 1, 2, 3], 0.2)
+
+        self.assertEqual(value.kglobalaccel.invoked,
+                         ["Switch One Desktop to the Right", "Switch One Desktop to the Left"])
+        self.assertEqual(value.touch.messages, [])
+
+    async def test_unmapped_swipe_does_nothing(self):
+        value = gesture_host()
+
+        self.assertFalse(value.perform_gesture(3, "up"))
+        self.assertFalse(value.perform_gesture(5, "left"))
+
+        self.assertEqual(value.kglobalaccel.invoked, [])
+        self.assertEqual(value.gestures_fired, 0)
+
+    async def test_single_finger_tap_is_delivered_unchanged(self):
+        value = gesture_host()
+        down = {"type": "touch", "action": 0, "slot": 0, "x": 0.2, "y": 0.3}
+        up = {"type": "touch", "action": 1, "slot": 0, "x": 0.0, "y": 0.0}
+
+        value.handle_touch(down, 4)
+        self.assertEqual(value.touch.messages, [])
+        value.handle_touch(up, 4)
+
+        self.assertEqual(value.touch.messages, [down, up])
+        self.assertEqual(value.kglobalaccel.invoked, [])
+
+    async def test_held_drag_is_delivered_when_the_timer_fires(self):
+        value = gesture_host()
+        down = {"type": "touch", "action": 0, "slot": 0, "x": 0.2, "y": 0.3}
+        value.handle_touch(down, 4)
+        (handle, callback), = value.timers.items()
+
+        self.assertFalse(value._input_timer(callback))   # GLib: one-shot
+        value.timers.pop(handle)
+
+        self.assertEqual(value.touch.messages, [down])
+
+    async def test_pen_bypasses_the_gesture_filter(self):
+        value = gesture_host()
+        pen = {"type": "pen", "action": 3, "x": 0.2, "y": 0.3}
+
+        value.handle_touch(pen, 4)
+
+        self.assertEqual(value.touch.messages, [pen])
+
+    async def test_rejected_replay_releases_input_and_resets_the_filter(self):
+        value = gesture_host()
+        value.touch.error = host_module.TouchInputError("invalid lifecycle")
+        down = {"type": "touch", "action": 0, "slot": 0, "x": 0.2, "y": 0.3}
+        value.handle_touch(down, 4)
+        (handle, callback), = value.timers.items()
+        value.timers.pop(handle)   # GLib drops a one-shot as it fires
+
+        value._input_timer(callback)
+
+        self.assertEqual(value.touch.releases, 1)
+        self.assertEqual(value.input_rejected, 1)
+        self.assertEqual(value.gestures.state, gestures.IDLE)
+        self.assertEqual(value.timers, {})
+
+    async def test_release_touch_drops_a_gesture_in_progress(self):
+        value = gesture_host()
+        for slot in (0, 1, 2):
+            value.handle_touch({"type": "touch", "action": 0, "slot": slot, "x": 0.3, "y": 0.5}, 4)
+        self.assertEqual(value.gestures.state, gestures.GESTURE)
+
+        value.release_touch()
+
+        self.assertEqual(value.gestures.state, gestures.IDLE)
+        self.assertEqual(value.touch.releases, 1)
+        self.assertEqual(value.touch.messages, [])
 
 
 if __name__ == "__main__":

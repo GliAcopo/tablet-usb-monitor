@@ -33,6 +33,7 @@ def make_test_host(tmp_dir):
     h.virtual_name = 'Virtual-1'
     h.session_watches = []
     h.touch = None
+    h.gestures = None
     return h
 
 
@@ -417,6 +418,7 @@ class RunFinallyCleanupTests(unittest.TestCase):
         h.pipeline = None
         h.reverse_ports = [8890, 8891]
         h.touch = MagicMock()
+        h.gestures = None
         h.closing = False
         h.failed = False
         return h

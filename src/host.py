@@ -42,6 +42,7 @@ from native_capture import NativeCapture, NativeCaptureError
 from websockets.asyncio.server import serve
 from touch_input import LiveKScreenTarget, PortalTouchInput, TouchInputError
 from eis_touch import EisTouch, EisError
+from gestures import GestureFilter
 from status import StatusWriter
 from tokens import load_tokens, save_token, discard_token
 
@@ -274,6 +275,16 @@ class Host:
         self.input_messages = 0
         self.input_rejected = 0
         self.input_followon_rejected = 0
+        self.gestures_fired = 0
+        self.kglobalaccel = None
+        # Multi-finger swipes are picked out here, before the desktop sees
+        # the contacts (see gestures.py); off delivers every touch as is.
+        self.gestures = None
+        if getattr(args, 'gestures', 'on') == 'on':
+            self.gestures = GestureFilter(self._deliver_input, self.perform_gesture,
+                schedule=lambda ms, callback: GLib.timeout_add(ms, self._input_timer, callback),
+                cancel=GLib.source_remove,
+                hold_ms=getattr(args, 'gesture_hold_ms', 120))
         self.resyncs = 0
         # Video-socket liveness (see video()): features the tablet advertised
         # on the control channel, per-connection generation, and counters.
@@ -498,6 +509,9 @@ class Host:
         self.watch_session(self.session)
         self.connect_eis(target)
         print('Tablet input mode:', self.touch.mode, flush=True)
+        if self.gestures is not None:
+            print(f'Tablet gestures: 3 fingers = windows, 4 fingers = desktops '
+                  f'(fingers land within {self.gestures.hold_ms} ms)', flush=True)
         self.fd = self.portal.OpenPipeWireRemote(self.session, dbus.Dictionary({}, signature='sv')).take()
         self.capture_node = int(node)
         self.start_pipeline()
@@ -1216,20 +1230,67 @@ class Host:
         if generation != self.control_generation or self.control_owner is None:
             return False
         if self.touch is not None:
-            try:
-                self.touch.handle_message(message)
-            except (TouchInputError, dbus.DBusException, EisError) as error:
-                followon = 'slot is not active' in str(error) or 'pen is not down' in str(error)
-                if followon:
-                    self.input_followon_rejected += 1
-                else:
-                    self.input_rejected += 1
-                rejected = self.input_followon_rejected if followon else self.input_rejected
-                label = 'Follow-on input ignored' if followon else 'Tablet input rejected'
-                if rejected <= 5 or rejected % 100 == 0:
-                    print(f'{label} ({rejected}): {type(error).__name__}: {error}', flush=True)
-                self.release_touch()
+            if self.gestures is not None and message.get('type') == 'touch':
+                self._guard_input(self.gestures.handle, message)
+            else:
+                self._guard_input(self.touch.handle_message, message)
         return False
+
+    def _deliver_input(self, message):
+        # Also reached from a hold-window timer, after the input may be gone.
+        if self.touch is not None:
+            self.touch.handle_message(message)
+
+    def _input_timer(self, callback):
+        # A gesture hold window ended: whatever was held back is delivered
+        # now, under the same error handling as a message that just arrived.
+        self._guard_input(callback)
+        return False
+
+    def _guard_input(self, deliver, *args):
+        try:
+            deliver(*args)
+        except (TouchInputError, dbus.DBusException, EisError) as error:
+            followon = 'slot is not active' in str(error) or 'pen is not down' in str(error)
+            if followon:
+                self.input_followon_rejected += 1
+            else:
+                self.input_rejected += 1
+            rejected = self.input_followon_rejected if followon else self.input_rejected
+            label = 'Follow-on input ignored' if followon else 'Tablet input rejected'
+            if rejected <= 5 or rejected % 100 == 0:
+                print(f'{label} ({rejected}): {type(error).__name__}: {error}', flush=True)
+            self.release_touch()
+
+    # Swipe -> KWin global shortcut, by name (kglobalaccel's kwin component).
+    # Fingers move left, content moves left: the window/desktop "to the
+    # right" comes in, as with KWin's own touchpad gestures. Invoked without a
+    # modifier held, "Walk Through Windows" is KWin's one-step switch: it
+    # activates the next window immediately, no popup.
+    GESTURE_SHORTCUTS = {
+        (3, 'left'): 'Walk Through Windows',
+        (3, 'right'): 'Walk Through Windows (Reverse)',
+        (4, 'left'): 'Switch One Desktop to the Right',
+        (4, 'right'): 'Switch One Desktop to the Left',
+    }
+
+    def perform_gesture(self, fingers, direction):
+        name = self.GESTURE_SHORTCUTS.get((fingers, direction))
+        if name is None:
+            return False
+        self.gestures_fired += 1
+        print(f'Gesture: {fingers} fingers {direction} -> {name}', flush=True)
+        self.invoke_kwin_shortcut(name)
+        return True
+
+    def invoke_kwin_shortcut(self, name):
+        if self.kglobalaccel is None:
+            self.kglobalaccel = dbus.Interface(
+                self.bus.get_object('org.kde.kglobalaccel', '/component/kwin'),
+                'org.kde.kglobalaccel.Component')
+        # Asynchronous: the touch path must not wait on KWin.
+        self.kglobalaccel.invokeShortcut(name, reply_handler=lambda *_: None,
+            error_handler=lambda error: print(f'KWin shortcut {name!r} failed: {error}', flush=True))
 
     def note_tablet_panel(self, message):
         """Record the tablet's own panel size and warn once if it disagrees.
@@ -1254,6 +1315,8 @@ class Host:
         return True
 
     def release_touch(self):
+        if self.gestures is not None:
+            self.gestures.reset()
         if self.touch is not None:
             self.touch.release_all()
         return False
@@ -1360,6 +1423,7 @@ class Host:
             'tablet_input_messages': self.input_messages,
             'tablet_input_rejected': self.input_rejected,
             'tablet_input_followon_rejected': self.input_followon_rejected,
+            'tablet_gestures': self.gestures_fired,
             'client_resyncs': self.resyncs,
             'video_clients': len(self.clients), 'video_connects': self.video_connects,
             'video_disconnects': self.video_disconnects, 'last_video_disconnect': self.last_video_disconnect,
@@ -1487,6 +1551,12 @@ if __name__ == '__main__':
                              '0 makes the outputs touch exactly as KWin would place them)')
     parser.add_argument('--capture-memory', choices=['native', 'va', 'system', 'gl'], default='native',
                         help='native: PipeWire consumer in native/tabs9-capture (default; falls back to va)')
+    parser.add_argument('--gestures', choices=['on', 'off'], default='on',
+                        help='three-finger swipes switch windows, four-finger swipes switch '
+                             'virtual desktops (default on)')
+    parser.add_argument('--gesture-hold-ms', type=int, default=120, metavar='MS',
+                        help='how long the fingers of a swipe may take to all land; also the '
+                             'most a single-finger drag is delayed (default 120)')
     parser.add_argument('--rate-control', choices=['cbr', 'vbr', 'cqp'], default='cbr')
     parser.add_argument('--qp', type=int, default=24)
     args = parser.parse_args()
@@ -1509,6 +1579,8 @@ if __name__ == '__main__':
             args.width % 2 == 0 and args.height % 2 == 0 and
             1 <= args.scale <= 3 and 1000 <= args.bitrate <= 150000):
         parser.error('Invalid resolution, scale or bitrate')
+    if not 1 <= args.gesture_hold_ms <= 1000:
+        parser.error('--gesture-hold-ms must be between 1 and 1000')
     os.umask(0o077)
     state_dir = ROOT / '.local/state'
     state_dir.mkdir(parents=True, exist_ok=True)

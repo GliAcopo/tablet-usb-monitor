@@ -224,6 +224,12 @@ helper must be built once with `scripts/setup-native.sh`; without it the host
 falls back to the GStreamer `va` path, which is subject to the half-rate
 state described in the performance report.
 
+If the pointer sticks for a moment when it crosses between the laptop and
+the tablet, that is KWin's edge barrier (Plasma 6.1+, 100 px by default);
+disable it with `kwriteconfig6 --file kwinrc --group EdgeBarrier --key
+EdgeBarrier 0`, `... --key CornerBarrier false`, then `qdbus6 org.kde.KWin
+/KWin reconfigure` (undo: the same two commands with `--delete`).
+
 `./tabs9 start` is **supervised**: it waits (up to 60 seconds) for the host to
 reach a terminal state (streaming, failed, or stopped) or a consent-needed
 phase, instead of printing "started" the moment `systemd-run` succeeds. It
@@ -261,6 +267,29 @@ same consented session and drives KWin's EIS backend through libei
 (`src/eis_touch.py`, ctypes, no extra permissions): KWin exposes one absolute
 device with a region per output, and every contact is framed. Pen input
 still uses the portal's pointer calls, which KDE maps correctly.
+
+### Swipe gestures
+
+Three fingers swiped sideways switch windows (KWin's Alt+Tab, one step:
+left goes to the next window, right to the previous), four fingers switch
+virtual desktops (left goes to the desktop on the right, as with KWin's
+touchpad gestures). The host recognises them (`src/gestures.py`) and fires
+the corresponding KWin global shortcut over D-Bus; the swipe's contacts never
+reach the desktop, so nothing under the fingers is clicked or scrolled. The
+fingers must all land within `--gesture-hold-ms` (120) of the first; the
+first contact of *every* touch is held back for at most that long, which is
+where the classification happens (a tap is delivered the moment it lifts, a
+drag starts on the desktop up to 120 ms late and then catches up).
+`--gestures off` turns this off. Verified live with `scripts/mt-inject`
+swipes: 3-left/3-right changed KWin's active window, 4-left/4-right moved the
+current desktop and back, 0 of the ordinary touches rejected.
+
+Two things to know: KWin's Alt+Tab is most-recently-used order, so two
+three-finger swipes to the left return to the starting window (as two taps
+of Alt+Tab do), and the reverse direction walks the least recent window
+first. And desktops are global (see "Virtual desktops and the tablet"): with
+`pin-desktop on` a four-finger swipe changes the laptop's desktop while the
+tablet's windows stay put.
 
 ### Portal token persistence (one-time consent)
 
