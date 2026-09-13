@@ -7,3 +7,4 @@ android/app/build/
 android/keystore.properties
 *.jks
 *.keystore
+.pytest_cache/
