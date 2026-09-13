@@ -26,12 +26,37 @@ minutes" cadence is simply how often nothing changed for 10 s.
 Why the earlier soaks never saw it: they ran continuous synthetic motion.
 And why an "idle" tablet usually still captured ~15 fps here: KWin rounds
 the laptop panel's logical width (2560 / 1.75 = 1462.86 → 1463), so the
-virtual output placed at x = 1463 shares one logical pixel with it, and any
-repaint near the laptop's right edge (a terminal, a browser) re-renders a
-2 px column of the tablet (`TABS9_TRACE_DAMAGE=1` logs the rectangles:
-`damage 2x1333+0+40`). The dropouts therefore only appeared when the laptop
-was idle too. That overlap is a separate placement issue, left as a
-follow-up (a 1 px gap would stop the pointer from crossing).
+virtual output placed at x = 1463 sits at a half device pixel of its own
+scale (1463 × 1.5 = 2194.5). KWin rounds that offset one way when it paints
+(`RenderViewport`, `rounded()`) and the other when it computes damage
+(`Item::paintedDeviceArea`, `roundedOut()`), so any repaint near the laptop's
+right edge (a terminal, a browser) re-renders a 2 px column of the tablet
+(`TABS9_TRACE_DAMAGE=1` logs the rectangles: `damage 2x1333+0+40`). The
+dropouts therefore only appeared when the laptop was idle too.
+
+The same rounding also *shows* laptop pixels on the tablet (this and the
+paragraph above are readings of KWin 6.6.6's `RenderViewport`, `Item` and
+Slide sources, not instrumented here): during a desktop switch KWin's Slide
+effect repaints every window once per screen,
+translated by that screen's slide offset and clipped to that screen's
+integer `geometry()`, with both the clip and the window rectangle rounded
+outward. A window whose frame sits exactly on the shared edge (an X11 window
+maximised on the laptop, plus Breeze's 1 px active-window outline) then
+paints a 1–2 device px column into the tablet's frame at every fractional
+offset of the animation. Since 2026-09-13 the host leaves a one-logical-pixel
+gap (`--gap`, default 1; `--gap 0` restores KWin's touching placement) and
+nudges x so that `x × scale` is a whole device pixel (1464 × 1.5 = 2196):
+the rounded edges no longer meet. The gap was checked live only in the
+user's own layout (tablet on the *left* at scale 2, laptop moved from 1480
+to 1481 with `kscreen-doctor`), where the 2 px column stopped appearing;
+the host's own right-side placement (1464 at scale 1.5) has not been
+restarted since. A ~100 px soft gradient at the boundary during desktop
+switches remained in that layout; it looks like a window drop shadow, which
+KWin paints across outputs regardless of placement, but its cause was not
+established. The pointer still crosses a gap (`Workspace::outputAt` picks
+the nearest output); the cost is that KWin now treats the boundary as an
+outer screen edge, so dragging a window against it quick-tiles instead of
+crossing.
 
 **Fix.** Video liveness is now separate from frame production:
 
@@ -95,8 +120,8 @@ show tab-s9-usb-display.service -p MainPID --value)` for a recovery drill.
 
 **Remaining limits.** Recovery timings were measured with synthetic motion;
 on a still desktop a reconnect shows the last picture until the next change
-(the encoder cannot produce an IDR without a frame). The one-pixel output
-overlap above is unfixed. The decoder watchdog's escalation past the first
+(the encoder cannot produce an IDR without a frame). The output gap above was
+checked by eye only, in the tablet-left layout (no damage trace was re-run). The decoder watchdog's escalation past the first
 rebuild was exercised only in code review, not live (the drills recover at
 the first step). Pen contacts are lifted by the same path as touch but were
 not exercised with a real pen during a drop.

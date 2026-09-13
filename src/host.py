@@ -174,7 +174,7 @@ def _resolve_mode_size(output):
     return width, height
 
 
-def compute_virtual_position(current_outputs, previous_names):
+def compute_virtual_position(current_outputs, previous_names, gap=1, scale=None):
     """Compute the position to place the virtual output to the RIGHT of all
     existing enabled physical outputs, using non-negative coordinates.
 
@@ -183,8 +183,25 @@ def compute_virtual_position(current_outputs, previous_names):
     collapse the result to (0, 0) when an enabled physical output exists --
     that would place the virtual output directly on top of it.
 
-    Returns (x, y) where y is 0 and x is at the right edge of the rightmost
-    physical output's logical extent.
+    The right edge is the physical output's *integer* logical width, rounded
+    the way KWin's LogicalOutput::geometry() rounds it (2560 / 1.75 =
+    1462.86 -> 1463).  ``gap`` logical pixels are then left between the two
+    outputs.  With ``gap == 0`` the outputs touch exactly as KWin itself would
+    place them, but a window whose frame sits on that shared edge leaks a
+    1-2 device pixel column into the virtual output whenever an effect
+    repaints it translated (KWin's Slide desktop switch clips per screen with
+    both the clip and the window rectangle rounded outward).  A gap of one
+    logical pixel keeps the two rounded edges apart.  KWin then treats the
+    shared boundary as an outer screen edge (quick-tile on drag, edge
+    actions); the pointer still crosses, it picks the nearest output.
+
+    When ``scale`` (the virtual output's scale) is given, x is nudged right by
+    up to a few pixels so that ``x * scale`` is a whole device pixel: a
+    half-pixel offset (1463 * 1.5 = 2194.5) makes KWin round paint and damage
+    differently and re-render a 2 px column on every repaint next to the
+    boundary.  Only applied when a gap is requested.
+
+    Returns (x, y) where y is 0.
     """
     right_edge = 0
     seen_enabled = False
@@ -209,7 +226,15 @@ def compute_virtual_position(current_outputs, previous_names):
     # there is nothing to avoid overlapping; place at the origin.
     if not seen_enabled:
         return (0, 0)
-    return (max(0, right_edge), 0)
+    gap = max(0, int(gap))
+    x = max(0, right_edge) + gap
+    if gap and isinstance(scale, (int, float)) and not isinstance(scale, bool) and scale > 0:
+        for extra in range(4):
+            device = (x + extra) * scale
+            if abs(device - round(device)) < 1e-6:
+                x += extra
+                break
+    return (x, 0)
 
 
 RESYNC = object()  # queue marker: the client must wait for the next keyframe
@@ -886,7 +911,7 @@ class Host:
             subprocess.run(['kscreen-doctor', *settings], capture_output=True, check=True)
         configure(f'output.{name}.addCustomMode.{a.width}.{a.height}.{a.fps * 1000}.reduced')
         # Place virtual output to the RIGHT of all existing physical outputs
-        x, y = compute_virtual_position(current, self.previous)
+        x, y = compute_virtual_position(current, self.previous, gap=a.gap, scale=a.scale)
         configure(f'output.{name}.mode.{a.width}x{a.height}@{a.fps}',
             f'output.{name}.scale.{a.scale}', f'output.{name}.position.{x},{y}', f'output.{name}.enable')
         final = next(o for o in outputs() if o['name'] == name)
@@ -1455,6 +1480,11 @@ if __name__ == '__main__':
     parser.add_argument('--fps', type=int, choices=[30, 60, 90, 120])
     parser.add_argument('--bitrate', type=int)
     parser.add_argument('--scale', type=float, default=1.5)
+    parser.add_argument('--gap', type=int, default=1, metavar='PX',
+                        help='logical pixels left between the laptop and the virtual output '
+                             '(default 1: stops windows on the shared edge from painting a '
+                             '1-2 px column onto the tablet during desktop-switch animations; '
+                             '0 makes the outputs touch exactly as KWin would place them)')
     parser.add_argument('--capture-memory', choices=['native', 'va', 'system', 'gl'], default='native',
                         help='native: PipeWire consumer in native/tabs9-capture (default; falls back to va)')
     parser.add_argument('--rate-control', choices=['cbr', 'vbr', 'cqp'], default='cbr')

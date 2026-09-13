@@ -203,7 +203,7 @@ case "${1:-help}" in
     echo '              {test-motion [--seconds N]|bench-capture [--seconds N]}'
     echo '  start options: --profile smooth|balanced|light (120/60/30 fps)'
     echo '                 --resolution 2960x1848  --fps 30|60|90|120'
-    echo '                 --bitrate 40000  --scale 1.5  --capture-memory va|system|gl'
+    echo '                 --bitrate 40000  --scale 1.5  --gap 1  --capture-memory va|system|gl'
     echo '  bench-capture compares both capture paths under continuous motion;'
     echo '  it needs the two KDE sharing dialogs answered once per path.'
     ;;
