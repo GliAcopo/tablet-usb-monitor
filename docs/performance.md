@@ -78,12 +78,12 @@ stated, synthetic motion from `scripts/gpu-motion-test.py`).**
 
 | check | result |
 |---|---|
-| idle soak, 60 s motion / 70 s no repaint, 14:55:38–15:22:58 (27 min, stopped early on request) | 156 motion windows: **58.6 fps median, min 56.0**, capture→ack p95 **27.4 ms** (worst 28.8), render p95 19.6 ms; **140 s of 0.0 fps windows** covered by heartbeats (1 → 141); **0 disconnects, 0 state transitions, 0 resyncs**; no window with acks behind capture |
+| idle soak, 60 s motion / 70 s no repaint, 14:55:38–15:22:58 (27 min, stopped early on request — not the 30 min asked for) | 156 motion windows: **58.6 fps median, min 56.0**, capture→ack p95 **27.4 ms** (worst 28.8), render p95 19.6 ms; **140 s of 0.0 fps windows** covered by heartbeats (1 → 141); **0 disconnects, 0 state transitions, 0 resyncs**; no window with acks behind capture. `render_stalls_over_100ms` summed to 3487, of which 3463 were in windows below 30 fps: on a near-idle output frames genuinely arrive 70–150 ms apart, so the metric counts idleness; 10 in motion windows, at the motion→static boundaries |
 | 5× host-side socket drop (`SIGUSR1`), motion running | fault seen +0.19 s, **streaming again +0.72–0.74 s** |
 | 5× app-side socket drop (drill) | **+0.77–0.80 s** |
 | 5× decoder rebuild (drill) | codec back **+0.28–0.32 s**, one video connection throughout, ack rate stayed 57.6–59.4 fps |
-| `--profile balanced --fps 120`, 200 s, 3 socket drops + 2 rebuilds | **110.5 fps median (min 100.6)**, capture→ack p95 22.3 ms, render p95 10.9 ms; drops recovered in 0.53 s; rebuilds 0.06 s |
-| touch, motion running | corner and centre taps landed in all 5 zones; a two-finger pinch held through a socket drop: app lifted 2 contacts, **0 rejected messages**, the next pinch delivered (274 updates, 2 points) |
+| `--profile balanced --fps 120`, 200 s, 3 socket drops + 2 rebuilds | **110.5 fps median (min 100.6)**, capture→ack p95 22.3 ms, render p95 10.9 ms; drops recovered in 0.53 s; rebuilds 0.06 s. Telemetry counted 4 disconnects: the 4th is the app's own `configureStream` rebuild at host start (greeting said 120 fps, the decoder was built for 60 → `stop()/start()`, socket included), confirmed with an uncleared log |
+| touch, motion running, two clean runs (taps + pinch through a drop + pinch after, `mt-inject` with per-step dx = −1) | run 1: 6 of 7 touch-begins seen by the test window (all 5 zones hit, both pinches' updates arrived, one begin frame not seen — not investigated), 152 updates; run 2: **7 of 7**, 274 updates, 2 points; both runs **0 rejected, 0 follow-on rejected** on the host; the app lifted 2 contacts at the drop each time. Two earlier attempts showed 2 rejections + 244/540 follow-ons: my `mt-inject` call used dx = −200 *per step*, which put the fingers off-screen at step 1 (the host correctly refused the non-normalised coordinates) — a test error, kept here so nobody re-derives it |
 | pixels | the synthetic pattern was on the tablet for every run (rendered acks track capture within 0.4 fps) |
 | tests | host: 156 unit tests (`python3 -m unittest discover -s tests`); client: 5 JVM tests run by `scripts/build-android.sh` |
 
