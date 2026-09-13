@@ -63,7 +63,8 @@ is `local.tabs9.usbdisplay`.
 ./tabs9 setup                 # checksum-pinned ADB into .local/, nothing system-wide
 ./tabs9 doctor                # checks portals, GStreamer, kscreen-doctor, USB device
 scripts/setup-native.sh       # builds native/tabs9-capture (Debian/Ubuntu)
-scripts/build-android.sh      # or download the release APK
+scripts/build-android.sh      # builds .local/artifacts/tab-s9-usb-display-debug.apk ...
+gh release download v0.1.0 -p '*.apk' -D .local/artifacts   # ... or download it (check the SHA-256 in the release notes)
 .local/platform-tools/adb -d install -r .local/artifacts/tab-s9-usb-display-debug.apk
 ./tabs9 start --profile balanced
 ```
