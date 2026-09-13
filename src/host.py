@@ -510,8 +510,8 @@ class Host:
         self.connect_eis(target)
         print('Tablet input mode:', self.touch.mode, flush=True)
         if self.gestures is not None:
-            print(f'Tablet gestures: 3 fingers = windows, 4 fingers = desktops '
-                  f'(fingers land within {self.gestures.hold_ms} ms)', flush=True)
+            print(f'Tablet gestures: 3 fingers = windows (up: Overview, down: Grid), '
+                  f'4 fingers = desktops (fingers land within {self.gestures.hold_ms} ms)', flush=True)
         self.fd = self.portal.OpenPipeWireRemote(self.session, dbus.Dictionary({}, signature='sv')).take()
         self.capture_node = int(node)
         self.start_pipeline()
@@ -1266,10 +1266,13 @@ class Host:
     # Fingers move left, content moves left: the window/desktop "to the
     # right" comes in, as with KWin's own touchpad gestures. Invoked without a
     # modifier held, "Walk Through Windows" is KWin's one-step switch: it
-    # activates the next window immediately, no popup.
+    # activates the next window immediately, no popup. Up/down mirror the
+    # laptop touchpad's four-finger swipes (Overview and the desktop grid).
     GESTURE_SHORTCUTS = {
         (3, 'left'): 'Walk Through Windows',
         (3, 'right'): 'Walk Through Windows (Reverse)',
+        (3, 'up'): 'Overview',
+        (3, 'down'): 'Grid View',
         (4, 'left'): 'Switch One Desktop to the Right',
         (4, 'right'): 'Switch One Desktop to the Left',
     }

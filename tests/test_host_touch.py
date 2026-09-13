@@ -361,10 +361,24 @@ class HostTouchIntegrationTests(unittest.IsolatedAsyncioTestCase):
                          ["Switch One Desktop to the Right", "Switch One Desktop to the Left"])
         self.assertEqual(value.touch.messages, [])
 
+    async def test_three_finger_swipe_up_opens_the_overview(self):
+        value = gesture_host()
+        for slot in (0, 1, 2):
+            value.handle_touch({"type": "touch", "action": 0, "slot": slot, "x": 0.3 + 0.05 * slot, "y": 0.6}, 4)
+        for step in (1, 2, 3):
+            for slot in (0, 1, 2):
+                value.handle_touch({"type": "touch", "action": 2, "slot": slot,
+                                    "x": 0.3 + 0.05 * slot, "y": 0.6 - 0.05 * step}, 4)
+        for slot in (0, 1, 2):
+            value.handle_touch({"type": "touch", "action": 1, "slot": slot, "x": 0.0, "y": 0.0}, 4)
+
+        self.assertEqual(value.kglobalaccel.invoked, ["Overview"])
+        self.assertEqual(value.touch.messages, [])
+
     async def test_unmapped_swipe_does_nothing(self):
         value = gesture_host()
 
-        self.assertFalse(value.perform_gesture(3, "up"))
+        self.assertFalse(value.perform_gesture(4, "up"))
         self.assertFalse(value.perform_gesture(5, "left"))
 
         self.assertEqual(value.kglobalaccel.invoked, [])

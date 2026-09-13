@@ -271,9 +271,10 @@ still uses the portal's pointer calls, which KDE maps correctly.
 ### Swipe gestures
 
 Three fingers swiped sideways switch windows (KWin's Alt+Tab, one step:
-left goes to the next window, right to the previous), four fingers switch
-virtual desktops (left goes to the desktop on the right, as with KWin's
-touchpad gestures). The host recognises them (`src/gestures.py`) and fires
+left goes to the next window, right to the previous), three fingers up open
+the Overview (tap a window to pick it, swipe up again to close it), three
+fingers down the desktop grid, four fingers switch virtual desktops (left
+goes to the desktop on the right, as with KWin's touchpad gestures). The host recognises them (`src/gestures.py`) and fires
 the corresponding KWin global shortcut over D-Bus; the swipe's contacts never
 reach the desktop, so nothing under the fingers is clicked or scrolled. The
 fingers must all land within `--gesture-hold-ms` (120) of the first; the
@@ -281,8 +282,9 @@ first contact of *every* touch is held back for at most that long, which is
 where the classification happens (a tap is delivered the moment it lifts, a
 drag starts on the desktop up to 120 ms late and then catches up).
 `--gestures off` turns this off. Verified live with `scripts/mt-inject`
-swipes: 3-left/3-right changed KWin's active window, 4-left/4-right moved the
-current desktop and back, 0 of the ordinary touches rejected.
+swipes: 3-left/3-right changed KWin's active window, 3-up toggled the
+Overview effect on and off, 4-left/4-right moved the current desktop and
+back, 0 of the ordinary touches rejected.
 
 Two things to know: KWin's Alt+Tab is most-recently-used order, so two
 three-finger swipes to the left return to the starting window (as two taps
