@@ -170,6 +170,36 @@ reproduction command are in [docs/performance.md](docs/performance.md).
   tablet's USB port does not become a DisplayPort input.
 - The APK is debug-signed and not on any store.
 
+## Gaming on the tablet (read before trying)
+
+Not benchmarked with a real game; what follows combines the pipeline design
+with the synthetic-motion measurements above. See
+[docs/performance.md](docs/performance.md#games-and-hybrid-gpus-not-measured)
+for the reasoning.
+
+- **The tablet does not add a GPU hop.** On a hybrid laptop (Intel iGPU +
+  NVIDIA dGPU) KWin composites on the Intel GPU and a game rendered on the
+  NVIDIA GPU (`prime-run`) already hands every frame to the Intel side, for the
+  built-in panel too. The virtual output is composited there like any monitor;
+  the extra work is colour conversion and HEVC encoding on the Intel **media
+  engine** (fixed-function, ~3–4 ms + ~7 ms per frame), not on the 3D units.
+  The NVENC route was tried and rejected: it forces a cross-GPU readback.
+- **Frame rate:** the game's own fps are not touched by the encoder. The
+  virtual output delivers a solid 59–60 fps at 60 Hz and ~111 fps at 120 Hz;
+  cap the game there, anything faster is heat for nothing.
+- **Latency is the real cost.** A frame appears on the tablet roughly
+  35–50 ms (2–3 frames at 60 Hz) after KWin rendered it: capture → tablet
+  acknowledgement p95 22–28 ms plus tablet decode/render p95 12–22 ms.
+  Playing with the laptop's mouse and keyboard while watching the tablet keeps
+  the game's input path unchanged — only the picture is late. Touch control
+  goes through the portal and adds its own delay. Fine for casual,
+  turn-based and strategy games; not for competitive shooters or rhythm games.
+- **Thermals:** both GPUs and the media engine busy in one chassis.
+- **Unmeasured:** the per-frame PCIe import of a large dGPU buffer while KWin
+  also composites the laptop screen. To get a number, run the game with
+  `prime-run` on the tablet and read `./tabs9 logs` (unique fps, capture→ack
+  p95) while it runs; no restart or setting change is needed.
+
 ## Reporting problems
 
 Open an issue with the output of `./tabs9 doctor` and `./tabs9 logs`, your

@@ -428,6 +428,53 @@ scripts/benchmark_transport.py --bitrate-kbps 60000 --fps 120 --frames 240
 The benchmark uses only generated zero bytes and an ephemeral local port.  It
 does not connect to the host service, ADB, or the tablet.
 
+## Games and hybrid GPUs (not measured)
+
+Nothing in this file was measured with a game; the soaks used
+`scripts/gpu-motion-test.py`, a synthetic full-frame motion pattern drawn by
+the Intel GPU. This section states what the design implies so that a gaming
+attempt starts from the right expectations.
+
+**Where the frames go.** The host laptop is a hybrid machine (Meteor Lake Arc
+iGPU, RTX 4050). KWin runs on the Intel GPU and drives both the panel and the
+virtual output. A game rendered on the NVIDIA GPU through PRIME render offload
+delivers each finished frame to KWin as a DMA-BUF across PCIe; that happens
+for the built-in panel as much as for the tablet, so the virtual output adds
+no GPU-to-GPU step. What it adds, compared with an ordinary monitor, is one
+more 2960 × 1848 composite on the Intel 3D engine, the screencast buffer
+(zero-copy into `native/tabs9-capture`), the VA-API colour conversion and the
+HEVC encode — the latter two on the Intel media engine, whose fixed-function
+units are largely independent of the 3D units that composite the game's
+frames (conversion 3–4 ms, encoder ~7 ms per frame, measured earlier in this
+file). The NVIDIA/NVENC route was measured and rejected above because it
+forces a full-frame readback and upload between GPUs. The helper therefore
+selects the Intel render node explicitly (see the 2026-09-13 regression: on
+one boot `renderD128` was NVIDIA).
+
+**Expected behaviour.**
+
+- Game frame rate: unaffected by the encoder. The presented rate is bounded
+  by the virtual output: 59–60 fps at 60 Hz, 110–113 fps at 120 Hz (KWin's
+  own recording ceiling). Capping the game there avoids wasted GPU time.
+- Bandwidth: one 2960 × 1848 BGRA frame is ~22 MB; at 60 fps that is
+  ~1.3 GB/s across PCIe for the PRIME import, well inside the link.
+- Latency: capture → tablet acknowledgement p95 was 22–28 ms and the
+  tablet's decode/render interval p95 12–22 ms in the soaks, so a frame is
+  visible roughly 35–50 ms after KWin rendered it — two to three 60 Hz
+  frames. Playing with the laptop's own mouse and keyboard leaves the game's
+  input path untouched; only the display is late. Touch through the portal
+  adds the touch path's own latency on top.
+- Thermals: dGPU rendering, iGPU compositing and the media engine all active
+  at once.
+
+**What a first measurement should record.** Run a game with `prime-run`
+fullscreen on the tablet, at a 60 fps cap, and read `./tabs9 logs` while it
+runs: unique fps, capture → ack p95, stalls. The unknown is whether the
+per-frame PCIe import plus the laptop panel's own compositing leaves the
+Intel 3D engine enough time to composite the virtual output every frame;
+a shortfall would show as unique fps dropping while capture → ack stays
+within its usual range (the encoder waiting for frames, not falling behind).
+
 ## Instrumentation for the next run
 
 Aggregate these fields over five-second windows and print only timing metadata:
