@@ -7,8 +7,8 @@ import android.util.Log
 
 /**
  * Recovery drills for debug builds:
- *   adb shell am broadcast -a local.tabs9.usbdisplay.DRILL_DROP_VIDEO   (video socket loss)
- *   adb shell am broadcast -a local.tabs9.usbdisplay.DRILL_RESET_DECODER (decoder failure)
+ *   adb shell am broadcast -n local.tabs9.usbdisplay/.DrillReceiver -a local.tabs9.usbdisplay.DRILL_DROP_VIDEO   (video socket loss)
+ *   adb shell am broadcast -n local.tabs9.usbdisplay/.DrillReceiver -a local.tabs9.usbdisplay.DRILL_RESET_DECODER (decoder failure)
  * Each goes through exactly the code path the corresponding real fault takes.
  */
 class DrillReceiver : BroadcastReceiver() {

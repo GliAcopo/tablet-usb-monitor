@@ -96,6 +96,7 @@ static struct {
 	uint32_t width, height, slots;
 	uint64_t modifier;
 	const char *render_node;
+	bool trace_damage;
 
 	struct pw_thread_loop *loop;
 	struct pw_context *context;
@@ -358,6 +359,27 @@ static void on_process(void *data)
 	bool corrupted = h && (h->flags & SPA_META_HEADER_FLAG_CORRUPTED);
 	int slot = -1;
 
+	if (S.trace_damage) {
+		static uint64_t last_log;
+		if (dequeued - last_log > 1000000000ull) {
+			last_log = dequeued;
+			struct spa_meta *dm = spa_buffer_find_meta(b->buffer, SPA_META_VideoDamage);
+			char line[512]; int n = snprintf(line, sizeof line, "tabs9-capture: damage");
+			if (dm) {
+				struct spa_meta_region *r;
+				spa_meta_for_each(r, dm) {
+					if (!spa_meta_region_is_valid(r)) break;
+					n += snprintf(line + n, sizeof line - (size_t)n, " %ux%u+%d+%d",
+						r->region.size.width, r->region.size.height, r->region.position.x, r->region.position.y);
+					if (n >= (int)sizeof line - 32) break;
+				}
+			} else {
+				n += snprintf(line + n, sizeof line - (size_t)n, " (no damage meta)");
+			}
+			fprintf(stderr, "%s\n", line);
+		}
+	}
+
 	if (!corrupted && d->chunk->size != 0) {
 		pthread_mutex_lock(&S.queue_lock);
 		for (uint32_t i = 0; i < S.slots; i++)
@@ -495,7 +517,14 @@ static void on_param_changed(void *data, uint32_t id, const struct spa_pod *para
 		SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
 		SPA_PARAM_META_type, SPA_POD_Id(SPA_META_VideoCrop),
 		SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_region)));
-	pw_stream_update_params(S.stream, params, 3);
+	/* Damage rectangles (geometry only) tell what keeps an "idle" output
+	 * busy; logged once a second when TABS9_TRACE_DAMAGE is set. */
+	params[3] = spa_pod_builder_add_object(&b,
+		SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
+		SPA_PARAM_META_type, SPA_POD_Id(SPA_META_VideoDamage),
+		SPA_PARAM_META_size, SPA_POD_CHOICE_RANGE_Int(sizeof(struct spa_meta_region) * 16,
+			sizeof(struct spa_meta_region) * 1, sizeof(struct spa_meta_region) * 16));
+	pw_stream_update_params(S.stream, params, 4);
 }
 
 static void on_state_changed(void *data, enum pw_stream_state old, enum pw_stream_state state,
@@ -562,6 +591,7 @@ int main(int argc, char **argv)
 	/* The host selects the encoder's Intel device. DRM numbering changes
 	 * across boots on hybrid-GPU machines; never guess renderD128 here. */
 	S.render_node = NULL;
+	S.trace_damage = getenv("TABS9_TRACE_DAMAGE") != NULL;
 	static const struct option opts[] = {
 		{ "node", required_argument, NULL, 'n' },
 		{ "width", required_argument, NULL, 'w' },

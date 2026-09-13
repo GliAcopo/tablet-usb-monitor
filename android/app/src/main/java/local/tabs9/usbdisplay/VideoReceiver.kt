@@ -626,7 +626,15 @@ class VideoReceiver {
                 val connectedNanos = System.nanoTime()
 
                 receiveLoop@ while (isRunning && current === connection) {
-                    val codec = mediaCodec ?: break
+                    // A decoder rebuild (error or watchdog) briefly leaves no
+                    // codec; the socket is kept so the stream resumes at the
+                    // IDR the rebuild asked for, without a reconnect.
+                    var codec = mediaCodec
+                    var waitedMs = 0
+                    while (codec == null && isRunning && current === connection && waitedMs < 2000) {
+                        delay(50); waitedMs += 50; codec = mediaCodec
+                    }
+                    if (codec == null) { reason = "no decoder for 2 s"; break@receiveLoop }
                     val packet = try {
                         framer.next()
                     } catch (e: java.net.SocketTimeoutException) {
