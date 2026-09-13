@@ -57,6 +57,9 @@ class TouchCapture {
     @Volatile private var inputSuspended = false
     private val activeTouches = HashMap<Int, Pair<Float, Float>>()
     private var penContact: Pair<Double, Double>? = null
+    /** Slots lifted by a suspension: their gesture is over for the host; ignore it until a new down. */
+    private val cancelledSlots = HashSet<Int>()
+    private var penCancelled = false
     private val contactLock = Object()
 
     @Volatile var hostStreamConfig = HostStreamConfig()
@@ -478,6 +481,12 @@ class TouchCapture {
 
     private fun emitPen(x: Double, y: Double, pressure: Double,
                         tiltX: Double, tiltY: Double, eraser: Boolean, action: Int) {
+        val skip = synchronized(contactLock) {
+            if (action == 0) { penCancelled = false; false }
+            else if (penCancelled && action in 1..2) { if (action == 1) penCancelled = false; true }
+            else false
+        }
+        if (skip) return
         val msg = JSONObject().apply {
             put("type", "pen")
             put("x", x)
@@ -528,6 +537,12 @@ class TouchCapture {
 
     private fun sendTouch(x: Float, y: Float, pressure: Double,
                           action: Int, slot: Int) {
+        val skip = synchronized(contactLock) {
+            if (action == 0) { cancelledSlots.remove(slot); false }
+            else if (slot in cancelledSlots) { if (action == 1) cancelledSlots.remove(slot); true }
+            else false
+        }
+        if (skip) return
         val msg = JSONObject().apply {
             put("type", "touch")
             put("x", x.toDouble())
@@ -559,6 +574,12 @@ class TouchCapture {
         }
         for ((slot, at) in touches) sendTouch(at.first, at.second, 0.0, 1, slot)
         pen?.let { emitPen(it.first, it.second, 0.0, 0.0, 0.0, false, 1) }
+        synchronized(contactLock) {
+            // The rest of those gestures (moves, the eventual up) must not
+            // reach the host: it has already seen the release.
+            for ((slot, _) in touches) cancelledSlots.add(slot)
+            if (pen != null) penCancelled = true
+        }
         if (touches.isNotEmpty() || pen != null) {
             Log.i(TAG, "Input suspended: lifted ${touches.size} touch contact(s)" +
                 if (pen != null) " and the pen" else "")
