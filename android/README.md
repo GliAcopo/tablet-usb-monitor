@@ -35,15 +35,21 @@ The host greeting and every reply after applying settings carry the complete
 applied stream state:
 
 ```json
-{"status":"connected","codec":"hevc","width":2960,"height":1848,"fps":120,"bitrate":60000,"pen_only":false}
+{"status":"connected","protocol":2,"codec":"hevc","width":2960,"height":1848,"fps":120,"bitrate":60000,"pen_only":false,
+ "features":["keyframe_request","render_ns","video_heartbeat"]}
 ```
+
+`features` names optional behaviours the host implements; the client names
+the ones it implements in its `config` message (`"features":["video_heartbeat"]`),
+and each side enables a feature only when the other named it. A greeting
+without `features` is a legacy host.
 
 The client uses those values, rather than local preferences, to configure the
 decoder and populate the UI. A settings request remains compatible with
 UScreen:
 
 ```json
-{"type":"config","fps":120,"bitrate":60000}
+{"type":"config","protocol":2,"features":["video_heartbeat"],"fps":120,"bitrate":60000}
 ```
 
 Once per second while video is decoding, the client sends measured tablet
@@ -77,6 +83,35 @@ applied state (`pen_only` false), which the client treats as authoritative, so
 the toggle reverts instead of showing a mode the host never entered.
 
 Frame acknowledgements and touch/pen messages retain the upstream format.
-The video socket receives a four-byte big-endian packet length, followed by
-packet type `1`, a four-byte big-endian sequence number, and one Annex-B HEVC
-access unit. Codec headers may be carried in-band.
+
+## Video socket
+
+Every packet is a four-byte big-endian length followed by a payload whose
+first byte is the type:
+
+| type | payload | meaning |
+|---|---|---|
+| `0` | codec configuration | optional; headers are normally in-band with each IDR |
+| `1` | four-byte big-endian sequence number + one Annex-B HEVC access unit | a frame |
+| `2` | four-byte big-endian counter (payload is exactly 5 bytes) | heartbeat |
+
+The compositor sends no frame while the desktop is static, so without the
+heartbeat a client cannot tell "nothing changed" from "the host is gone".
+A host that both sides negotiated `video_heartbeat` with writes a heartbeat
+once per second whenever it has had nothing else to write for a second
+(never queued behind frames, same writer, whole packets only). The client
+consumes it without decoding or counting it and refreshes its 10 s
+transport deadline. With a heartbeat-capable host, that deadline expiring is a
+fault and the client reconnects; with a legacy host, silence keeps the
+connection and the last picture. A deadline expiring *inside* a packet, an
+impossible length or an unknown type is a framing failure and always
+reconnects.
+
+Every video connection starts at an IDR: the host asks its encoder for one
+when a client connects, and the client discards dependent frames until it
+arrives. The client reports `streaming` only once a frame of the current
+connection has been rendered; a connection lost after that keeps the
+picture on screen and shows a small "Reconnecting video" indicator, and
+gestures pause (held contacts are lifted) until rendering resumes. Debug
+builds accept two drills over adb (`DrillReceiver`): socket loss and decoder
+rebuild.

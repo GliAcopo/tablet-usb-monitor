@@ -1,5 +1,106 @@
 # Performance analysis
 
+## 2026-09-13 incident: video dropouts every few minutes (fixed)
+
+**Symptom.** While using the tablet as a desktop, the picture was replaced
+by the app's "waiting for the host" screen for about a second, at
+irregular intervals of minutes; touch kept working. The app logged
+`Stream read timeout, reconnecting` (14:08:55, 14:10:41, 14:10:52,
+14:11:02, 14:11:13, 14:12:42, 14:14:08, 14:14:19 in the reported session).
+
+**Root cause, demonstrated.** Every one of those timestamps falls inside a
+run of host telemetry windows reporting `capture_fps 0.0` — twelve
+consecutive windows at 14:08:03–14:08:58, nine at 14:10:33–14:11:13, and
+so on — with `native_dropped 0`, `import_failures 0`, `client_resyncs 0`
+and `native_pending 0` throughout. KWin sends a screencast frame only when
+something on the output changed; a static desktop produces nothing, the
+host had nothing to write, and the client's 10 s socket read deadline
+(`soTimeout = 10000`) expired. The client treated that as a dead
+transport: it closed the socket, called `onDisconnected`, and the activity
+covered the surface with the startup screen until the *first frame* of the
+next connection arrived — which, on a still desktop, was whenever the user
+next moved something. Not a capture stall, not a transport fault, not a
+decoder failure: an idle desktop misread as a broken link. The "every few
+minutes" cadence is simply how often nothing changed for 10 s.
+
+Why the earlier soaks never saw it: they ran continuous synthetic motion.
+And why an "idle" tablet usually still captured ~15 fps here: KWin rounds
+the laptop panel's logical width (2560 / 1.75 = 1462.86 → 1463), so the
+virtual output placed at x = 1463 shares one logical pixel with it, and any
+repaint near the laptop's right edge (a terminal, a browser) re-renders a
+2 px column of the tablet (`TABS9_TRACE_DAMAGE=1` logs the rectangles:
+`damage 2x1333+0+40`). The dropouts therefore only appeared when the laptop
+was idle too. That overlap is a separate placement issue, left as a
+follow-up (a 1 px gap would stop the pointer from crossing).
+
+**Fix.** Video liveness is now separate from frame production:
+
+- The host writes a 5-byte heartbeat packet (type `2`) on the video socket
+  once per second whenever it has had nothing else to write — from the same
+  single-writer coroutine, never queued behind frames — but only to a client
+  that advertised `video_heartbeat` in its `config` message (an older client
+  reconnects on an unknown packet type). The host greeting lists
+  `video_heartbeat` in `features`. A new video connection also asks the
+  encoder for an IDR immediately instead of waiting for the periodic one.
+- The client consumes heartbeats without decoding or counting them and keeps
+  the 10 s deadline as a *transport* deadline: with a heartbeat-capable host
+  its expiry is a real fault and the client reconnects; with a legacy host
+  silence keeps the connection and the picture. A deadline expiring inside a
+  packet, an impossible length or an unknown type is a framing failure
+  (`StreamFramer`, pure Kotlin, JVM-tested).
+- Each connection owns its socket and callbacks (`Connection` generation);
+  `stop()` closes only its own; a decoder rebuild keeps the socket and
+  resumes at the IDR it asks for.
+- States `WAITING / STREAMING / RECOVERING / DISCONNECTED`: `STREAMING`
+  only after the first *rendered* frame of the connection; `RECOVERING`
+  keeps the last picture and shows a small "Reconnecting video…" chip;
+  the startup screen returns only if recovery fails for 15 s. While
+  recovering, gestures pause and any held contact is lifted at its last
+  position; the remainder of that gesture is dropped until its next down.
+- Decoder watchdog: frames submitted but nothing rendered for 3 s →
+  keyframe request; still nothing → one decoder rebuild; still nothing →
+  reconnect with 0.5/1/2/4 s backoff. It cannot fire on an idle desktop
+  (nothing is submitted).
+- Diagnostics: host telemetry `video_clients`, `video_connects`,
+  `video_disconnects`, `last_video_disconnect`, `heartbeats_sent`; host log
+  lines per video connection with the reason it ended; app log lines per
+  connection (packets, last seq received/rendered, reason) and per state
+  transition. `SIGUSR1` to the host drops the video clients; debug APKs
+  accept `DRILL_DROP_VIDEO` / `DRILL_RESET_DECODER` broadcasts
+  (`-n local.tabs9.usbdisplay/.DrillReceiver`).
+
+Not done on purpose: the timeout was not raised, the connection screen was
+not merely hidden, the host service is never restarted for a client fault,
+and the user's fps setting is untouched.
+
+**Evidence (all on the same hardware, host `--profile balanced` unless
+stated, synthetic motion from `scripts/gpu-motion-test.py`).**
+
+| check | result |
+|---|---|
+| idle soak, 60 s motion / 70 s no repaint, 14:55:38–15:22:58 (27 min, stopped early on request) | 156 motion windows: **58.6 fps median, min 56.0**, capture→ack p95 **27.4 ms** (worst 28.8), render p95 19.6 ms; **140 s of 0.0 fps windows** covered by heartbeats (1 → 141); **0 disconnects, 0 state transitions, 0 resyncs**; no window with acks behind capture |
+| 5× host-side socket drop (`SIGUSR1`), motion running | fault seen +0.19 s, **streaming again +0.72–0.74 s** |
+| 5× app-side socket drop (drill) | **+0.77–0.80 s** |
+| 5× decoder rebuild (drill) | codec back **+0.28–0.32 s**, one video connection throughout, ack rate stayed 57.6–59.4 fps |
+| `--profile balanced --fps 120`, 200 s, 3 socket drops + 2 rebuilds | **110.5 fps median (min 100.6)**, capture→ack p95 22.3 ms, render p95 10.9 ms; drops recovered in 0.53 s; rebuilds 0.06 s |
+| touch, motion running | corner and centre taps landed in all 5 zones; a two-finger pinch held through a socket drop: app lifted 2 contacts, **0 rejected messages**, the next pinch delivered (274 updates, 2 points) |
+| pixels | the synthetic pattern was on the tablet for every run (rendered acks track capture within 0.4 fps) |
+| tests | host: 156 unit tests (`python3 -m unittest discover -s tests`); client: 5 JVM tests run by `scripts/build-android.sh` |
+
+Reproduce: `./tabs9 start --profile balanced`, then
+`QT_QPA_PLATFORM=wayland python3 scripts/gpu-motion-test.py --seconds 300 --motion 60 --static 70`
+and watch `./tabs9 logs` for `heartbeats_sent` rising during the static
+phases with `video_disconnects` unchanged; `kill -USR1 $(systemctl --user
+show tab-s9-usb-display.service -p MainPID --value)` for a recovery drill.
+
+**Remaining limits.** Recovery timings were measured with synthetic motion;
+on a still desktop a reconnect shows the last picture until the next change
+(the encoder cannot produce an IDR without a frame). The one-pixel output
+overlap above is unfixed. The decoder watchdog's escalation past the first
+rebuild was exercised only in code review, not live (the drills recover at
+the first step). Pen contacts are lifted by the same path as touch but were
+not exercised with a real pen during a drop.
+
 ## 2026-09-13 regression: native capture selected the wrong GPU
 
 The reported unusable `./tabs9 start --profile balanced` session did not use

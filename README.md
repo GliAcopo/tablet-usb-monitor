@@ -113,6 +113,15 @@ private was captured.
   render p95 20 ms (worst 24), 0 stalls, 2868 input messages, 0 rejected.
   With the bitrate doubled to 60 Mbit/s the tablet receives 59 Mbit/s and
   capture→ack p95 drops to 22 ms: the ADB transport has ≥ 2× headroom.
+  **2026-09-13:** the picture dropping to the app's startup screen every
+  few minutes was an idle desktop misread as a dead link (KWin sends no
+  frame while nothing changes; the app's 10 s read deadline fired). Fixed
+  with a negotiated video heartbeat and an explicit recovery state; a 27 min
+  motion/idle soak, 15 fault drills (socket loss both sides, decoder
+  rebuild) and a held-pinch-through-drop touch check are in
+  [docs/performance.md](docs/performance.md). Rebuild the APK and restart
+  the host together: an old app with a new host keeps working (no
+  heartbeat is sent unless the app asks for it).
   Background/foreground, host restart under a live app, and an app frozen
   for 3 s under load (host and app resync paths both fire) all recover on
   their own within one 5 s window.
