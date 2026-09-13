@@ -5,6 +5,11 @@ This client is adapted from
 `402c94ecd04ebbe33cf7c50d16a9f22c0d73164e`. The original MIT license is in
 `LICENSE-USCREEN`.
 
+The client is not tied to one tablet model: it decodes HEVC with the
+device's hardware `MediaCodec` and takes resolution, frame rate and bitrate
+from the host greeting, so any Android tablet with an HEVC decoder should
+work. Only the Galaxy Tab S9 Ultra has been verified.
+
 The custom build uses application ID `local.tabs9.usbdisplay`, so it can be
 installed beside the upstream `com.uscreen` app. Its launcher activity is:
 

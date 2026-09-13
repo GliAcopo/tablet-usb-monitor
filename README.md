@@ -1,18 +1,94 @@
-# Tab S9 Ultra as a wired Linux monitor
+# Tablet USB monitor
 
-A local Linux host and Android client for a **real extended desktop over USB**.
-The host creates a KDE virtual monitor, captures it through PipeWire as a
-DMA-BUF, converts and compresses it on the same Intel GPU with VA-API HEVC
-(zero copies, no readback), and sends it through authenticated loopback
-sockets forwarded by ADB. Touch comes back through KDE's RemoteDesktop portal
-and is injected with libei. Wi-Fi and USB tethering are not used.
+Use an Android tablet as a **real extended monitor** for a Linux laptop over a
+USB cable. The host creates a KDE virtual output, captures it through PipeWire
+as a DMA-BUF, converts and compresses it on the same Intel GPU with VA-API HEVC
+(zero copies, no readback) and sends it through authenticated loopback sockets
+forwarded by ADB. Touch and pen come back through KDE's RemoteDesktop portal
+and are delivered to the desktop with libei. No root, no kernel module, no
+Wi-Fi, no system-wide installation: everything the tools download lives under
+`.local/` in this directory.
 
-Target: Galaxy Tab S9 Ultra, 2960 × 1848 at 120 Hz. Development machine:
-Ubuntu 26.04, KDE Plasma 6.6.6 Wayland, NVIDIA RTX 4050 Laptop GPU.
+**Tested hardware — the only combination that has ever run this:**
+a **Samsung Galaxy Tab S9 Ultra** (2960 × 1848, 120 Hz) connected to a laptop
+running **Ubuntu 26.04, KDE Plasma 6.6.6 on Wayland, Intel Core Ultra 7 155H
+with its Arc iGPU (i915)**; an NVIDIA RTX 4050 is present but idle in the
+recommended mode. Every number in this file and in
+[docs/performance.md](docs/performance.md) comes from that pair.
 
-## Current verification (live, 2026-09-12)
+## Requirements
 
-All of the following were measured on the device with the synthetic OpenGL
+Read this before anything else; the project is hardware-specific.
+
+**Host**
+
+- Linux with **KDE Plasma 6.6 on Wayland**: the host uses
+  `xdg-desktop-portal-kde` (virtual output creation, screen capture,
+  RemoteDesktop), `kscreen-doctor` (output placement and modes) and KWin's
+  EIS backend for input. GNOME, Sway, Hyprland and X11 sessions are **not
+  supported**.
+- **Intel GPU, Gen12 or newer** (Tiger Lake / Arc / Meteor Lake and later)
+  with the iHD VA-API driver and GStreamer's `vah265enc`. The native capture
+  helper hard-codes the Intel `I915_FORMAT_MOD_4_TILED` DMA-BUF modifier and
+  is the only path that reaches the numbers below. AMD-only machines are
+  **not supported** today; on an NVIDIA-only machine only the slow reference
+  path (`--capture-memory system`, CPU readback → NVENC, ~30 fps) exists.
+- PipeWire ≥ 1.0, Python 3 with `gi` (GStreamer typelibs), `dbus`,
+  `websockets` ≥ 13, and `libei` (`libei.so.1`; on Ubuntu the `libei1` package,
+  pulled in by Xwayland).
+- `scripts/setup-native.sh` unpacks headers with `apt-get download`, so it is
+  Debian/Ubuntu-only; on other distributions build `native/tabs9-capture`
+  against your own `libpipewire-0.3`, `libva`, `libdrm` headers with
+  `make -C native SYSROOT=/usr/include`.
+- A USB 3 **data** cable.
+
+**Tablet**
+
+- Any Android tablet with a hardware HEVC decoder and USB debugging enabled
+  should work in principle: the client negotiates resolution, frame rate and
+  bitrate from the host, so the `2960x1848` defaults are only fallbacks
+  (`--resolution WIDTHxHEIGHT` picks yours). Only the Tab S9 Ultra has been
+  verified.
+- The client APK is debug-signed. Install it from the GitHub release (the
+  SHA-256 is in the release notes) or build it from source with
+  `scripts/build-android.sh`.
+
+Internal names keep the `tabs9` prefix from the first tested device: the CLI
+is `./tabs9`, the systemd user unit is `tab-s9-usb-display.service`, the app id
+is `local.tabs9.usbdisplay`.
+
+## Quick start
+
+```sh
+./tabs9 setup                 # checksum-pinned ADB into .local/, nothing system-wide
+./tabs9 doctor                # checks portals, GStreamer, kscreen-doctor, USB device
+scripts/setup-native.sh       # builds native/tabs9-capture (Debian/Ubuntu)
+scripts/build-android.sh      # or download the release APK
+.local/platform-tools/adb -d install -r .local/artifacts/tab-s9-usb-display-debug.apk
+./tabs9 start --profile balanced
+```
+
+Before the first start: connect the tablet directly with a USB 3 data cable
+(a charging-only cable cannot work), unlock it, enable USB debugging and
+authorize this computer on the tablet. `setup` does not install system
+packages, load kernel modules, change the firewall or enable autostart;
+`doctor` deliberately does not print device serial numbers. The build script
+prints the APK's SHA-256; the toolchain (JDK, SDK, Gradle caches) lives under
+`.local/android-toolchain`. The motion test additionally needs PyQt6. The
+control protocol between host and client is described in
+[android/README.md](android/README.md).
+
+The first start shows two KDE dialogs — "Share virtual screen" and the
+RemoteDesktop/ScreenCast approval. Leave "Allow restoring on future sessions"
+ticked in both: the host stores the restore tokens under `.local/state/` and
+every later start is silent. The host launches the app on the tablet itself
+over ADB; `./tabs9 status`, `./tabs9 logs` and `./tabs9 stop` do what they
+say. `--profile balanced` (native resolution, 60 Hz, HEVC 30 Mbit/s) is the
+measured usable mode; `--fps 120` is available and reaches 110–113 fps.
+
+## Measured results (2026-09-12, commit 5049a41, one machine)
+
+All of the following were measured on the Tab S9 Ultra with the synthetic OpenGL
 motion pattern on the virtual output (`scripts/gpu-motion-test.py`); nothing
 private was captured.
 
@@ -58,44 +134,37 @@ private was captured.
   input mode `touchscreen-eis-ready`, nobody at the keyboard).
 - Host → tablet settings sync and tablet → host input transport verified as
   before.
-- Pen-only mode (tablet as a graphics tablet for the laptop's own screen) is
-  not implemented; the host tells the client so rather than ignoring it.
 
-This is a hardware-specific implementation, not a claim of support for every
-Linux compositor or graphics card. It does not turn the tablet USB port into a
-DisplayPort input. Video is compressed; perfect pixel preservation is not promised.
+**Read together with the 2026-09-13 fix.** The runs above were recorded on a
+boot where `/dev/dri/renderD128` happened to be the Intel GPU. Commit
+`449bd62` made the helper take the render node from the VA encoder instead of
+assuming it (on a hybrid laptop the numbering changes across boots, and the
+silent fallback landed on a slower path). Two fresh 30 s runs after the fix,
+same profile, same synthetic motion: **56.8 / 56.6 unique fps**, capture→ack
+p95 31.1 / 30.9 ms (worst window), render p95 22.6 / 21.8 ms, 0 stalls, no
+fallback. Those are the figures a fresh install should reproduce; the
+59.x runs and the 30-minute soak stand as recorded. Details and the
+reproduction command are in [docs/performance.md](docs/performance.md).
 
-## Setup
+## Limitations
 
-The following host packages must be available: Python 3 with `gi`, `dbus` and
-`websockets`, GStreamer 1.x with PipeWire, HEVC parsing and NVENC plugins,
-`kscreen-doctor`, and a KDE Wayland session with desktop portals. The NVIDIA
-driver must support hardware encoding. The motion test additionally uses PyQt6.
+- **One tested device pair.** Tab S9 Ultra + the laptop above. Other tablets
+  and other Intel machines are expected to work but nobody has tried.
+- **KDE Plasma Wayland only**, Intel GPU only for the usable path (see
+  Requirements).
+- **120 Hz mode delivers 110–113 fps**, not 120: KWin records that many frames
+  on this output even with capture → discard and no pipeline at all.
+- **Pen-only mode** (tablet as a graphics tablet for the laptop's own screen)
+  is not implemented; the host tells the client so rather than ignoring it.
+- Video is compressed HEVC; perfect pixel preservation is not promised. The
+  tablet's USB port does not become a DisplayPort input.
+- The APK is debug-signed and not on any store.
 
-```sh
-./tabs9 setup
-./tabs9 doctor
-```
+## Reporting problems
 
-`setup` downloads checksum-pinned ADB into `.local/`; it does not install system
-packages, load kernel modules, change the firewall or enable autostart.
-
-The Android client is built from source in this repository, with its own pinned
-toolchain under `.local/android-toolchain` (nothing is installed system-wide):
-
-```sh
-scripts/build-android.sh
-.local/platform-tools/adb -d install -r .local/artifacts/tab-s9-usb-display-debug.apk
-```
-
-The build script prints the APK's SHA-256. The host launches the installed
-client itself over ADB — `local.tabs9.usbdisplay/.MainActivity`, with the
-session token as an intent extra — so the app does not need to be started by
-hand. See [android/README.md](android/README.md) for the control protocol.
-
-Connect the tablet directly with a USB 3 data cable, unlock it, enable USB
-debugging, and authorize this computer on the tablet. A charging-only cable
-cannot work. `doctor` deliberately does not print device serial numbers.
+Open an issue with the output of `./tabs9 doctor` and `./tabs9 logs`, your
+Plasma and GPU model, and the tablet model. Both commands avoid device
+serials, tokens and screen content by design; check anyway before pasting.
 
 ## Start and stop
 
@@ -144,7 +213,7 @@ transmitted video stream.
 `xdg-desktop-portal-kde` 6.6.6 forwards `NotifyTouchDown/Motion/Up` to KWin's
 fake-input protocol but never sends `touch_frame`; Wayland clients (Qt, GTK,
 Chromium) only dispatch touch on a frame, so those touches reach no window.
-It also ignores the `stream` argument and injects the coordinates as
+It also ignores the `stream` argument and forwards the coordinates as
 workspace-global, while `xdg-desktop-portal` validates them stream-relative,
 so they can only ever land on whichever output sits at the origin. Both were
 reproduced live. The host instead calls `RemoteDesktop.ConnectToEIS` on the
@@ -278,7 +347,8 @@ or `TABS9_TRACE_CAPTURE=1` to the host. With stored restore tokens no consent
 dialog appears, so it runs unattended.
 
 The motion test displays a synthetic moving pattern on the virtual output and
-reports how many injected touches arrived as native input. Logs contain counts, frame dimensions, timing and negotiated
+reports how many synthetic touches delivered from the tablet arrived as
+native input. Logs contain counts, frame dimensions, timing and negotiated
 formats, not desktop pixels, touch coordinates, clipboard data or device
 identifiers. Runtime tokens, downloads and signing keys belong in ignored
 `.local/` paths. Never commit those files or captured desktop images.
