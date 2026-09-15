@@ -1,5 +1,8 @@
 import asyncio
 import base64
+import os
+import pathlib
+import tempfile
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -134,6 +137,10 @@ def bare_host():
     value.shortcut_components = {}
     value.clip = None
     value.clips = 0
+    value.pen_gestures = 0
+    value.air = None
+    value.tablet_mode = 'screen'
+    value.remote = None
     value.clipboard = []
     value.set_clipboard = lambda mime, data: value.clipboard.append((mime, data))
     return value
@@ -166,6 +173,8 @@ def with_shortcuts(value):
 def gesture_host():
     """A host whose touch path goes through the gesture filter (timers by hand)."""
     value = bare_host()
+    value.pen_actions = dict(host_module.DEFAULT_PEN_ACTIONS)
+    value.air = host_module.AirGestures(value.perform_pen_gesture)
     value.control_owner = object()
     value.control_generation = 4
     with_shortcuts(value)
@@ -617,38 +626,66 @@ class HostTouchIntegrationTests(unittest.IsolatedAsyncioTestCase):
                          [(0, 0), (0, 1), (1, 1), (1, 0)])
         self.assertEqual(value.gestures.state, gestures.IDLE)
 
-    async def test_pen_button_while_hovering_opens_the_launcher(self):
+    async def test_pen_button_click_while_hovering_opens_the_launcher(self):
         value = gesture_host()
         hover = {"type": "pen", "action": 3, "x": 0.2, "y": 0.3}
-        press = {"type": "pen", "action": 5, "x": 0.0, "y": 0.0}
-        release = {"type": "pen", "action": 6, "x": 0.0, "y": 0.0}
 
         value.handle_touch(hover, 4)
-        value.handle_touch(press, 4)
-        value.handle_touch(release, 4)
+        value.handle_touch({"type": "pen", "action": 5, "x": 0.0, "y": 0.0}, 4)
+        value.handle_touch({"type": "pen", "action": 6, "x": 0.0, "y": 0.0}, 4)
 
         self.assertEqual(value.shortcuts.invoked, ["activate application launcher"])
         self.assertEqual(value.pen_buttons, 1)
+        self.assertEqual(value.pen_gestures, 1)
         # The button messages are not input: only the hover reached the pointer.
         self.assertEqual(value.touch.messages, [hover])
+
+    async def test_air_motion_between_button_presses_is_a_gesture(self):
+        value = gesture_host()
+
+        value.handle_touch({"type": "pen", "action": 5, "x": 0.0, "y": 0.0}, 4)
+        for _ in range(5):
+            value.handle_air({"type": "air", "dx": 0.0, "dy": -0.5}, 4)
+        value.handle_touch({"type": "pen", "action": 6, "x": 0.0, "y": 0.0}, 4)
+
+        self.assertEqual(value.shortcuts.invoked, ["Overview"])   # 'up' in the defaults
+        self.assertEqual(value.pen_gestures, 1)
 
     async def test_pen_button_with_the_tip_down_is_left_alone(self):
         value = gesture_host()
         value.touch.pen_down = True
 
         value.handle_touch({"type": "pen", "action": 5, "x": 0.0, "y": 0.0}, 4)
+        value.handle_touch({"type": "pen", "action": 6, "x": 0.0, "y": 0.0}, 4)
 
         self.assertEqual(value.shortcuts.invoked, [])
         self.assertEqual(value.pen_buttons, 0)
 
     async def test_pen_button_off_ignores_the_press(self):
         value = gesture_host()
-        value.pen_button = 'off'
+        value.air = None
 
         value.handle_touch({"type": "pen", "action": 5, "x": 0.0, "y": 0.0}, 4)
 
         self.assertEqual(value.shortcuts.invoked, [])
         self.assertEqual(value.touch.messages, [])
+
+    async def test_a_gesture_bound_to_a_command_runs_it(self):
+        value = gesture_host()
+        marker = pathlib.Path(tempfile.gettempdir()) / f"tabs9-pen-{os.getpid()}"
+        marker.unlink(missing_ok=True)
+        value.pen_actions = {"click": f"exec:touch {marker}"}
+
+        value.handle_touch({"type": "pen", "action": 5, "x": 0.0, "y": 0.0}, 4)
+        value.handle_touch({"type": "pen", "action": 6, "x": 0.0, "y": 0.0}, 4)
+
+        for _ in range(50):
+            if marker.exists():
+                break
+            await asyncio.sleep(0.02)
+        self.assertTrue(marker.exists())
+        marker.unlink(missing_ok=True)
+        self.assertEqual(value.shortcuts.invoked, [])
 
     async def test_release_touch_drops_a_gesture_in_progress(self):
         value = gesture_host()

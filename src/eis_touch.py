@@ -23,7 +23,9 @@ from typing import Callable
 
 log = logging.getLogger(__name__)
 
+EI_DEVICE_CAP_POINTER = 1 << 0
 EI_DEVICE_CAP_POINTER_ABSOLUTE = 1 << 1
+EI_DEVICE_CAP_KEYBOARD = 1 << 2
 EI_DEVICE_CAP_TOUCH = 1 << 3
 EI_DEVICE_CAP_SCROLL = 1 << 4
 EI_DEVICE_CAP_BUTTON = 1 << 5
@@ -91,6 +93,7 @@ def _load():
         'ei_touch_motion': (None, [P, ctypes.c_double, ctypes.c_double]),
         'ei_touch_up': (None, [P]),
         'ei_touch_unref': (P, [P]),
+        'ei_device_pointer_motion': (None, [P, ctypes.c_double, ctypes.c_double]),
         'ei_device_pointer_motion_absolute': (None, [P, ctypes.c_double, ctypes.c_double]),
         'ei_device_button_button': (None, [P, ctypes.c_uint32, ctypes.c_bool]),
         'ei_device_scroll_delta': (None, [P, ctypes.c_double, ctypes.c_double]),
@@ -134,6 +137,11 @@ class EisTouch:
         self._scrolling = False
         self._devices: dict[int, ctypes.c_void_p] = {}
         self._resumed: set[int] = set()
+        # KWin's separate relative-pointer device (it exists whenever the
+        # portal granted pointer control). Only used to hand the pointer to
+        # an input capture's barrier; ordinary input never needs it.
+        self._pointer: ctypes.c_void_p | None = None
+        self._pointer_emulating = False
         self._closed = False
 
     # -- event pump (call from the thread that owns this object) --------------
@@ -168,10 +176,17 @@ class EisTouch:
             caps = [EI_DEVICE_CAP_TOUCH, EI_DEVICE_CAP_POINTER_ABSOLUTE, EI_DEVICE_CAP_BUTTON]
             if self.lib.ei_seat_has_capability(seat, EI_DEVICE_CAP_SCROLL):
                 caps.append(EI_DEVICE_CAP_SCROLL)
+            if self.lib.ei_seat_has_capability(seat, EI_DEVICE_CAP_POINTER):
+                caps.append(EI_DEVICE_CAP_POINTER)
             self.lib.ei_seat_bind_capabilities(seat, *[ctypes.c_int(cap) for cap in caps],
                                                ctypes.c_void_p(None))
         elif kind == EI_EVENT_DEVICE_ADDED:
             device = self.lib.ei_event_get_device(event)
+            if (self.lib.ei_device_has_capability(device, EI_DEVICE_CAP_POINTER) and
+                    not self.lib.ei_device_has_capability(device, EI_DEVICE_CAP_TOUCH)):
+                if self._pointer is None:
+                    self._pointer = self.lib.ei_device_ref(device)
+                    self._pointer_emulating = False
             if self.lib.ei_device_has_capability(device, EI_DEVICE_CAP_TOUCH):
                 key = self._key(device)
                 if key not in self._devices:
@@ -183,6 +198,10 @@ class EisTouch:
         elif kind == EI_EVENT_DEVICE_REMOVED:
             removed = self.lib.ei_event_get_device(event)
             key = self._key(removed)
+            if self._pointer is not None and key == self._key(self._pointer):
+                self.lib.ei_device_unref(self._pointer)
+                self._pointer = None
+                self._pointer_emulating = False
             if self.device is not None and key == self._key(self.device):
                 self._release_contacts()
                 self.device = None
@@ -196,11 +215,17 @@ class EisTouch:
         elif kind == EI_EVENT_DEVICE_RESUMED:
             device = self.lib.ei_event_get_device(event)
             self._resumed.add(self._key(device))
+            if self._pointer is not None and self._key(device) == self._key(self._pointer):
+                self._sequence += 1
+                self.lib.ei_device_start_emulating(self._pointer, self._sequence)
+                self._pointer_emulating = True
             self.refresh_binding(layout_changed=True)
         elif kind == EI_EVENT_DEVICE_PAUSED:
             device = self.lib.ei_event_get_device(event)
             key = self._key(device)
             self._resumed.discard(key)
+            if self._pointer is not None and key == self._key(self._pointer):
+                self._pointer_emulating = False
             if self.device is not None and key == self._key(self.device):
                 self._release_contacts()
                 with contextlib.suppress(Exception):
@@ -368,6 +393,23 @@ class EisTouch:
         self.lib.ei_device_button_button(self.device, button, False)
         self.lib.ei_device_frame(self.device, self.lib.ei_now(self.ei))
 
+    # -- relative pointer (handing the pointer to an input capture) -----------
+    @property
+    def relative_pointer_ready(self) -> bool:
+        return self._pointer is not None and self._pointer_emulating
+
+    def pointer_nudge(self, dx: float, dy: float) -> None:
+        """Relative pointer motion, in logical pixels.
+
+        Used to push the pointer across an input-capture barrier at a screen
+        edge: the position stays clamped on the edge while the motion carries
+        an orthogonal delta, which is exactly what KWin watches for.
+        """
+        if not self.relative_pointer_ready:
+            raise EisError('EIS relative pointer is not ready')
+        self.lib.ei_device_pointer_motion(self._pointer, dx, dy)
+        self.lib.ei_device_frame(self._pointer, self.lib.ei_now(self.ei))
+
     # -- two-finger scrolling: pointer axes aimed at the fingers ---------------
     def _require_scroll(self):
         self._require_ready()
@@ -444,6 +486,12 @@ class EisTouch:
                 self.lib.ei_device_stop_emulating(self.device)
             except Exception:
                 pass
+        if self._pointer is not None:
+            if self._pointer_emulating:
+                with contextlib.suppress(Exception):
+                    self.lib.ei_device_stop_emulating(self._pointer)
+            self.lib.ei_device_unref(self._pointer)
+            self._pointer = None
         for device in self._devices.values():
             self.lib.ei_device_unref(device)
         self._devices.clear()

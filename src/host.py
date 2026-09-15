@@ -11,11 +11,13 @@ import contextlib
 import fcntl
 import hmac
 import json
+import logging
 import math
 import os
 from pathlib import Path
 import sys
 import secrets
+import shlex
 import shutil
 import signal
 import socket
@@ -45,6 +47,9 @@ from websockets.asyncio.server import serve
 from touch_input import LiveKScreenTarget, PortalTouchInput, TouchInputError
 from eis_touch import EisTouch, EisError
 from gestures import GestureFilter
+from air import AirGestures, GESTURES
+from shortcuts import KdeShortcuts
+from remote import InputCapture, RemoteControl, RemoteError, TabletInjector
 
 # Measured on Qt 6.10 (QScrollArea): 1 axis unit is 12 angle units, so 10
 # units of finger travel are one wheel notch (three lines). 0.2 makes the
@@ -66,6 +71,26 @@ CLIP_MIMES = {'text/plain', 'image/png', 'image/jpeg', 'image/webp', 'image/gif'
 STATE_DIR = ROOT / '.local/state'
 STATUS_FILE = STATE_DIR / 'host.status.json'
 TOKENS_FILE = STATE_DIR / 'portal_tokens.json'
+# What each S Pen gesture does, as "kglobalaccel component:action name" or
+# "exec:command". Written here on first run, then the file is the truth:
+# `./tabs9 pen-actions` prints it and `./tabs9 shortcuts` lists the names
+# every KDE component offers.
+PEN_ACTIONS_FILE = STATE_DIR / 'pen-actions.json'
+DEFAULT_PEN_ACTIONS = {
+    'click': 'plasmashell:activate application launcher',
+    'up': 'kwin:Overview',
+    'down': 'kwin:Grid View',
+    'left': 'kwin:Switch One Desktop to the Left',
+    'right': 'kwin:Switch One Desktop to the Right',
+    'clockwise': 'kwin:Walk Through Windows',
+    'counterclockwise': 'kwin:Walk Through Windows (Reverse)',
+}
+# The host's own actions, in KDE's shortcut list (System Settings ->
+# Shortcuts -> Tab S9 USB display), where they can be rebound like any other.
+HOST_SHORTCUTS = [
+    ('remote-control', 'Tablet: own desktop, then send mouse and keyboard', 'Meta+Shift+T'),
+    ('tablet-screen', "Tablet: back to being the computer's screen", 'Meta+Shift+D'),
+]
 
 # Cap on retrying the capture session after the user selects the wrong output
 # (e.g. the laptop screen instead of the Virtual Output), so a confused user
@@ -73,6 +98,34 @@ TOKENS_FILE = STATE_DIR / 'portal_tokens.json'
 # supervised `tabs9 start` would otherwise report as a silent 60s hang.
 MAX_WRONG_SOURCE_ATTEMPTS = 3
 CAPTURE_DIALOG_HINT = 'Click Allow in the KDE remote-control dialog (keep "Allow restoring" ticked).'
+
+
+def load_pen_actions(mode='actions'):
+    """What each S Pen gesture should do, from the state file (written once).
+
+    ``mode='launcher'`` keeps the old behaviour: the button opens the
+    application launcher and gestures do nothing.
+    """
+    if mode == 'launcher':
+        return {'click': DEFAULT_PEN_ACTIONS['click']}
+    actions = dict(DEFAULT_PEN_ACTIONS)
+    try:
+        if PEN_ACTIONS_FILE.exists():
+            stored = json.loads(PEN_ACTIONS_FILE.read_text())
+            if not isinstance(stored, dict):
+                raise ValueError('pen-actions.json must hold an object')
+            actions = {name: target for name, target in stored.items()
+                       if name in GESTURES and isinstance(target, str) and target}
+            unknown = sorted(set(stored) - set(GESTURES))
+            if unknown:
+                print(f'Ignoring unknown S Pen gestures in {PEN_ACTIONS_FILE.name}: '
+                      f'{", ".join(unknown)}', flush=True)
+        else:
+            PEN_ACTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            PEN_ACTIONS_FILE.write_text(json.dumps(actions, indent=2) + '\n')
+    except (OSError, ValueError) as error:
+        print(f'Using the built-in S Pen actions ({PEN_ACTIONS_FILE.name}: {error})', flush=True)
+    return actions
 
 
 def notify(summary, body, urgency='normal'):
@@ -298,11 +351,28 @@ class Host:
         # (see receive_clip) and how many were put on the clipboard.
         self.clip = None
         self.clips = 0
+        # S Pen button and air gestures (see air.py), and where they are sent.
+        self.pen_actions = dict(DEFAULT_PEN_ACTIONS)
+        self.pen_gestures = 0
+        self.air = None
+        # Mouse and keyboard forwarding (see remote.py): 'screen' (the tablet
+        # is the computer's screen), 'desktop' (it shows its own), 'control'
+        # (and has the input). Built on first use, so a host that never
+        # remote-controls anything never talks to KWin's capture at all.
+        self.shortcuts = None
+        self.tablet_mode = 'screen'
+        self.remote_control = None
+        self.remote_watch = None
         # kglobalaccel component name -> D-Bus interface, bound on first use.
         self.shortcut_components = {}
-        # The S Pen's side button, pressed while hovering: 'launcher' opens
-        # the application launcher (see PEN_BUTTON_SHORTCUT), 'off' ignores it.
-        self.pen_button = getattr(args, 'pen_button', 'launcher')
+        # The S Pen's side button and air gestures: 'actions' follows
+        # pen-actions.json, 'launcher' only opens the launcher on a click,
+        # 'off' ignores the pen's button entirely.
+        self.pen_button = getattr(args, 'pen_button', 'actions')
+        if self.pen_button != 'off':
+            self.pen_actions = load_pen_actions(self.pen_button)
+            self.air = AirGestures(self.perform_pen_gesture,
+                                   threshold=getattr(args, 'air_threshold', 1.5))
         # Multi-finger swipes and two-finger scrolls are picked out here,
         # before the desktop sees the contacts (see gestures.py); off
         # delivers every touch as is.
@@ -552,9 +622,22 @@ class Host:
                       f'gain {self.scroll_gain:g}; needs the libei device)', flush=True)
             if self.gestures.tap is not None:
                 print('Tablet taps: 2 fingers = right click (needs the libei device)', flush=True)
-        if self.pen_button != 'off':
-            print(f'S Pen button (hovering): {self.pen_button} -> '
-                  f'{self.PEN_BUTTON_SHORTCUT[self.pen_button][1]!r}', flush=True)
+        if self.air is not None:
+            bound = ', '.join(f'{name} -> {target}' for name, target in self.pen_actions.items())
+            print(f'S Pen actions ({PEN_ACTIONS_FILE}): {bound}', flush=True)
+        self.setup_shortcuts()
+        if getattr(self.args, 'remote', 'on') != 'off' and hasattr(self.args, 'remote_port'):
+            # The capture is created now, not on the first shortcut press: KWin
+            # needs a moment to give it its devices, and one activated before
+            # that swallows the input instead of forwarding it. Nothing is
+            # captured until the shortcut (or the edge) asks for it.
+            try:
+                self.build_remote().ensure_capture()
+                if self.args.remote_edge != 'none':
+                    print(f'Remote control: pushing the pointer past the {self.args.remote_edge} '
+                          'edge of the tablet screen also hands it the input.', flush=True)
+            except (RemoteError, dbus.DBusException, EisError) as error:
+                print(f'Remote control unavailable: {type(error).__name__}: {error}', flush=True)
         self.fd = self.portal.OpenPipeWireRemote(self.session, dbus.Dictionary({}, signature='sv')).take()
         self.capture_node = int(node)
         self.start_pipeline()
@@ -986,7 +1069,7 @@ class Host:
         try:
             fd = self.remote.ConnectToEIS(self.session, dbus.Dictionary({}, signature='sv')).take()
             self.eis = EisTouch(fd, lambda: ((g := target.geometry()).x, g.y, *g.logical_size),
-                                layout_changed=target.invalidate)
+                                layout_changed=lambda: self.layout_changed(target))
         except (dbus.DBusException, EisError, AttributeError) as error:
             print('EIS unavailable, using portal touch:', type(error).__name__, error, flush=True)
             return
@@ -1007,6 +1090,15 @@ class Host:
                           GLib.IOCondition.IN | GLib.IOCondition.HUP | GLib.IOCondition.ERR, pump)
         self.touch.touch_backend = self.eis
         # A touch before the EIS device is resumed raises and is counted as rejected.
+
+    def layout_changed(self, target):
+        """KWin re-announced its devices: the outputs may have moved."""
+        target.invalidate()
+        if self.remote_control is not None:
+            # The input-capture barrier is a segment in workspace coordinates,
+            # so it has to follow the tablet's screen when it is rearranged.
+            with contextlib.suppress(Exception):
+                self.remote_control.rearm()
 
     def _virtual_x(self):
         with contextlib.suppress(Exception):
@@ -1246,6 +1338,8 @@ class Host:
                 elif msg.get('type') in ('touch', 'pen'):
                     self.input_messages += 1
                     GLib.idle_add(self.handle_touch, msg, generation)
+                elif msg.get('type') == 'air':
+                    GLib.idle_add(self.handle_air, msg, generation)
                 elif msg.get('type') == 'resolution':
                     self.note_tablet_panel(msg)
                 elif msg.get('type') == 'mode':
@@ -1275,6 +1369,11 @@ class Host:
 
     def handle_touch(self, message, generation):
         if generation != self.control_generation or self.control_owner is None:
+            return False
+        if self.tablet_mode == 'control' and message.get('type') == 'touch':
+            # The tablet is being driven from here; its own screen is not the
+            # desktop's, and forwarding what lands on it would come straight
+            # back as pointer events.
             return False
         if self.touch is not None:
             if self.gestures is not None and message.get('type') == 'touch':
@@ -1351,6 +1450,200 @@ class Host:
             self.touch.scroll_end()
         return True
 
+    # -- the host's own KDE shortcuts -----------------------------------------
+    def setup_shortcuts(self):
+        """Put the host's actions in KDE's shortcut list and listen for them."""
+        if getattr(self.args, 'remote', 'on') == 'off':
+            return
+        try:
+            self.shortcuts = KdeShortcuts(self.bus)
+            bound = []
+            for name, label, default in HOST_SHORTCUTS:
+                bound.append(f'{self.shortcuts.register(name, label, default)} = {label}')
+            self.shortcuts.listen(self.on_shortcut)
+        except dbus.DBusException as error:
+            self.shortcuts = None
+            print(f'KDE shortcuts unavailable ({error}); remote control is off.', flush=True)
+            return
+        print('Shortcuts (System Settings -> Shortcuts -> Tab S9 USB display): '
+              + '; '.join(bound), flush=True)
+        if any(entry.startswith('none = ') for entry in bound):
+            print('A shortcut shows as "none" because another application already owns the '
+                  'key the host proposes; pick one in System Settings -> Shortcuts.', flush=True)
+        print('While the tablet has the input, KWin\'s own Meta+Shift+Escape '
+              '("Disable Active Input Capture") always gives it back.', flush=True)
+
+    def on_shortcut(self, action):
+        print(f'Shortcut {action}: the tablet is showing '
+              f'{"the computer" if self.tablet_mode == "screen" else "its own desktop"}'
+              f'{" and has the input" if self.tablet_mode == "control" else ""}.', flush=True)
+        if action == 'remote-control':
+            self.cycle_tablet_mode()
+        elif action == 'tablet-screen':
+            self.tablet_as_screen()
+        return False
+
+    def tablet_app(self, front):
+        """Bring the display app to the front, or put the tablet's own desktop there."""
+        if front:
+            adb('shell', 'am', 'start', '-n', 'local.tabs9.usbdisplay/.MainActivity')
+        else:
+            adb('shell', 'input', 'keyevent', 'KEYCODE_HOME')
+
+    def cycle_tablet_mode(self):
+        """The remote-control shortcut: desktop, then input, then input back."""
+        try:
+            if self.tablet_mode == 'screen':
+                self.tablet_app(front=False)
+                self.tablet_mode = 'desktop'
+                notify('Tablet is showing its own desktop',
+                       'Press the shortcut again to send your mouse and keyboard to it.')
+            elif self.tablet_mode == 'desktop':
+                self.start_remote()
+            else:
+                self.remote_control.stop()
+        except (RemoteError, RuntimeError, dbus.DBusException) as error:
+            print(f'Remote control failed: {type(error).__name__}: {error}', flush=True)
+            notify('Could not send the input to the tablet', str(error), 'critical')
+        return False
+
+    def tablet_as_screen(self):
+        """The other shortcut: the tablet goes back to being the computer's screen."""
+        with contextlib.suppress(Exception):
+            if self.remote_control is not None:
+                self.remote_control.stop()
+        self.tablet_mode = 'screen'
+        with contextlib.suppress(Exception):
+            self.tablet_app(front=True)
+        notify("Tablet is the computer's screen again", '')
+        return False
+
+    def start_remote(self):
+        """Hand the pointer and keyboard to the tablet (building the pieces once)."""
+        remote = self.build_remote()
+        remote.start()
+        # KWin answers asynchronously; if the push did not take (the pointer
+        # was being moved at that moment, say), try once more before saying so.
+        GLib.timeout_add(400, self.check_remote_started, 1)
+
+    def check_remote_started(self, attempts):
+        if self.remote_control is None or self.remote_control.active:
+            return False
+        if attempts <= 0:
+            notify('The tablet did not take the input',
+                   'Press the shortcut again, or push the pointer off that edge by hand.')
+            return False
+        with contextlib.suppress(Exception):
+            self.remote_control.cross()
+        GLib.timeout_add(400, self.check_remote_started, attempts - 1)
+        return False
+
+    def build_remote(self):
+        """The remote-control machinery, created on first use."""
+        if self.remote_control is None:
+            injector = TabletInjector(adb, str(ADB), port=self.args.remote_port)
+            capture = InputCapture(self.bus, source=self.args.remote_capture)
+            self.remote_control = RemoteControl(injector, capture,
+                panel=self.tablet_panel or (self.args.width, self.args.height),
+                sensitivity=self.args.remote_sensitivity, edge=self.args.remote_edge,
+                barrier=self.output_edge, watch=self.watch_remote, unwatch=self.unwatch_remote,
+                park=self.park_pointer, nudge=self.nudge_pointer,
+                notify=lambda summary, body: notify(summary, body),
+                on_state=self.remote_state_changed, home=self.pointer_home)
+        return self.remote_control
+
+    def remote_state_changed(self, state):
+        # 'control' while the tablet has the input, 'desktop' when it is given
+        # back; the shortcut reads this to know what its next press does. The
+        # release is asynchronous, so a mode set in the meantime (the tablet
+        # was asked to be a screen again) is not undone here.
+        if not (state == 'desktop' and self.tablet_mode == 'screen'):
+            self.tablet_mode = state
+        if state == 'control':
+            print('Remote control: the tablet has the mouse and keyboard '
+                  '(Meta+Shift+Escape always gives them back).', flush=True)
+        else:
+            kinds = dict(self.remote_control.kinds) if self.remote_control else {}
+            print(f'Remote control: input is back on the computer ({kinds or "no events"}).',
+                  flush=True)
+            if self.remote_control is not None:
+                self.remote_control.kinds.clear()
+        return False
+
+    def watch_remote(self, fd, pump):
+        def ready(_fd, condition):
+            if condition & (GLib.IOCondition.HUP | GLib.IOCondition.ERR):
+                print('Input capture closed.', flush=True)
+                self.remote_watch = None
+                return False
+            try:
+                return pump()
+            except Exception as error:
+                print(f'Input capture dispatch failed: {type(error).__name__}: {error}', flush=True)
+                self.remote_watch = None
+                return False
+        self.remote_watch = GLib.io_add_watch(fd, GLib.PRIORITY_DEFAULT,
+            GLib.IOCondition.IN | GLib.IOCondition.HUP | GLib.IOCondition.ERR, ready)
+
+    def unwatch_remote(self):
+        if self.remote_watch is not None:
+            with contextlib.suppress(Exception):
+                GLib.source_remove(self.remote_watch)
+            self.remote_watch = None
+
+    def output_edge(self, side):
+        """One edge of the virtual output, as a barrier segment in logical pixels.
+
+        KWin only activates a capture at a workspace edge, where the pointer
+        cannot go further: the tablet's outer edge is the one the pointer is
+        pushed against, by hand or by the shortcut.
+        """
+        if self.touch is None:
+            return None
+        geometry = self.touch.target.geometry()
+        x, y = geometry.x, geometry.y
+        width, height = geometry.logical_size
+        edges = {'left': ((x, y), (x, y + height)),
+                 'right': ((x + width, y), (x + width, y + height)),
+                 'top': ((x, y), (x + width, y)),
+                 'bottom': ((x, y + height), (x + width, y + height))}
+        return edges.get(side)
+
+    def pointer_home(self):
+        """The middle of the computer's own screen: where the pointer is left."""
+        own = next(o for o in outputs()
+                   if o['name'] != self.virtual_name and o.get('enabled', True))
+        scale = own.get('scale') or 1
+        return (own['pos']['x'] + own['size']['width'] / scale / 2,
+                own['pos']['y'] + own['size']['height'] / scale / 2)
+
+    def park_pointer(self, x, y):
+        """Put the pointer on the barrier, with the same device the pen uses."""
+        if self.eis is None or not self.eis.pen_capable:
+            raise RemoteError('the libei device is not ready; input capture needs it to start')
+        region = self.eis.region
+        if region is None:
+            raise RemoteError('the libei device has no region for the virtual output')
+        self.eis.pen_motion(min(max(x - region.x, 0), region.width - 1),
+                            min(max(y - region.y, 0), region.height - 1))
+
+    def nudge_pointer(self, dx, dy):
+        if self.eis is None or not self.eis.relative_pointer_ready:
+            raise RemoteError('KWin gave this session no relative pointer device')
+        self.eis.pointer_nudge(dx, dy)
+
+    def drill_pointer(self):
+        """Debug drill (SIGUSR2): a few pointer moves and a click, from here."""
+        try:
+            for _ in range(10):
+                self.eis.pointer_nudge(12.0, 6.0)
+            if self.touch is not None:
+                self.touch.click(0.5, 0.5, 0x110)
+            print('Pointer drill: 10 moves and a click sent', flush=True)
+        except Exception as error:
+            print(f'Pointer drill failed: {type(error).__name__}: {error}', flush=True)
+        return True
+
     def perform_right_click(self, x, y):
         """Two fingers tapped together: a right click where they landed."""
         if self.touch is None or not self.touch.click(x, y):
@@ -1358,26 +1651,60 @@ class Host:
         self.right_clicks += 1
         return True
 
-    # S Pen side button -> global shortcut, as (kglobalaccel component, name).
-    # Plasma opens the launcher of the panel on KWin's active output (the one
-    # under the pointer, so the tablet's own panel if it has one) and falls
-    # back to any launcher.
-    PEN_BUTTON_SHORTCUT = {
-        'launcher': ('plasmashell', 'activate application launcher'),
-    }
-
     def perform_pen_button(self, message):
-        """The S Pen's side button (5 press, 6 release), while hovering only.
+        """The S Pen's side button (5 press, 6 release).
 
         Pressed with the tip down it is left alone: the stroke goes on and a
-        launcher over it would be in the way. The release is not used.
+        launcher over it would be in the way. Otherwise it opens (and closes)
+        a gesture: what happens is decided when the button comes back up, by
+        how the pen moved in between (see air.py).
         """
-        shortcut = self.PEN_BUTTON_SHORTCUT.get(self.pen_button)
-        if shortcut is None or message.get('action') != 5 or self.touch.pen_down:
+        if self.air is None or message.get('action') not in (5, 6):
             return False
-        self.pen_buttons += 1
-        print(f'S Pen button -> {shortcut[1]}', flush=True)
-        self.invoke_shortcut(*shortcut)
+        if self.touch is not None and self.touch.pen_down:
+            return False
+        press = message.get('action') == 5
+        if press:
+            self.pen_buttons += 1
+        self.air.button(press)
+        return True
+
+    def handle_air(self, message, generation):
+        """One air-motion sample from the S Pen, while its button is held."""
+        if generation != self.control_generation or self.control_owner is None or self.air is None:
+            return False
+        dx, dy = message.get('dx'), message.get('dy')
+        if (isinstance(dx, (int, float)) and isinstance(dy, (int, float))
+                and not isinstance(dx, bool) and not isinstance(dy, bool)):
+            self.air.motion(float(dx), float(dy))
+        return False
+
+    def perform_pen_gesture(self, name):
+        """One recognised S Pen gesture: whatever the user bound it to."""
+        self.pen_gestures += 1
+        target = self.pen_actions.get(name)
+        _, sx, sy, area, samples = self.air.last
+        print(f'S Pen {name} ({sx:+.2f}, {sy:+.2f}; area {area:+.2f}; {samples} samples) -> '
+              f'{target or "nothing bound"}', flush=True)
+        if not target:
+            return False
+        return self.perform_target(target)
+
+    def perform_target(self, target):
+        """Run a bound action: ``component:action name`` or ``exec:command``."""
+        kind, _, rest = str(target).partition(':')
+        if not rest:
+            return False
+        if kind == 'exec':
+            try:
+                subprocess.Popen(shlex.split(rest), stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+            except (OSError, ValueError) as error:
+                print(f'Pen action {target!r} failed: {error}', flush=True)
+                return False
+            return True
+        self.invoke_shortcut(kind, rest)
         return True
 
     # -- tablet clipboard -> desktop clipboard --------------------------------
@@ -1596,6 +1923,10 @@ class Host:
             'tablet_right_clicks': self.right_clicks,
             'tablet_pen_buttons': self.pen_buttons,
             'tablet_clips': self.clips,
+            'tablet_pen_gestures': self.pen_gestures,
+            'tablet_mode': self.tablet_mode,
+            'remote_sessions': self.remote_control.sessions if self.remote_control is not None else 0,
+            'remote_events': self.remote_control.events if self.remote_control is not None else 0,
             'client_resyncs': self.resyncs,
             'video_clients': len(self.clients), 'video_connects': self.video_connects,
             'video_disconnects': self.video_disconnects, 'last_video_disconnect': self.last_video_disconnect,
@@ -1658,6 +1989,11 @@ class Host:
             # closes, the tablet must reconnect and resume at a keyframe)
             # without touching the control channel or the capture pipeline.
             GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, self.drop_video_clients)
+            # Recovery drill: SIGUSR2 moves and clicks the pointer with the
+            # host's own libei sender. With the input captured (remote
+            # control) it is the way to exercise the whole path -- KWin,
+            # capture, tablet -- without touching the real mouse.
+            GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR2, self.drill_pointer)
             self.loop.run()
         except Exception as error:
             # RuntimeErrors raised in this method carry static, non-sensitive
@@ -1675,6 +2011,14 @@ class Host:
                     self.status.write('stopped')
             with contextlib.suppress(Exception):
                 self.release_touch()
+            if getattr(self, 'remote_control', None) is not None:
+                # Always before anything else: the desktop must not be left
+                # without its own input because the host went away.
+                with contextlib.suppress(Exception):
+                    self.remote_control.close()
+            if getattr(self, 'shortcuts', None) is not None:
+                with contextlib.suppress(Exception):
+                    self.shortcuts.release()
             if getattr(self, 'eis', None) is not None:
                 with contextlib.suppress(Exception):
                     self.eis.close()
@@ -1740,12 +2084,36 @@ if __name__ == '__main__':
     parser.add_argument('--two-finger-tap', choices=['right-click', 'off'], default='right-click',
                         help='two fingers tapped together: a right click where they landed '
                              '(default) or off (the desktop gets two taps)')
-    parser.add_argument('--pen-button', choices=['launcher', 'off'], default='launcher',
-                        help="the S Pen's side button pressed while hovering: launcher opens "
-                             'the application launcher (default), off leaves it alone')
+    parser.add_argument('--pen-button', choices=['actions', 'launcher', 'off'], default='actions',
+                        help="the S Pen's side button and air gestures: actions follows "
+                             f'{PEN_ACTIONS_FILE.name} (default), launcher only opens the '
+                             'application launcher on a click, off leaves the button alone')
+    parser.add_argument('--air-threshold', type=float, default=1.5, metavar='UNITS',
+                        help='how far the pen must move in the air, with its button held, for '
+                             'the press to be a direction rather than a click (default 1.5; the '
+                             'host logs what each gesture measured)')
+    parser.add_argument('--remote', choices=['on', 'off'], default='on',
+                        help='register the KDE shortcuts that show the tablet its own desktop '
+                             "and send it this computer's mouse and keyboard (default on)")
+    parser.add_argument('--remote-capture', choices=['kwin', 'portal'], default='kwin',
+                        help='how the input is taken from the desktop: kwin asks KWin directly '
+                             "(default, no dialog), portal goes through the desktop portal's "
+                             'InputCapture, which asks every time it is set up')
+    parser.add_argument('--remote-edge', choices=['left', 'right', 'top', 'bottom', 'none'],
+                        default='none', metavar='SIDE',
+                        help='also hand the input over when the pointer is pushed against this '
+                             "edge of the tablet's screen (default none: only the shortcut does)")
+    parser.add_argument('--remote-sensitivity', type=float, default=2.0, metavar='FACTOR',
+                        help='tablet pixels per logical pixel of mouse movement while the tablet '
+                             'has the input (default 2.0)')
+    parser.add_argument('--remote-port', type=int, default=8892, metavar='PORT',
+                        help='local port forwarded to the tablet input receiver (default 8892)')
     parser.add_argument('--rate-control', choices=['cbr', 'vbr', 'cqp'], default='cbr')
     parser.add_argument('--qp', type=int, default=24)
     args = parser.parse_args()
+    # The input-capture and libei modules report through logging; the rest of
+    # the host prints. Keep both on stdout, where the journal collects them.
+    logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stdout)
     try:
         args.width, args.height = (int(part) for part in args.resolution.lower().split('x', 1))
     except (TypeError, ValueError):
@@ -1769,6 +2137,12 @@ if __name__ == '__main__':
         parser.error('--gesture-hold-ms must be between 1 and 1000')
     if not 0.1 <= args.scroll_gain <= 10:
         parser.error('--scroll-gain must be between 0.1 and 10')
+    if not 0.05 <= args.air_threshold <= 100:
+        parser.error('--air-threshold must be between 0.05 and 100')
+    if not 0.1 <= args.remote_sensitivity <= 10:
+        parser.error('--remote-sensitivity must be between 0.1 and 10')
+    if not 1024 <= args.remote_port <= 65535:
+        parser.error('--remote-port must be between 1024 and 65535')
     os.umask(0o077)
     state_dir = ROOT / '.local/state'
     state_dir.mkdir(parents=True, exist_ok=True)

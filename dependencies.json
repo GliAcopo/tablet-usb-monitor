@@ -10,5 +10,23 @@
     "commit": "402c94ecd04ebbe33cf7c50d16a9f22c0d73164e",
     "url": "https://github.com/majmichu1/UScreen/releases/download/v1.1.0/uscreen.apk",
     "sha256": "551e60db68b958f2b87750b2fa49296ec7eb82cd139e62376a283045ef76f30a"
+  },
+  "spen_remote_sdk": {
+    "version": "1.0.1",
+    "source": "https://developer.samsung.com/galaxy-spen-remote (mirrored in github.com/choshinyoung/Spen)",
+    "note": "Samsung's S Pen Remote SDK jars: the supported way for an app to receive the Bluetooth S Pen's button and air motion. The vendor download needs a Samsung account, so they are fetched from a pinned commit of a public mirror and checked against these hashes.",
+    "commit": "0d753dc13fb729bb9795e9d921b698a5faea7534",
+    "files": [
+      {
+        "name": "spenremote-v1.0.1.jar",
+        "url": "https://raw.githubusercontent.com/choshinyoung/Spen/0d753dc13fb729bb9795e9d921b698a5faea7534/Spen/Spen/libs/spenremote-v1.0.1.jar",
+        "sha256": "bd30c560d3722ee112e86c23e7426ceaee5e7cb7e8b5b19f0cbf20faee0a586e"
+      },
+      {
+        "name": "sdk-v1.0.0.jar",
+        "url": "https://raw.githubusercontent.com/choshinyoung/Spen/0d753dc13fb729bb9795e9d921b698a5faea7534/Spen/Spen/libs/sdk-v1.0.0.jar",
+        "sha256": "a0950fde86125fd7487039e6c5d009e1f502155ce504c29ac04c9d2737b78a5b"
+      }
+    ]
   }
 }

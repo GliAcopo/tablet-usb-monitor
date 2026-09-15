@@ -8,3 +8,4 @@ android/keystore.properties
 *.jks
 *.keystore
 .pytest_cache/
+android/app/libs/

@@ -35,6 +35,9 @@ def make_test_host(tmp_dir):
     h.touch = None
     h.gestures = None
     h.pen_button = 'off'
+    h.air = None
+    h.tablet_mode = 'screen'
+    h.remote_control = None
     return h
 
 
@@ -421,6 +424,9 @@ class RunFinallyCleanupTests(unittest.TestCase):
         h.touch = MagicMock()
         h.gestures = None
         h.pen_button = 'off'
+        h.air = None
+        h.tablet_mode = 'screen'
+        h.remote_control = None
         h.closing = False
         h.failed = False
         return h

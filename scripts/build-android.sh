@@ -63,6 +63,27 @@ sdkmanager --sdk_root="$SDK_ROOT" \
     "platforms;android-34" \
     "build-tools;34.0.0"
 
+# Samsung's S Pen Remote SDK jars (see dependencies.json): the app needs them
+# at compile time to receive the pen's button and air gestures.
+python3 - "$PROJECT_ROOT" <<'PY'
+import hashlib, json, sys, urllib.request
+from pathlib import Path
+root = Path(sys.argv[1])
+libs = root / 'android/app/libs'
+libs.mkdir(parents=True, exist_ok=True)
+for item in json.loads((root / 'dependencies.json').read_text())['spen_remote_sdk']['files']:
+    target = libs / item['name']
+    if target.exists() and hashlib.sha256(target.read_bytes()).hexdigest() == item['sha256']:
+        continue
+    print(f"downloading {item['name']}")
+    partial = target.with_suffix(target.suffix + '.partial')
+    urllib.request.urlretrieve(item['url'], partial)
+    if hashlib.sha256(partial.read_bytes()).hexdigest() != item['sha256']:
+        partial.unlink()
+        raise SystemExit(f"{item['name']} did not match its pinned checksum")
+    partial.replace(target)
+PY
+
 cd "$PROJECT_ROOT/android"
 # JVM unit tests (packet framing etc.) run before the APK is assembled;
 # TABS9_SKIP_ANDROID_TESTS=1 skips them.

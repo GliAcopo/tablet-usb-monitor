@@ -196,16 +196,21 @@ case "${1:-help}" in
       *) echo 'Usage: ./tabs9 pin-desktop on|off|status'; exit 1 ;;
     esac
     ;;
+  pen-actions) shift; exec python3 scripts/kde-actions.py "$@" ;;
+  shortcuts) shift; exec python3 scripts/kde-actions.py --list "$@" ;;
   test-motion) shift; exec python3 scripts/motion-test.py "$@" ;;
   bench-capture) shift; exec python3 scripts/capture_ab.py "$@" ;;
   *)
     echo 'Usage: ./tabs9 {setup|doctor|start [options]|stop|status|logs|pin-desktop on|off}'
+    echo '              {pen-actions [gesture target]|shortcuts [component]}'
     echo '              {test-motion [--seconds N]|bench-capture [--seconds N]}'
     echo '  start options: --profile smooth|balanced|light (120/60/30 fps)'
     echo '                 --resolution 2960x1848  --fps 30|60|90|120'
     echo '                 --bitrate 40000  --scale 1.5  --gap 1  --capture-memory va|system|gl'
     echo '                 --scroll natural|standard|off  --scroll-gain 0.2  --gestures on|off'
-    echo '                 --two-finger-tap right-click|off  --pen-button launcher|off'
+    echo '                 --two-finger-tap right-click|off  --pen-button actions|launcher|off'
+    echo '                 --remote on|off  --remote-edge left|right|top|bottom|none'
+    echo '                 --remote-sensitivity 2.0  --remote-capture kwin|portal'
     echo '  bench-capture compares both capture paths under continuous motion;'
     echo '  it needs the two KDE sharing dialogs answered once per path.'
     ;;

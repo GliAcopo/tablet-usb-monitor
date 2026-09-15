@@ -68,6 +68,10 @@ android {
 }
 
 dependencies {
+    // Samsung's S Pen Remote SDK (the Bluetooth pen's button and air motion).
+    // scripts/build-android.sh downloads these into libs/ with pinned
+    // checksums; see dependencies.json.
+    implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.jar"))))
     // 2024.02.02 ships material3 1.2.1 built against compose 1.6.x — the
     // 2024.01.00 BOM paired material3 1.1.2 with animation-core 1.6.0, which
     // crashes with NoSuchMethodError in CircularProgressIndicator.

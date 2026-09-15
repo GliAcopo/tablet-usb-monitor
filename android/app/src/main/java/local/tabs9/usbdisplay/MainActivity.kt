@@ -45,6 +45,8 @@ class MainActivity : ComponentActivity() {
     companion object {
         /** Set while the activity is alive; the debug DrillReceiver calls it with the drill action. */
         @Volatile var drillHook: ((String) -> Unit)? = null
+        /** Debug builds: a synthetic S Pen press with air motion (dx, dy, steps). */
+        @Volatile var penDrillHook: ((Float, Float, Int) -> Unit)? = null
     }
 
     /// Mirrors the host's mode so the UI can say what is going on.
@@ -59,6 +61,9 @@ class MainActivity : ComponentActivity() {
     private var videoState by mutableStateOf(VideoReceiver.VideoState.DISCONNECTED)
     private var videoReceiver: VideoReceiver? = null
     private var touchCapture: TouchCapture? = null
+    private var spenButton: SpenButton? = null
+    /** What the S Pen Remote connection is doing, for the settings sheet. */
+    private var penStatus by mutableStateOf("Not connected")
     private lateinit var prefs: Prefs
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -92,6 +97,19 @@ class MainActivity : ComponentActivity() {
                 "local.tabs9.usbdisplay.DRILL_SEND_CLIPBOARD" -> sendClip { ClipSource.fromClipboard(this) }
                 "local.tabs9.usbdisplay.DRILL_SEND_SCREENSHOT" -> sendScreenshot()
             }
+        }
+        // The S Pen's button and air gestures come from Samsung's service, not
+        // from the digitizer, so they are asked for separately (SpenButton.kt)
+        // and follow the activity's foreground state below.
+        spenButton = SpenButton(this).also { pen ->
+            pen.onButton = { down -> touchCapture?.sendPenButton(down) }
+            pen.onAirMotion = { dx, dy -> touchCapture?.sendAirMotion(dx, dy) }
+            pen.onStatus = { text -> runOnUiThread { penStatus = text } }
+        }
+        penDrillHook = { dx, dy, steps ->
+            touchCapture?.sendPenButton(true)
+            repeat(steps) { touchCapture?.sendAirMotion(dx, dy) }
+            touchCapture?.sendPenButton(false)
         }
         touchCapture?.onProtocolKnown = { version -> runOnUiThread { hostProtocol = version } }
         touchCapture?.onHostFeaturesKnown = { features ->
@@ -159,6 +177,7 @@ class MainActivity : ComponentActivity() {
                     onDismissThanks = { showThanks = false },
                     hostProtocol = hostProtocol,
                     hostClipboard = hostClipboard,
+                    penStatus = penStatus,
                     onSendClipboard = { sendClip { ClipSource.fromClipboard(this) } },
                     onSendScreenshot = { sendScreenshot() },
                     videoState = videoState,
@@ -384,6 +403,18 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        // The S Pen service only talks to the foreground app, and while it
+        // talks to us Samsung's Air Command leaves the button alone.
+        spenButton?.connect()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        spenButton?.disconnect()
+    }
+
     override fun onStop() {
         super.onStop()
         videoReceiver?.stop()
@@ -392,6 +423,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         drillHook = null
+        penDrillHook = null
+        spenButton?.disconnect()
         super.onDestroy()
         stopService(Intent(this, StreamingService::class.java))
     }
@@ -428,6 +461,7 @@ fun UScreenMain(
     onDismissThanks: () -> Unit = {},
     hostProtocol: Int = 0,
     hostClipboard: Boolean = false,
+    penStatus: String = "",
     onSendClipboard: () -> Unit = {},
     onSendScreenshot: () -> Unit = {},
     videoState: VideoReceiver.VideoState = VideoReceiver.VideoState.DISCONNECTED,
@@ -649,6 +683,7 @@ fun UScreenMain(
                     touchCapture?.sendConfig(bitrateKbps, newFps)
                 },
                 hostClipboard = hostClipboard,
+                penStatus = penStatus,
                 onSendClipboard = onSendClipboard,
                 onSendScreenshot = onSendScreenshot,
                 onDismiss = { showSettings = false }
@@ -759,6 +794,7 @@ private fun SettingsSheet(
     onShowStatsChange: (Boolean) -> Unit,
     onApply: (bitrateKbps: Int, fps: Int) -> Unit,
     hostClipboard: Boolean,
+    penStatus: String,
     onSendClipboard: () -> Unit,
     onSendScreenshot: () -> Unit,
     onDismiss: () -> Unit,
@@ -872,6 +908,15 @@ private fun SettingsSheet(
                     colors = SwitchDefaults.colors(checkedTrackColor = Accent)
                 )
             }
+            Spacer(Modifier.height(24.dp))
+
+            Text("S Pen button", fontSize = 14.sp, color = Color(0xFFB0B0C0))
+            Text(
+                "$penStatus. While this app is in front, the pen's button and its air " +
+                    "gestures go to the computer instead of opening Air Command here.",
+                fontSize = 11.sp,
+                color = Color(0xFF6A6A7E)
+            )
             Spacer(Modifier.height(24.dp))
 
             if (hostClipboard) {

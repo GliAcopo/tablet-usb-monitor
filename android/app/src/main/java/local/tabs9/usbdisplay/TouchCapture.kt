@@ -331,6 +331,11 @@ class TouchCapture {
     fun handleMotionEvent(event: MotionEvent, width: Int, height: Int): Boolean {
         if (!isConnected) return false
         if (inputSuspended) return true
+        // A mouse on the tablet is not a finger: while the computer is driving
+        // this tablet (remote control), its pointer arrives as mouse events,
+        // and forwarding them would send them straight back where they came
+        // from. Real fingers and the pen are never TOOL_TYPE_MOUSE.
+        if (isMouse(event)) return false
 
         val vw = width.coerceAtLeast(1).toFloat()
         val vh = height.coerceAtLeast(1).toFloat()
@@ -538,8 +543,8 @@ class TouchCapture {
         webSocket?.send(msg.toString())
     }
 
-    /** The S Pen's side button; the host opens the application launcher on a press while hovering. */
-    private fun sendPenButton(down: Boolean) {
+    /** The S Pen's side button; the host decides what the press means (see air.py). */
+    fun sendPenButton(down: Boolean) {
         Log.i(TAG, "S Pen side button ${if (down) "pressed" else "released"}")
         val msg = JSONObject().apply {
             put("type", "pen")
@@ -553,6 +558,20 @@ class TouchCapture {
             put("action", if (down) 5 else 6)
         }
         webSocket?.send(msg.toString())
+    }
+
+    /**
+     * One air-motion sample from the pen's gyroscope, while its button is
+     * held. Only meaningful between a button down and the matching up, which
+     * is where the host recognises the gesture.
+     */
+    fun sendAirMotion(dx: Float, dy: Float) {
+        if (!isConnected) return
+        webSocket?.send(JSONObject().apply {
+            put("type", "air")
+            put("dx", dx.toDouble())
+            put("dy", dy.toDouble())
+        }.toString())
     }
 
     private fun sendPenProximityExit() {
@@ -770,6 +789,13 @@ class TouchCapture {
     @android.annotation.SuppressLint("WrongConstant")
     private fun isPalm(event: MotionEvent, index: Int): Boolean =
         event.getToolType(index) == TOOL_TYPE_PALM
+
+    /** A pointing device rather than a finger: a mouse, a trackball, a touchpad. */
+    private fun isMouse(event: MotionEvent): Boolean {
+        val source = event.source
+        return source and android.view.InputDevice.SOURCE_MOUSE == android.view.InputDevice.SOURCE_MOUSE ||
+            (0 until event.pointerCount).any { event.getToolType(it) == MotionEvent.TOOL_TYPE_MOUSE }
+    }
 
     fun isControlConnected(): Boolean = isConnected
 
