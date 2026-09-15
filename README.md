@@ -397,6 +397,14 @@ bytes) arrived byte-for-byte, with `wl-paste --list-types` offering
 `DRILL_SEND_CLIPBOARD`, `DRILL_SEND_SCREENSHOT` and `DRILL_SEED_CLIPBOARD`
 broadcasts (see `DrillReceiver.kt`).
 
+### Planned: controlling the tablet from the PC
+
+Not built. [docs/pc-to-tablet-control.md](docs/pc-to-tablet-control.md)
+lays out a shortcut that puts the tablet in DeX and then forwards the
+PC's mouse and keyboard to it, the portals this session already offers
+for it (InputCapture, GlobalShortcuts), the tablet-side injector, and
+what to verify first.
+
 ### Portal token persistence (one-time consent)
 
 The capture/RemoteDesktop session requests `persist_mode=2`. Per the XDG
