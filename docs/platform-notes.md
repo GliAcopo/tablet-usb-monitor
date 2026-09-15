@@ -63,6 +63,22 @@ same process that would otherwise open the Air Command panel.
   account, so this project fetches them from a pinned commit of a public
   mirror with checksums (`dependencies.json`).
 
+**Injected events draw no pointer; a UHID device does.** Android draws a
+mouse cursor only for a device its InputReader knows about, so
+`injectInputEvent` with `SOURCE_MOUSE` moves an invisible pointer. Writing
+an HID report descriptor to `/dev/uhid` (group `uhid`, which `adb shell`
+belongs to, so no root) creates a real one: `dumpsys input` then lists it
+as `CURSOR | EXTERNAL` with a `/dev/input/eventN` of its own, and it gets
+the tablet's pointer acceleration and keyboard layout. Two event types are
+enough — `UHID_CREATE2` (11) and `UHID_INPUT2` (12), written as packed
+structs; the kernel zero-fills the rest, so a short write is a complete
+event. `IsWaking: false` for such a device: moving it does not wake a
+dozing tablet.
+- Source: `linux/uhid.h`, `drivers/hid/uhid.c`; the evdev↔HID usage map is
+  the kernel's `hid_keyboard[]` in `drivers/hid/hid-input.c`.
+- Observed 2026-09-15: `getevent -pl` and `dumpsys input` both show
+  "tabs9 remote mouse"/"tabs9 remote keyboard" after the receiver starts.
+
 **Injection as the shell user reaches everything on screen** (including
 Samsung DeX windows): `InputManager.injectInputEvent(event, 0)` through
 `android.hardware.input.InputManagerGlobal.getInstance()` (Android 14+;
@@ -226,6 +242,11 @@ is *not* captured and reaches the desktop as usual.
 - KWin's own escape hatch is a global shortcut, "Disable Active Input
   Capture" (Meta+Shift+Escape), handled inside KWin's barrier spy, so it
   works even while every other key is captured.
+- **No other global shortcut fires while a capture is active**: the capture
+  filter is `InputFilterOrder::EisInput`, above `GlobalShortcut` in
+  `input.h`, so kglobalaccel never sees the keys. Anything that has to be
+  able to *stop* a capture must recognise its own key combination inside
+  the captured stream (spies see events; filters that run later do not).
 
 **Portals present in this session** (`busctl --user introspect
 org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop`, all from
@@ -303,3 +324,12 @@ are `plasmashell` (`caption` empty). Useful fields: `w.output.name`,
   real mouse or keyboard can be created for testing without root:
   `scripts/test-mouse.py`. It is the only way to exercise input capture,
   which by design does not carry this project's own injected input.
+- **A Wayland window cannot both choose its screen and stay unfocused.**
+  Placement needs `setScreen()` + `showFullScreen()`, and Qt calls
+  `requestActivate()` for that, which takes the keyboard focus (measured
+  with a key probe; `WA_ShowWithoutActivating`, `Qt::Tool`,
+  `WindowDoesNotAcceptFocus` and `WindowTransparentForInput` do not stop
+  it, and Qt prints "requestActivate() called for ... which has
+  Qt::WindowDoesNotAcceptFocus set"). An override-redirect XWayland window
+  (`X11BypassWindowManagerHint`) has both properties, which is what
+  `scripts/tabs9-banner.py` uses.

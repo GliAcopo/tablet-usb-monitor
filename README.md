@@ -410,12 +410,19 @@ Settings → Shortcuts → *Tab S9 USB display*), so they can be rebound like
 any other; the host prints what they are bound to when it starts, and says
 so if another application already owns the key it proposes.
 
-**Getting out is never in doubt.** The shortcut works while the tablet has
-the input (it is not a key the desktop has to see: KDE's shortcut daemon
-handles it), KWin's own *Meta+Shift+Escape* ("Disable Active Input
-Capture") always releases a capture, and so does unplugging the tablet or
-stopping the host. The pointer is put back in the middle of the computer's
-screen afterwards.
+**A banner on every screen says which of the three you are in**, and which
+key changes it — there is no guessing, and no state you can be in without
+being told. It is a strip at the top of each screen
+(`scripts/tabs9-banner.py`), it takes no focus and clicks go through it.
+
+**Getting out is never in doubt.** While the tablet has the input, KDE
+cannot see the keyboard at all (KWin's capture filter runs above its global
+shortcuts), so the host watches the captured keys itself and releases on
+the same combination KDE has bound — pressing `Meta+Shift+T` works exactly
+as it reads on the banner. KWin's own *Meta+Shift+Escape* ("Disable Active
+Input Capture") is handled inside the compositor and always works too, and
+so does unplugging the tablet or stopping the host. The pointer is put back
+in the middle of the computer's screen afterwards.
 
 **How the input is taken.** Not by a window stealing focus: the host uses
 KWin's **input capture** (the mechanism the InputCapture portal and
@@ -435,22 +442,26 @@ portable path and would ask for permission every time a session is set up;
 it is not implemented.
 
 **On the tablet**, a small receiver (`scripts/tabs9-remote`, pushed by its
-`build-and-push.sh`) runs over ADB as the shell user and turns the events
-into Android MotionEvents and KeyEvents — the same injection UI Automator
-uses, so they reach the tablet's own launcher and its desktop-mode windows.
-`--remote-sensitivity` (default 2.0) sets how many tablet pixels a logical
-pixel of mouse movement covers; the key layout is Android's own (the evdev
-code names the physical key, so the tablet's layout decides the letter).
+`build-and-push.sh`) runs over ADB as the shell user and creates a **real
+mouse and keyboard** through `/dev/uhid`. That is what makes the pointer
+*visible*: Android draws a cursor only for a device its input reader knows
+about, and a UHID device is one — it appears as `CURSOR | EXTERNAL`, gets
+the tablet's own pointer acceleration and keyboard layout, and works in
+desktop mode like anything plugged into the USB port. On a tablet whose
+shell user cannot open `/dev/uhid`, the receiver falls back to injecting
+events (which reach every window but draw no pointer) and says so in the
+host's log. `--remote-sensitivity` (default 1.0) scales the movement
+before the tablet's own acceleration.
 
 Verified live with a real (virtual) mouse and keyboard created through
 uinput, `scripts/test-mouse.py`: the shortcut cycle handed the input over
 and back, 26 pointer motions, both buttons, a wheel notch and the keys
-arrived on the tablet, the desktop saw none of them, and typing "kde" on
-the captured keyboard searched for *kde* in the tablet's Settings. Pushing
-the pointer against the armed edge did the same. What the pen and the
-finger do on the tablet is untouched while it is being driven: the host
-stops forwarding the tablet's own touches so they cannot come back as
-pointer events.
+arrived on the tablet, the desktop saw none of them, typing "kde" on the
+captured keyboard searched for *kde* in the tablet's Settings, and
+`Meta+Shift+T` pressed *while captured* released it. Pushing the pointer
+against the armed edge did the same. What the pen and the finger do on the
+tablet is untouched while it is being driven: the host stops forwarding the
+tablet's own touches so they cannot come back as pointer events.
 
 ### Tablet clipboard and screenshots to the PC
 

@@ -16,6 +16,8 @@ Android 16.
 | `src/remote.py` | the state machine, the capture, the socket to the tablet |
 | `src/eis_receive.py` | libei *receiver* (the mirror of `eis_touch.py`'s sender) |
 | `scripts/tabs9-remote/Remote.java` | the tablet's receiver: events in, Android input out |
+| `scripts/tabs9-remote/Uhid.java` | the real mouse and keyboard it makes on the tablet |
+| `scripts/tabs9-banner.py` | the strip on every screen saying what state this is |
 | `scripts/test-mouse.py` | a uinput mouse/keyboard, to test all of it without hands |
 
 The flow, once the shortcut has taken the input:
@@ -23,8 +25,8 @@ The flow, once the shortcut has taken the input:
 ```
 mouse/keyboard -> libinput -> KWin -> EisInputCaptureFilter -> libei socket
    -> EisReceiver (host) -> RemoteControl.handle -> 12-byte records
-   -> adb forward -> LocalServerSocket -> Remote.java -> injectInputEvent
-   -> whatever is on the tablet's screen
+   -> adb forward -> LocalServerSocket -> Remote.java -> /dev/uhid
+   -> the kernel's HID layer -> Android's InputReader -> a visible pointer
 ```
 
 ## KWin's input capture, as it actually behaves
@@ -71,6 +73,16 @@ looks the way it does.
    the host's own absolute injection (the pen, the touches) has to be
    stopped by the host itself in remote mode rather than being captured.
 
+5. **No key reaches KDE while a capture is active.** The capture filter sits
+   at `InputFilterOrder::EisInput`, above `GlobalShortcut`, so the shortcut
+   that started the capture cannot end it — and a test that releases over
+   D-Bus (as the first ones did) never notices. The host watches the
+   captured key stream for the combination KDE has bound to its own action
+   and releases on it, swallowing those keys rather than sending them to
+   the tablet. KWin's "Disable Active Input Capture" (Meta+Shift+Escape)
+   works because it is handled in the barrier *spy*, and spies run before
+   filters.
+
 Two more practical notes: every call into the capture is made
 asynchronously, because they are made from inside D-Bus signal handlers and
 the same process has to keep the libei socket serviced; and the barrier is
@@ -84,8 +96,22 @@ outputs move (a host restart puts the tablet on the right until
 route) and listens on the abstract socket `tabs9-remote`, which the host
 reaches through `adb forward tcp:8892 localabstract:tabs9-remote`. The
 protocol is twelve bytes per event: `u8 type, u8 flags, u16 code, i32 a,
-i32 b` — move (absolute tablet pixels), button (evdev code), scroll
+i32 b` — move (relative, in tablet pixels), button (evdev code), scroll
 (thousandths of a wheel notch), key (evdev code), reset.
+
+**It makes a real mouse and keyboard** (`Uhid.java`): `/dev/uhid` is
+group-owned by `uhid`, and `adb shell` is in that group, so the receiver
+can write a `UHID_CREATE2` event with an HID report descriptor and then
+`UHID_INPUT2` reports. The kernel builds an input device from it and
+Android's InputReader lists it as `CURSOR | EXTERNAL` — which is the whole
+point: **injected events draw no pointer**, so the first version had an
+invisible cursor. Only those two writes are needed; the kernel zero-fills
+the rest of its event struct, so a short write is a complete event. The
+mouse report is five bytes (buttons, dx, dy, wheel, hwheel) with motion
+split into ±127 steps, and the keyboard is boot protocol (modifier byte,
+reserved, six usages) with the evdev→HID usage table generated from the
+kernel's own `hid_keyboard[]`. `IsWaking: false`, so moving the mouse does
+not wake a sleeping tablet.
 
 * **ADB's forward accepts a local connection whether or not anything
   listens on the device**, so "the socket connected" says nothing. The
@@ -102,10 +128,32 @@ i32 b` — move (absolute tablet pixels), button (evdev code), scroll
   `ACTION_HOVER_MOVE`, and a drag is `ACTION_DOWN`/`MOVE`/`UP` with
   `ACTION_BUTTON_PRESS`/`RELEASE` carrying `setActionButton` (the
   dispatcher refuses a button action without it).
-* Keys are mapped from evdev codes to Android keycodes with a table
-  generated from Android 16's `Generic.kl` at build time, and injected with
-  `KeyCharacterMap.VIRTUAL_KEYBOARD`, so the tablet's own layout decides
-  the character.
+* The fallback path keeps the absolute position on the tablet side and maps
+  evdev codes to Android keycodes with a table generated from Android 16's
+  `Generic.kl`, injecting with `KeyCharacterMap.VIRTUAL_KEYBOARD`.
+* The greeting's third byte says which path is in use: `u` real devices,
+  `i` injection.
+
+## The banner
+
+`scripts/tabs9-banner.py` is a separate process (the host writes one JSON
+line per state change to its stdin) because it needs a Qt event loop of its
+own. It draws a strip at the top of every screen.
+
+It runs on **XWayland**, which is not a compromise but the only way to get
+the two properties this needs at once: a window placed on a chosen screen,
+and a window that never takes the keyboard focus. Under Wayland a client
+cannot position itself, so the only way to pick a screen is `setScreen()`
+plus `showFullScreen()` — and that asks the compositor to activate the
+window, which takes focus away from whatever the user is typing into
+(measured: a key probe stopped receiving keys the moment the banner
+appeared; `WA_ShowWithoutActivating`, `Qt::Tool`, `WindowDoesNotAcceptFocus`
+and `WindowTransparentForInput` did not change that, and Qt even warns that
+it called `requestActivate()` itself). Under X11 the same window is
+override-redirect (`X11BypassWindowManagerHint`): KWin never manages it,
+never focuses it, and Qt gives it an empty input shape so clicks pass
+through. Verified with the same key probe: typing kept working with the
+banner up.
 
 ## What is not done
 
