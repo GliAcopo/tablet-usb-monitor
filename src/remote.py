@@ -188,11 +188,12 @@ class TabletInjector:
 class InputCapture:
     """One KWin input capture, with its libei receiver.
 
-    ``source='kwin'`` asks KWin directly (no dialog: this is the same
-    interface xdg-desktop-portal-kde uses once consent is given, and only
-    this session's own processes can reach it). ``source='portal'`` goes
-    through org.freedesktop.portal.InputCapture instead, which asks the user
-    every time the session is created, and is the portable path.
+    The capture is asked of KWin directly: the same interface
+    xdg-desktop-portal-kde drives on the other side of
+    org.freedesktop.portal.InputCapture, reachable only by this session's
+    own processes and without a dialog. The portal is the portable path and
+    would ask the user each time a session is created; it is not implemented
+    here (see docs/pc-to-tablet-control.md).
     """
 
     def __init__(self, bus, *, source: str = 'kwin',

@@ -338,44 +338,119 @@ fingers' mean point, to the pixel where a one-finger tap at the same place
 lands, both for a 60 ms and a 250 ms hold; 0 touches rejected. Needs the
 libei device, like scrolling.
 
-### S Pen side button: application launcher
+### S Pen button and air gestures
 
-Pressing the S Pen's side button while the pen hovers over the tablet
-invokes Plasma's "Activate Application Launcher" global shortcut (the
-`plasmashell` kglobalaccel component), the same thing the Meta key does;
-a second press closes it again. The host acts on the press only while the
-pen is hovering: with the tip down the button is left alone (the stroke
-goes on) and the release is not used. `--pen-button off` ignores it.
+The S Pen's side button drives the computer: a press opens Plasma's
+application launcher, and a press *with a flick of the pen in the air*
+does whatever you bound that direction to — the same six gestures
+Samsung's Air actions offer, but pointed at KDE.
 
-Where the launcher opens is Plasma's decision: it takes the panel on KWin's
-active output, which is the tablet while the pen hovers there, and falls
-back to any launcher when that output has no panel. So without a panel on
-the tablet the menu opens on the laptop's; add a panel with a launcher to
-the tablet's screen to have it open under the pen.
+| gesture | default |
+| --- | --- |
+| click (no motion) | `plasmashell:activate application launcher` |
+| up / down | `kwin:Overview` / `kwin:Grid View` |
+| left / right | `kwin:Switch One Desktop to the Left` / `... to the Right` |
+| clockwise / counterclockwise | `kwin:Walk Through Windows` / `... (Reverse)` |
 
-**Not working yet with the real S Pen** on the Tab S9 Ultra: pressing its
-button while hovering opens Samsung's Air Command panel on the tablet and
-nothing reaches the app. On this pen the button is not a digitizer barrel
-button but a Bluetooth one: Air Command's own service receives it over
-BLE (`[AirCmd]_BleDriver ... UUID_BUTTON_EVENT`, `StickySpenDriver:
-dispatchButtonData`), pairs it with its hover detector and opens its
-panel; the hover events the app sees carry no button state at all. The
-way to get it is Samsung's S Pen Remote SDK (`com.samsung.android.sdk.
-penremote`: connect while in the foreground, register a `ButtonEvent`
-listener), which is how apps take the button over from Air Command; that
-is planned with the rest of the PC-side work
-([docs/pc-to-tablet-control.md](docs/pc-to-tablet-control.md)).
+```bash
+./tabs9 pen-actions                       # what each gesture does now
+./tabs9 shortcuts                         # KDE components that have actions
+./tabs9 shortcuts kwin                    # ... and the action names of one
+./tabs9 pen-actions up "kwin:Window One Desktop to the Left"
+./tabs9 pen-actions clockwise "exec:kate"     # or any command
+./tabs9 pen-actions down ""                   # nothing
+```
 
-What is in place and verified: the host path (pen action 5 while hovering
-→ the launcher shortcut, action 5 with the tip down ignored) and the
-app's edge detection on the button state of hover events, which is what
-a digitizer-reported stylus button produces. Android never delivers the
-discrete `ACTION_BUTTON_PRESS` to an app while the stylus is only
-hovering (the input dispatcher drops button actions when no pointer is
-down, AOSP 14 through 16), hence the button-state reading. Verified live
-with a synthetic stylus hover and side-button press (`scripts/mt-inject
-penbutton`): the host saw one press per click, the launcher opened on
-the laptop's panel and closed on the next press.
+The bindings live in `.local/state/pen-actions.json` (written on the first
+run) and the host reads them at start-up, so restart it after a change. A
+target is either the name of a KDE global shortcut, written
+`component:action name`, or `exec:` and a command line. `--pen-button
+launcher` keeps the button to the launcher and ignores gestures; `off`
+ignores the button entirely.
+
+**How the button gets here.** On the Tab S9 Ultra the button is a
+*Bluetooth* button, not a barrel switch on the digitizer: no MotionEvent
+ever reports it, and Samsung's Air Command service answers it by opening
+its own panel. The app therefore asks for it through Samsung's **S Pen
+Remote SDK** (`SpenButton.kt`), which is the supported way to take it over:
+while the app is in front, the button and the pen's motion sensor belong to
+it and Air Command stays out of the way. The jars are downloaded by
+`scripts/build-android.sh` with pinned checksums (see `dependencies.json`);
+the settings sheet shows whether the connection succeeded. The pen's air
+motion arrives as small deltas while the button is held; the host adds them
+up and decides what the gesture was when the button comes back up
+(`src/air.py`), logging what it measured:
+
+```
+S Pen up (+0.00, -2.50; area +0.00; 5 samples) -> kwin:Overview
+```
+
+so `--air-threshold` can be tuned to your hand. Verified live with
+synthetic pen events (`DRILL_PEN_GESTURE`, see `DrillReceiver.kt`): click,
+up, left and right each fired their binding, and the SDK reported "Button
+and air gestures" on this tablet. **The physical pen's own button and the
+circle gestures have not been tried yet** — that needs the pen in hand.
+
+### Driving the tablet from the computer
+
+`Meta+Shift+T` makes the tablet a computer of its own and hands it this
+computer's mouse and keyboard:
+
+1. **First press** — the display app steps aside and the tablet shows its
+   own Android desktop (a notification says what the next press does).
+2. **Second press** — the desktop stops receiving input entirely and every
+   mouse movement, click, wheel notch and key goes to the tablet instead,
+   as if they were plugged into it.
+3. **Third press** — the computer has them back, the tablet keeps its own
+   desktop. Then it alternates between 2 and 3.
+
+`Meta+Shift+D` brings the display app back: the tablet is the computer's
+screen again. Both shortcuts are registered in KDE's own list (System
+Settings → Shortcuts → *Tab S9 USB display*), so they can be rebound like
+any other; the host prints what they are bound to when it starts, and says
+so if another application already owns the key it proposes.
+
+**Getting out is never in doubt.** The shortcut works while the tablet has
+the input (it is not a key the desktop has to see: KDE's shortcut daemon
+handles it), KWin's own *Meta+Shift+Escape* ("Disable Active Input
+Capture") always releases a capture, and so does unplugging the tablet or
+stopping the host. The pointer is put back in the middle of the computer's
+screen afterwards.
+
+**How the input is taken.** Not by a window stealing focus: the host uses
+KWin's **input capture** (the mechanism the InputCapture portal and
+Input Leap use), so while it is active the desktop genuinely has no
+pointer and no keyboard. KWin only *starts* a capture when the pointer is
+pushed against a screen edge carrying a barrier, so the shortcut arms a
+barrier on the outer edge of the tablet's screen, parks the pointer there
+and pushes it across with the host's own libei sender — the motion a hand
+would have made. `--remote-edge left|right|top|bottom` leaves that edge
+armed so the hand can do it directly; by default the barrier exists only
+for the instant the shortcut needs it, so nothing is entered by accident.
+The capture is asked of KWin directly, which asks nothing: it is the same
+interface `xdg-desktop-portal-kde` drives on the other side of
+`org.freedesktop.portal.InputCapture`, and only this session's own
+processes can reach it. Going through the portal instead would be the
+portable path and would ask for permission every time a session is set up;
+it is not implemented.
+
+**On the tablet**, a small receiver (`scripts/tabs9-remote`, pushed by its
+`build-and-push.sh`) runs over ADB as the shell user and turns the events
+into Android MotionEvents and KeyEvents — the same injection UI Automator
+uses, so they reach the tablet's own launcher and its desktop-mode windows.
+`--remote-sensitivity` (default 2.0) sets how many tablet pixels a logical
+pixel of mouse movement covers; the key layout is Android's own (the evdev
+code names the physical key, so the tablet's layout decides the letter).
+
+Verified live with a real (virtual) mouse and keyboard created through
+uinput, `scripts/test-mouse.py`: the shortcut cycle handed the input over
+and back, 26 pointer motions, both buttons, a wheel notch and the keys
+arrived on the tablet, the desktop saw none of them, and typing "kde" on
+the captured keyboard searched for *kde* in the tablet's Settings. Pushing
+the pointer against the armed edge did the same. What the pen and the
+finger do on the tablet is untouched while it is being driven: the host
+stops forwarding the tablet's own touches so they cannot come back as
+pointer events.
 
 ### Tablet clipboard and screenshots to the PC
 
@@ -413,17 +488,12 @@ broadcasts (see `DrillReceiver.kt`).
 ### Platform notes
 
 [docs/platform-notes.md](docs/platform-notes.md) collects what was learned
-about Android's input dispatcher, Samsung's Air Command and DeX, KWin's
-EIS devices and clipboard rules, Plasma's launcher and shortcuts, with
-the source file and line each finding rests on.
-
-### Planned: controlling the tablet from the PC
-
-Not built. [docs/pc-to-tablet-control.md](docs/pc-to-tablet-control.md)
-lays out a shortcut that puts the tablet in DeX and then forwards the
-PC's mouse and keyboard to it, the portals this session already offers
-for it (InputCapture, GlobalShortcuts), the tablet-side injector, and
-what to verify first.
+about Android's input dispatcher, Samsung's Air Command, the S Pen's
+Bluetooth button and DeX, KWin's EIS devices, input capture and clipboard
+rules, Plasma's launcher and shortcuts, with the source file and line each
+finding rests on. [docs/pc-to-tablet-control.md](docs/pc-to-tablet-control.md)
+is how remote control is put together, what it took to make KWin's capture
+behave, and what is left to do.
 
 ### Portal token persistence (one-time consent)
 

@@ -46,6 +46,23 @@ hidden-API enforcement there); `scripts/mt-inject` does that.
 - Observed: `InputDispatcher: Injection failed: invalid event: action
   button should be nonzero for BUTTON_PRESS` before the fix.
 
+**An app can take the Bluetooth S Pen's button back from Air Command**
+through Samsung's S Pen Remote SDK (`com.samsung.android.sdk.penremote`):
+`SpenRemote.getInstance().connect(context, callback)` while the activity is
+in the foreground, then `SpenUnitManager.getUnit(SpenUnit.TYPE_BUTTON)` and
+`registerSpenEventListener(listener, unit)`; `TYPE_AIR_MOTION` gives the
+pen's gyroscope as `AirMotionEvent.getDeltaX/Y()`. A `SpenEvent` does not
+say which unit produced it, so there is one listener per unit (as the
+vendor sample does). Observed on this tablet: the service answers
+`isFeatureEnabled` for both units and the app logs "Button and air
+gestures"; the SDK's own service is `[AirCmd]_RemoteSpenService`, i.e. the
+same process that would otherwise open the Air Command panel.
+- Source: S Pen Remote SDK 1.0.2 guide and API reference,
+  `https://developer.samsung.com/galaxy-spen-remote/s-pen-remote-sdk.html`.
+  The jars are not on Maven Central; the vendor download needs a Samsung
+  account, so this project fetches them from a pinned commit of a public
+  mirror with checksums (`dependencies.json`).
+
 **Injection as the shell user reaches everything on screen** (including
 Samsung DeX windows): `InputManager.injectInputEvent(event, 0)` through
 `android.hardware.input.InputManagerGlobal.getInstance()` (Android 14+;
@@ -127,6 +144,21 @@ should toggle it (untested). Settings keys seen: `desktop_mode`,
 **`adb shell am broadcast --es`** goes through a remote shell: quote the
 value twice (`--es text "'a b c'"`) or only the first word arrives.
 
+**`adb forward` accepts the local connection whether or not anything is
+listening on the device.** A TCP connect to the forwarded port always
+succeeds; the connection is only closed when the first write cannot be
+delivered ("Broken pipe"). Anything that has to know whether the other end
+exists needs the device side to say something first: `Remote.java` writes
+two bytes on accept, and the host starts a receiver only if they do not
+come.
+
+**Mouse events on the tablet are touch events to an app.** With `SOURCE_MOUSE`,
+`ACTION_DOWN`/`MOVE`/`UP` reach `onTouchListener` like a finger (only
+`HOVER_*` and `SCROLL` go to the generic-motion path), so an app that
+forwards touches somewhere else has to filter mouse input out explicitly —
+otherwise the pointer this project sends *to* the tablet comes straight
+back as a touch on the computer.
+
 ## KWin (Wayland) and libei
 
 **The EIS "absolute device" carries pointer-absolute, scroll, button and
@@ -174,6 +206,27 @@ fix), so run it with both redirected to `/dev/null`.
 - Source: `kwin/src/wayland/seat.cpp` (Plasma/6.6) `updateSelection`
   ≈ line 312.
 
+**KWin's input capture** (`org.kde.KWin.EIS.InputCaptureManager` on
+`/org/kde/KWin/EIS/InputCapture`) is what the InputCapture portal drives;
+it can be used directly by this session's own processes, with no dialog.
+Four behaviours worth knowing, all found by experiment on 6.6.6 and
+explained in `docs/pc-to-tablet-control.md`: a capture activates only when
+the pointer is pushed *against a workspace edge* carrying a barrier (both
+the current and the previous position must be on it, with an orthogonal
+delta); a capture created and activated in the same instant swallows the
+input instead of forwarding it, so it has to be created ahead of time;
+changing its barriers while it is active (`enable([])`) stops delivery in
+the same way, and the portal's own state machine forbids exactly that; and
+`EisInputCaptureFilter` has no `pointerMotionAbsolute` override, so
+absolute pointer motion (a graphics tablet, or this host's own injection)
+is *not* captured and reaches the desktop as usual.
+- Source: `kwin/src/plugins/eis/eisinputcapturemanager.cpp`,
+  `eisinputcapture.cpp`, `eisinputcapturefilter.cpp` (Plasma/6.6);
+  `xdg-desktop-portal-kde/src/inputcapture.cpp` for the state rules.
+- KWin's own escape hatch is a global shortcut, "Disable Active Input
+  Capture" (Meta+Shift+Escape), handled inside KWin's barrier spy, so it
+  works even while every other key is captured.
+
 **Portals present in this session** (`busctl --user introspect
 org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop`, all from
 `kde.portal`): RemoteDesktop (used), ScreenCast (used), **InputCapture
@@ -191,6 +244,22 @@ Wayland windows: put a probe on the tablet with
 `windowHandle().setScreen(screen)` then `showFullScreen()`.
 
 ## Plasma
+
+**Registering a shortcut in KDE's own list** takes three calls on
+`org.kde.KGlobalAccel` (`/kglobalaccel`): `doRegister([component, action,
+component label, action label])`, then `setShortcut(action, keys, 4)` to
+record the *default* key, then `setShortcut(action, keys, 2)` which assigns
+it the first time and afterwards returns whatever the user chose —
+autoloading keeps their binding, and the call answers with the keys in
+force. Presses arrive as `globalShortcutPressed` on
+`/component/<component>`. A key another component already owns is refused
+(the action stays bound to nothing), and `invokeShortcut` on our own
+component fires the action over D-Bus, which is how this project tests
+shortcut paths without pressing keys. Flags come from kglobalacceld's
+`SetShortcutFlag`: SetPresent 2, IsDefault 4, NoAutoloading 8.
+- Source: `kglobalacceld/src/kglobalacceld.cpp` (`setShortcutKeys`).
+- Qt key values: letters are their ASCII uppercase, modifiers are
+  Shift 0x02000000, Ctrl 0x04000000, Alt 0x08000000, Meta 0x10000000.
 
 **Global shortcuts live in kglobalaccel components**: KWin's under
 `/component/kwin` ("Walk Through Windows", "Overview", "Grid View",
@@ -230,3 +299,7 @@ are `plasmashell` (`caption` empty). Useful fields: `w.output.name`,
   `invent.kde.org` raw URLs, `android.googlesource.com` (`?format=TEXT`,
   base64) and `gitlab.freedesktop.org` worked.
 - `grep` may be aliased to ugrep, which prints nothing for binary files.
+- `/dev/uinput` is writable by the logged-in user here (a seat ACL), so a
+  real mouse or keyboard can be created for testing without root:
+  `scripts/test-mouse.py`. It is the only way to exercise input capture,
+  which by design does not carry this project's own injected input.

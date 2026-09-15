@@ -32,6 +32,13 @@ def main():
     wl_copy = shutil.which('wl-copy') or ROOT / '.local/sysroot/usr/bin/wl-copy'
     print(f'wl-copy (tablet clipboard to PC, optional): '
           f'{"ready" if Path(wl_copy).is_file() else "missing: run scripts/setup-native.sh"}')
+    # Optional: the tablet-side receiver for remote control (mouse/keyboard).
+    if adb.is_file():
+        pushed = subprocess.run([str(adb), 'shell', 'ls', '/data/local/tmp/tabs9-remote.dex'],
+                                capture_output=True, timeout=10)
+        print('tabs9-remote on the tablet (remote control, optional): '
+              + ('ready' if pushed.returncode == 0 else
+                 'missing: run scripts/tabs9-remote/build-and-push.sh'))
     if adb.is_file():
         result = subprocess.run([str(adb), '-d', 'get-state'], capture_output=True, timeout=10)
         check('One authorized USB tablet', result.returncode == 0 and result.stdout.strip() == b'device')

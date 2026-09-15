@@ -1542,7 +1542,7 @@ class Host:
         """The remote-control machinery, created on first use."""
         if self.remote_control is None:
             injector = TabletInjector(adb, str(ADB), port=self.args.remote_port)
-            capture = InputCapture(self.bus, source=self.args.remote_capture)
+            capture = InputCapture(self.bus)
             self.remote_control = RemoteControl(injector, capture,
                 panel=self.tablet_panel or (self.args.width, self.args.height),
                 sensitivity=self.args.remote_sensitivity, edge=self.args.remote_edge,
@@ -2095,10 +2095,6 @@ if __name__ == '__main__':
     parser.add_argument('--remote', choices=['on', 'off'], default='on',
                         help='register the KDE shortcuts that show the tablet its own desktop '
                              "and send it this computer's mouse and keyboard (default on)")
-    parser.add_argument('--remote-capture', choices=['kwin', 'portal'], default='kwin',
-                        help='how the input is taken from the desktop: kwin asks KWin directly '
-                             "(default, no dialog), portal goes through the desktop portal's "
-                             'InputCapture, which asks every time it is set up')
     parser.add_argument('--remote-edge', choices=['left', 'right', 'top', 'bottom', 'none'],
                         default='none', metavar='SIDE',
                         help='also hand the input over when the pointer is pushed against this '
