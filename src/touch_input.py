@@ -34,6 +34,7 @@ TOUCH_MOTION = 2
 
 # Linux evdev BTN_LEFT, as required by NotifyPointerButton.
 BTN_LEFT = 0x110
+BTN_RIGHT = 0x111
 BUTTON_RELEASED = 0
 BUTTON_PRESSED = 1
 
@@ -406,6 +407,23 @@ class PortalTouchInput:
         else:
             self.portal.NotifyPointerButton(
                 self.session_handle, {}, BTN_LEFT, BUTTON_RELEASED)
+
+    # -- two-finger tap (libei backend only) ----------------------------------
+    def click(self, x: float, y: float, button: int = BTN_RIGHT) -> bool:
+        """Press and release a pointer button at a normalized point.
+
+        False when this session cannot: like scrolling, it needs the libei
+        device (KDE 6.6 refuses the portal's pointer calls), and a pen that
+        is down or a pointer drag in progress keeps the button state.
+        """
+        if isinstance(button, bool) or not isinstance(button, int) or not (0x100 <= button <= 0x11f):
+            raise TouchInputError("pointer button must be an evdev BTN_ code")
+        if (not getattr(self.touch_backend, "pen_capable", False) or self.pen_down or
+                self.pointer_slot is not None):
+            return False
+        x, y = self._position({"x": x, "y": y})
+        self.touch_backend.click(x, y, button)
+        return True
 
     # -- two-finger scrolling (libei backend only) ---------------------------
     @property

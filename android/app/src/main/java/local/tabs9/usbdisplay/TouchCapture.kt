@@ -267,8 +267,9 @@ class TouchCapture {
 
     /**
      * Forward stylus hover so the host's cursor follows the pen before it
-     * touches down. Returns true only for pen hover, so nothing else the
-     * activity might want to do with generic motion events is disturbed.
+     * touches down, and the S Pen's side button. Returns true only for those,
+     * so nothing else the activity might want to do with generic motion
+     * events is disturbed.
      */
     fun handleHoverEvent(event: MotionEvent, width: Int, height: Int): Boolean {
         if (!isConnected) return false
@@ -278,16 +279,42 @@ class TouchCapture {
             MotionEvent.ACTION_HOVER_ENTER,
             MotionEvent.ACTION_HOVER_MOVE -> {
                 if (!isPenLike(event, 0)) return false
+                notePenButtons(event)
                 sendPenEvent(event, 0, 3, vw, vh)
                 true
             }
             MotionEvent.ACTION_HOVER_EXIT -> {
                 if (!isPenLike(event, 0)) return false
+                notePenButtons(event)
                 sendPenProximityExit()
+                true
+            }
+            MotionEvent.ACTION_BUTTON_PRESS,
+            MotionEvent.ACTION_BUTTON_RELEASE -> {
+                if (!isPenLike(event, 0)) return false
+                notePenButtons(event)
                 true
             }
             else -> false
         }
+    }
+
+    /** Whether the S Pen's side button was down at the last pen event. */
+    private var penButtonDown = false
+
+    /**
+     * Report the S Pen's side button from the button state every pen event
+     * carries, on the edges only. The discrete ACTION_BUTTON_PRESS/RELEASE
+     * cannot be relied on: while the pen is hovering the input dispatcher
+     * drops them (no pointer is down, InputDispatcher's "Case 2"), and that
+     * is exactly when the host wants the press. The hover move that carries
+     * the new state does arrive.
+     */
+    private fun notePenButtons(event: MotionEvent) {
+        val down = event.buttonState and MotionEvent.BUTTON_STYLUS_PRIMARY != 0
+        if (down == penButtonDown) return
+        penButtonDown = down
+        sendPenButton(down)
     }
 
     fun handleMotionEvent(event: MotionEvent, width: Int, height: Int): Boolean {
@@ -311,6 +338,7 @@ class TouchCapture {
                     return true
                 }
                 if (isPenLike(event, actionIndex)) {
+                    notePenButtons(event)
                     sendPenEvent(event, actionIndex, 0, vw, vh)
                 } else {
                     sendTouch(event.getX(actionIndex) / vw,
@@ -324,6 +352,7 @@ class TouchCapture {
                 for (i in 0 until pointerCount) {
                     if (isPalm(event, i)) continue
                     if (isPenLike(event, i)) {
+                        notePenButtons(event)
                         // Android batches several samples between frames.
                         // Forward the historical points too, otherwise fast
                         // pen strokes look jagged in GIMP.
@@ -348,21 +377,13 @@ class TouchCapture {
                 }
             }
 
-            // S-Pen side button. Fired as a discrete event while hovering or
-            // drawing; forwarded as the stylus button (right-click in GIMP).
-            MotionEvent.ACTION_BUTTON_PRESS -> {
-                if (isPenLike(event, event.actionIndex)) sendPenButton(true)
-            }
-            MotionEvent.ACTION_BUTTON_RELEASE -> {
-                if (isPenLike(event, event.actionIndex)) sendPenButton(false)
-            }
-
             MotionEvent.ACTION_UP,
             MotionEvent.ACTION_POINTER_UP -> {
                 if (isPalm(event, actionIndex)) {
                     return true
                 }
                 if (isPenLike(event, actionIndex)) {
+                    notePenButtons(event)
                     sendPenEvent(event, actionIndex, 1, vw, vh)
                 } else {
                     sendTouch(event.getX(actionIndex) / vw,
@@ -506,7 +527,9 @@ class TouchCapture {
         webSocket?.send(msg.toString())
     }
 
+    /** The S Pen's side button; the host opens the application launcher on a press while hovering. */
     private fun sendPenButton(down: Boolean) {
+        Log.i(TAG, "S Pen side button ${if (down) "pressed" else "released"}")
         val msg = JSONObject().apply {
             put("type", "pen")
             put("x", 0.0)

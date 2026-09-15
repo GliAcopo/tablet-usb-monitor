@@ -29,6 +29,7 @@ EI_DEVICE_CAP_SCROLL = 1 << 4
 EI_DEVICE_CAP_BUTTON = 1 << 5
 
 BTN_LEFT = 0x110  # Linux evdev code; libei buttons use evdev codes.
+BTN_RIGHT = 0x111
 
 EI_EVENT_CONNECT = 1
 EI_EVENT_DISCONNECT = 2
@@ -350,6 +351,21 @@ class EisTouch:
         self._pen_down = False
         self._require_pen()
         self.lib.ei_device_button_button(self.device, BTN_LEFT, False)
+        self.lib.ei_device_frame(self.device, self.lib.ei_now(self.ei))
+
+    def click(self, x: float, y: float, button: int = BTN_RIGHT) -> None:
+        """Press and release a pointer button at a point (a two-finger tap's right click)."""
+        self._require_pen()
+        if self._pen_down:
+            raise EisError('EIS pen is down')
+        ax, ay = self._absolute(x, y)
+        self.lib.ei_device_pointer_motion_absolute(self.device, ax, ay)
+        self.lib.ei_device_frame(self.device, self.lib.ei_now(self.ei))
+        # Press and release in frames of their own, as a physical button
+        # reports them.
+        self.lib.ei_device_button_button(self.device, button, True)
+        self.lib.ei_device_frame(self.device, self.lib.ei_now(self.ei))
+        self.lib.ei_device_button_button(self.device, button, False)
         self.lib.ei_device_frame(self.device, self.lib.ei_now(self.ei))
 
     # -- two-finger scrolling: pointer axes aimed at the fingers ---------------

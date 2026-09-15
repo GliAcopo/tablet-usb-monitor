@@ -384,5 +384,90 @@ class TwoFingerScrollTests(GestureFilterTests):
         self.assertEqual(len(self.delivered), 2)
 
 
+class TwoFingerTapTests(TwoFingerScrollTests):
+    """Scrolling and taps on together: every scroll and swipe test still holds."""
+
+    def setUp(self):
+        super().setUp()
+        self.tapped = []
+        self.can_tap = True
+
+        def tap(x, y):
+            self.tapped.append((round(x, 4), round(y, 4)))
+            return self.can_tap
+        self.filter.tap = tap
+
+    def test_two_finger_tap_reaches_the_desktop(self):
+        # Overrides the base test: the tap is the host's now.
+        self.two()
+        self.send(touch(UP, 1))
+        self.assertEqual(self.tapped, [(0.325, 0.5)])
+        self.assertEqual(self.delivered, [])
+        self.assertEqual(self.filter.state, GESTURE)
+        self.send(touch(UP, 0))
+        self.assertEqual(self.filter.state, IDLE)
+        self.assertEqual(self.scrolled, [])
+        self.assertEqual(self.filter.tapped, 1)
+
+    def test_lift_inside_the_window_with_a_finger_left_passes_through(self):
+        # Overrides the base test: lifting without moving is the tap now, so
+        # the finger has to have moved for the sequence to pass through.
+        self.land([0, 1])
+        self.send(touch(MOTION, 1, 0.35, 0.52))
+        self.send(touch(UP, 1))
+        self.assertEqual(len(self.delivered), 4)
+        self.assertEqual(self.filter.state, PASS)
+        self.send(touch(UP, 0))
+        self.assertEqual(self.filter.state, IDLE)
+        self.assertEqual(self.tapped, [])
+
+    def test_quick_two_finger_tap_inside_the_window_is_a_tap_too(self):
+        self.land([0, 1])
+        self.send(touch(UP, 0))
+        self.assertEqual(self.tapped, [(0.325, 0.5)])
+        self.assertEqual(self.delivered, [])
+        self.assertEqual(self.loop.timers, {})
+        self.send(touch(UP, 1))
+        self.assertEqual(self.filter.state, IDLE)
+        # The next single tap is ordinary again.
+        self.send(touch(DOWN, 0, 0.1, 0.1), touch(UP, 0))
+        self.assertEqual(len(self.delivered), 2)
+
+    def test_two_fingers_that_moved_are_not_a_tap(self):
+        self.two()
+        self.send(touch(MOTION, 0, 0.3, 0.505), touch(MOTION, 1, 0.35, 0.512))   # under the scroll threshold
+        self.assertEqual(self.filter.state, TWO)
+        self.send(touch(UP, 1))
+        self.assertEqual(self.tapped, [])
+        self.assertEqual(len(self.delivered), 5)    # 2 down, 2 motion, 1 up
+        self.assertEqual(self.filter.state, PASS)
+
+    def test_a_late_finger_during_a_tap_is_dropped(self):
+        self.two()
+        self.send(touch(UP, 1), touch(DOWN, 2, 0.6, 0.6), touch(UP, 2), touch(UP, 0))
+        self.assertEqual(self.delivered, [])
+        self.assertEqual(self.filter.state, IDLE)
+
+    def test_tap_the_host_cannot_perform_reaches_the_desktop(self):
+        self.can_tap = False
+        self.two()
+        self.send(touch(UP, 1))
+        self.assertEqual(self.tapped, [(0.325, 0.5)])
+        self.assertEqual([m["action"] for m in self.delivered], [DOWN, DOWN, UP])
+        self.assertEqual(self.filter.state, PASS)
+
+    def test_taps_need_no_scrolling(self):
+        self.filter.scroll = None
+        self.two()
+        self.send(touch(UP, 1), touch(UP, 0))
+        self.assertEqual(self.tapped, [(0.325, 0.5)])
+        self.assertEqual(self.delivered, [])
+        # Two fingers moving together are the desktop's without ``scroll``.
+        self.two()
+        self.send(touch(MOTION, 0, 0.3, 0.55), touch(MOTION, 1, 0.35, 0.55))
+        self.assertEqual(self.filter.state, PASS)
+        self.assertEqual(len(self.delivered), 4)
+
+
 if __name__ == "__main__":
     unittest.main()

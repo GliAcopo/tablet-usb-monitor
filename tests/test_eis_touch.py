@@ -186,6 +186,17 @@ class EisScrollTests(unittest.TestCase):
         self.assertEqual(calls, [("stop", True, True), ("frame",)])
         self.assertFalse(touch._scrolling)
 
+    def test_click_aims_the_pointer_then_presses_and_releases(self):
+        touch, calls = self.scroller()
+        touch.click(10.0, 20.0)
+        self.assertEqual(calls, [
+            ("motion", 1473.0, 20.0), ("frame",),
+            ("button", 0x111, True), ("frame",),
+            ("button", 0x111, False), ("frame",)])
+        touch._pen_down = True
+        with self.assertRaises(Exception):
+            touch.click(1.0, 1.0)
+
 
 if __name__ == '__main__':
     unittest.main()

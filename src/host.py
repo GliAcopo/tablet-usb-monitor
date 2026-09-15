@@ -283,7 +283,13 @@ class Host:
         self.input_followon_rejected = 0
         self.gestures_fired = 0
         self.scrolls = 0
-        self.kglobalaccel = None
+        self.right_clicks = 0
+        self.pen_buttons = 0
+        # kglobalaccel component name -> D-Bus interface, bound on first use.
+        self.shortcut_components = {}
+        # The S Pen's side button, pressed while hovering: 'launcher' opens
+        # the application launcher (see PEN_BUTTON_SHORTCUT), 'off' ignores it.
+        self.pen_button = getattr(args, 'pen_button', 'launcher')
         # Multi-finger swipes and two-finger scrolls are picked out here,
         # before the desktop sees the contacts (see gestures.py); off
         # delivers every touch as is.
@@ -298,7 +304,9 @@ class Host:
                 schedule=lambda ms, callback: GLib.timeout_add(ms, self._input_timer, callback),
                 cancel=GLib.source_remove,
                 hold_ms=getattr(args, 'gesture_hold_ms', 120),
-                scroll=self.perform_scroll if scroll != 'off' else None)
+                scroll=self.perform_scroll if scroll != 'off' else None,
+                tap=self.perform_right_click
+                    if getattr(args, 'two_finger_tap', 'right-click') == 'right-click' else None)
         self.resyncs = 0
         # Video-socket liveness (see video()): features the tablet advertised
         # on the control channel, per-connection generation, and counters.
@@ -529,6 +537,11 @@ class Host:
             if self.gestures.scroll is not None:
                 print(f'Tablet scrolling: 2 fingers = scroll ({self.args.scroll}, '
                       f'gain {self.scroll_gain:g}; needs the libei device)', flush=True)
+            if self.gestures.tap is not None:
+                print('Tablet taps: 2 fingers = right click (needs the libei device)', flush=True)
+        if self.pen_button != 'off':
+            print(f'S Pen button (hovering): {self.pen_button} -> '
+                  f'{self.PEN_BUTTON_SHORTCUT[self.pen_button][1]!r}', flush=True)
         self.fd = self.portal.OpenPipeWireRemote(self.session, dbus.Dictionary({}, signature='sv')).take()
         self.capture_node = int(node)
         self.start_pipeline()
@@ -1249,6 +1262,8 @@ class Host:
         if self.touch is not None:
             if self.gestures is not None and message.get('type') == 'touch':
                 self._guard_input(self.gestures.handle, message)
+            elif message.get('type') == 'pen' and message.get('action') in (5, 6):
+                self.perform_pen_button(message)
             else:
                 self._guard_input(self.touch.handle_message, message)
         return False
@@ -1319,14 +1334,48 @@ class Host:
             self.touch.scroll_end()
         return True
 
+    def perform_right_click(self, x, y):
+        """Two fingers tapped together: a right click where they landed."""
+        if self.touch is None or not self.touch.click(x, y):
+            return False
+        self.right_clicks += 1
+        return True
+
+    # S Pen side button -> global shortcut, as (kglobalaccel component, name).
+    # Plasma opens the launcher of the panel on KWin's active output (the one
+    # under the pointer, so the tablet's own panel if it has one) and falls
+    # back to any launcher.
+    PEN_BUTTON_SHORTCUT = {
+        'launcher': ('plasmashell', 'activate application launcher'),
+    }
+
+    def perform_pen_button(self, message):
+        """The S Pen's side button (5 press, 6 release), while hovering only.
+
+        Pressed with the tip down it is left alone: the stroke goes on and a
+        launcher over it would be in the way. The release is not used.
+        """
+        shortcut = self.PEN_BUTTON_SHORTCUT.get(self.pen_button)
+        if shortcut is None or message.get('action') != 5 or self.touch.pen_down:
+            return False
+        self.pen_buttons += 1
+        print(f'S Pen button -> {shortcut[1]}', flush=True)
+        self.invoke_shortcut(*shortcut)
+        return True
+
     def invoke_kwin_shortcut(self, name):
-        if self.kglobalaccel is None:
-            self.kglobalaccel = dbus.Interface(
-                self.bus.get_object('org.kde.kglobalaccel', '/component/kwin'),
+        self.invoke_shortcut('kwin', name)
+
+    def invoke_shortcut(self, component, name):
+        interface = self.shortcut_components.get(component)
+        if interface is None:
+            interface = self.shortcut_components[component] = dbus.Interface(
+                self.bus.get_object('org.kde.kglobalaccel', f'/component/{component}'),
                 'org.kde.kglobalaccel.Component')
-        # Asynchronous: the touch path must not wait on KWin.
-        self.kglobalaccel.invokeShortcut(name, reply_handler=lambda *_: None,
-            error_handler=lambda error: print(f'KWin shortcut {name!r} failed: {error}', flush=True))
+        # Asynchronous: the touch path must not wait on KWin or Plasma.
+        interface.invokeShortcut(name, reply_handler=lambda *_: None,
+            error_handler=lambda error: print(f'{component} shortcut {name!r} failed: {error}',
+                                              flush=True))
 
     def note_tablet_panel(self, message):
         """Record the tablet's own panel size and warn once if it disagrees.
@@ -1461,6 +1510,8 @@ class Host:
             'tablet_input_followon_rejected': self.input_followon_rejected,
             'tablet_gestures': self.gestures_fired,
             'tablet_scrolls': self.scrolls,
+            'tablet_right_clicks': self.right_clicks,
+            'tablet_pen_buttons': self.pen_buttons,
             'client_resyncs': self.resyncs,
             'video_clients': len(self.clients), 'video_connects': self.video_connects,
             'video_disconnects': self.video_disconnects, 'last_video_disconnect': self.last_video_disconnect,
@@ -1602,6 +1653,12 @@ if __name__ == '__main__':
                         help='pointer-axis distance per logical pixel of finger travel (default '
                              f'{DEFAULT_SCROLL_GAIN}: content keeps pace with the fingers in Qt '
                              'apps, which read 10 axis units as one wheel notch)')
+    parser.add_argument('--two-finger-tap', choices=['right-click', 'off'], default='right-click',
+                        help='two fingers tapped together: a right click where they landed '
+                             '(default) or off (the desktop gets two taps)')
+    parser.add_argument('--pen-button', choices=['launcher', 'off'], default='launcher',
+                        help="the S Pen's side button pressed while hovering: launcher opens "
+                             'the application launcher (default), off leaves it alone')
     parser.add_argument('--rate-control', choices=['cbr', 'vbr', 'cqp'], default='cbr')
     parser.add_argument('--qp', type=int, default=24)
     args = parser.parse_args()

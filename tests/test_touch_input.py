@@ -249,6 +249,7 @@ class PortalTouchInputTests(unittest.TestCase):
             def scroll_end(self): self.calls.append(("end",))
             def pen_down(self, x, y): self.calls.append(("pen_down", x, y))
             def pen_up(self): self.calls.append(("pen_up",))
+            def click(self, x, y, button): self.calls.append(("click", x, y, button))
             def release_all(self): self.calls.append(("release_all",))
         touch, portal = controller(TOUCHSCREEN)
         backend = Backend()
@@ -276,6 +277,17 @@ class PortalTouchInputTests(unittest.TestCase):
         touch.scroll_begin(0.5, 0.5)
         touch.release_all()
         self.assertEqual(backend.calls[-1], ("release_all",))
+        # A two-finger tap's right click follows the same rules.
+        self.assertTrue(touch.click(0.5, 0.25))
+        self.assertEqual(backend.calls[-1], ("click", 986.5, 308.0, 0x111))
+        touch.handle_message({"type": "pen", "action": 0, "x": 0.25, "y": 0.5})
+        self.assertFalse(touch.click(0.5, 0.5))
+        touch.handle_message({"type": "pen", "action": 1, "x": 0.25, "y": 0.5})
+        touch.touch_backend = None
+        self.assertFalse(touch.click(0.5, 0.5))
+        with self.assertRaises(TouchInputError):
+            touch.click(0.5, 0.5, button=True)
+        self.assertEqual(portal.calls, [])
 
     def test_non_touch_messages_are_left_for_host(self):
         touch, portal = controller()

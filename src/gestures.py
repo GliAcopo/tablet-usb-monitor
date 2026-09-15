@@ -22,7 +22,9 @@ the hold window has passed with exactly two contacts down, they stay held
 until their mean position has travelled ``scroll_threshold`` (a scroll: the
 contacts are consumed and the travel goes to ``scroll`` as pointer-axis
 deltas) or their spacing has changed by that much (a pinch: the contacts are
-replayed and the desktop gets its two-finger gesture as usual).
+replayed and the desktop gets its two-finger gesture as usual).  Two
+fingers that lift without having moved that far are a two-finger tap: it
+goes to ``tap`` (a right click on the host) and nothing reaches the desktop.
 
 The recogniser is pure: the host supplies delivery, the actions, the clock
 and a one-shot timer, so the state machine is exercised in tests without
@@ -68,6 +70,10 @@ class GestureFilter:
     finger lifts; all in normalised screen units. A false result from
     ``'begin'`` means the host cannot scroll and the contacts are replayed
     as touches instead. ``None`` leaves two fingers to the desktop.
+
+    ``tap(x, y)`` is called with the mean landing point of two fingers that
+    lift without moving; a false result replays them as the two taps they
+    were. ``None`` leaves two-finger taps to the desktop.
     """
 
     def __init__(self, forward: Callable[[Mapping[str, Any]], Any],
@@ -78,18 +84,20 @@ class GestureFilter:
                  hold_ms: int = DEFAULT_HOLD_MS, threshold: float = DEFAULT_THRESHOLD,
                  min_fingers: int = 3, max_fingers: int = 4,
                  scroll: Callable[[str, float, float], Any] | None = None,
-                 scroll_threshold: float = DEFAULT_SCROLL_THRESHOLD):
+                 scroll_threshold: float = DEFAULT_SCROLL_THRESHOLD,
+                 tap: Callable[[float, float], Any] | None = None):
         if not 1 <= hold_ms <= 1000:
             raise ValueError('hold_ms must be between 1 and 1000')
         if not 0.0 < threshold <= 1.0 or not 0.0 < scroll_threshold <= 1.0:
             raise ValueError('threshold must be a fraction of the screen')
         if not 2 <= min_fingers <= max_fingers <= 10:
             raise ValueError('finger counts must satisfy 2 <= min <= max <= 10')
-        if scroll is not None and min_fingers <= 2:
-            raise ValueError('two-finger scrolling needs swipes of three fingers or more')
+        if (scroll is not None or tap is not None) and min_fingers <= 2:
+            raise ValueError('two-finger scrolling and taps need swipes of three fingers or more')
         self.forward = forward
         self.act = act
         self.scroll = scroll
+        self.tap = tap
         self.scroll_threshold = scroll_threshold
         self.schedule = schedule
         self.cancel = cancel
@@ -101,6 +109,7 @@ class GestureFilter:
         self.state = IDLE
         self.recognised = 0
         self.scrolled = 0
+        self.tapped = 0
         # Where the scrolling fingers' mean position was last reported.
         self.last_mean = (0.0, 0.0)
         # slot -> [x0, y0, x, y]: where each finger landed and where it is.
@@ -189,6 +198,9 @@ class GestureFilter:
             return
         # A lift this early is a tap, or a finger that changed its mind:
         # deliver everything now rather than after the window.
+        if len(self.contacts) == 2 and self._watching_two():
+            self._lift_two(message, slot)
+            return
         self.contacts.pop(slot, None)
         self.buffer.append(message)
         self._leave_hold()
@@ -211,11 +223,7 @@ class GestureFilter:
             self.state = PASS
             return
         if action == TOUCH_UP:
-            # A two-finger tap, or a finger that changed its mind.
-            self.contacts.pop(slot, None)
-            self.buffer.append(message)
-            self._flush()
-            self.state = PASS if self.contacts else IDLE
+            self._lift_two(message, slot)
             return
         if slot in self.contacts:
             self.contacts[slot][2:] = [x, y]
@@ -228,13 +236,13 @@ class GestureFilter:
 
     def _classify_two(self):
         a, b = self.contacts.values()
-        mx0, my0 = (a[0] + b[0]) / 2, (a[1] + b[1]) / 2
+        mx0, my0 = self._landing()
         mx, my = self._mean()
         travel = math.hypot(mx - mx0, my - my0)
         spread = abs(math.hypot(b[2] - a[2], b[3] - a[3]) - math.hypot(b[0] - a[0], b[1] - a[1]))
         if max(travel, spread) < self.scroll_threshold:
             return
-        if spread > travel or not self.scroll('begin', mx0, my0):
+        if spread > travel or self.scroll is None or not self.scroll('begin', mx0, my0):
             # A pinch, or nowhere to scroll to: the desktop gets the contacts.
             self._flush()
             self.state = PASS
@@ -246,6 +254,28 @@ class GestureFilter:
         self.scrolled += 1
         self.last_mean = (mx0, my0)
         self._scroll_to(mx, my)
+
+    def _lift_two(self, message, slot):
+        """One of two held fingers lifts: a two-finger tap unless they moved."""
+        moved = max(math.hypot(c[2] - c[0], c[3] - c[1]) for c in self.contacts.values())
+        mx0, my0 = self._landing()
+        self.contacts.pop(slot, None)
+        if self.tap is not None and moved < self.scroll_threshold and self.tap(mx0, my0):
+            # Consumed: the other finger's lift, and any late finger, are
+            # dropped the way a swipe's are.
+            self._cancel_timer()
+            self.buffer.clear()
+            self.tapped += 1
+            self.state = GESTURE
+            self.fingers = 2
+            self.fired = self.ended = True
+            if not self.contacts:
+                self.reset()
+            return
+        # A finger that changed its mind, or two taps for the desktop.
+        self.buffer.append(message)
+        self._flush()
+        self.state = PASS if self.contacts else IDLE
 
     def _scroll(self, action, slot, x, y):
         if action == TOUCH_DOWN:
@@ -263,6 +293,11 @@ class GestureFilter:
         self.ignored.discard(slot)
         if not self.contacts and not self.ignored:
             self.reset()
+
+    def _landing(self):
+        n = len(self.contacts)
+        return (sum(c[0] for c in self.contacts.values()) / n,
+                sum(c[1] for c in self.contacts.values()) / n)
 
     def _mean(self):
         n = len(self.contacts)
@@ -302,12 +337,15 @@ class GestureFilter:
     # -- helpers --------------------------------------------------------------
     def _leave_hold(self):
         self._cancel_timer()
-        if self.scroll is not None and len(self.contacts) == 2:
+        if len(self.contacts) == 2 and self._watching_two():
             # Exactly two fingers landed together: keep them until they move.
             self.state = TWO
             return
         self._flush()
         self.state = PASS if self.contacts else IDLE
+
+    def _watching_two(self):
+        return self.scroll is not None or self.tap is not None
 
     def _begin_gesture(self):
         self._cancel_timer()

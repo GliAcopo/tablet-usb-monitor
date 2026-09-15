@@ -34,7 +34,9 @@ class FakeTouch:
         self.releases = 0
         self.error = None
         self.scrolls = []
+        self.clicks = []
         self.scroll_capable = True
+        self.click_capable = True
         self.pen_down = False
         self.pointer_slot = None
 
@@ -57,6 +59,12 @@ class FakeTouch:
 
     def scroll_end(self):
         self.scrolls.append(("end",))
+
+    def click(self, x, y, button=0x111):
+        if not self.click_capable or self.pen_down:
+            return False
+        self.clicks.append((round(x, 4), round(y, 4), button))
+        return True
 
 
 class FakeWebSocket:
@@ -119,7 +127,10 @@ def bare_host():
     value.scrolls = 0
     value.scroll_sign = -1.0
     value.scroll_gain = 1.0
-    value.kglobalaccel = None
+    value.right_clicks = 0
+    value.pen_buttons = 0
+    value.pen_button = 'launcher'
+    value.shortcut_components = {}
     return value
 
 
@@ -131,12 +142,19 @@ class FakeShortcuts:
         self.invoked.append(name)
 
 
+def with_shortcuts(value):
+    """Both kglobalaccel components answer to one recorder."""
+    value.shortcuts = FakeShortcuts()
+    value.shortcut_components = {'kwin': value.shortcuts, 'plasmashell': value.shortcuts}
+    return value
+
+
 def gesture_host():
     """A host whose touch path goes through the gesture filter (timers by hand)."""
     value = bare_host()
     value.control_owner = object()
     value.control_generation = 4
-    value.kglobalaccel = FakeShortcuts()
+    with_shortcuts(value)
     value.timers = {}
 
     def schedule(ms, callback):
@@ -147,7 +165,7 @@ def gesture_host():
     value.gestures = host_module.GestureFilter(
         value._deliver_input, value.perform_gesture,
         schedule=schedule, cancel=value.timers.pop, hold_ms=120,
-        scroll=value.perform_scroll)
+        scroll=value.perform_scroll, tap=value.perform_right_click)
     return value
 
 
@@ -378,7 +396,7 @@ class HostTouchIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         swipe(value, [0, 1, 2], -0.2)
 
-        self.assertEqual(value.kglobalaccel.invoked, ["Walk Through Windows"])
+        self.assertEqual(value.shortcuts.invoked, ["Walk Through Windows"])
         self.assertEqual(value.touch.messages, [])
         self.assertEqual(value.gestures_fired, 1)
         self.assertEqual(value.input_rejected, 0)
@@ -390,7 +408,7 @@ class HostTouchIntegrationTests(unittest.IsolatedAsyncioTestCase):
         swipe(value, [0, 1, 2, 3], -0.2)
         swipe(value, [0, 1, 2, 3], 0.2)
 
-        self.assertEqual(value.kglobalaccel.invoked,
+        self.assertEqual(value.shortcuts.invoked,
                          ["Switch One Desktop to the Right", "Switch One Desktop to the Left"])
         self.assertEqual(value.touch.messages, [])
 
@@ -405,7 +423,7 @@ class HostTouchIntegrationTests(unittest.IsolatedAsyncioTestCase):
         for slot in (0, 1, 2):
             value.handle_touch({"type": "touch", "action": 1, "slot": slot, "x": 0.0, "y": 0.0}, 4)
 
-        self.assertEqual(value.kglobalaccel.invoked, ["Overview"])
+        self.assertEqual(value.shortcuts.invoked, ["Overview"])
         self.assertEqual(value.touch.messages, [])
 
     async def test_unmapped_swipe_does_nothing(self):
@@ -414,7 +432,7 @@ class HostTouchIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(value.perform_gesture(4, "up"))
         self.assertFalse(value.perform_gesture(5, "left"))
 
-        self.assertEqual(value.kglobalaccel.invoked, [])
+        self.assertEqual(value.shortcuts.invoked, [])
         self.assertEqual(value.gestures_fired, 0)
 
     async def test_single_finger_tap_is_delivered_unchanged(self):
@@ -427,7 +445,7 @@ class HostTouchIntegrationTests(unittest.IsolatedAsyncioTestCase):
         value.handle_touch(up, 4)
 
         self.assertEqual(value.touch.messages, [down, up])
-        self.assertEqual(value.kglobalaccel.invoked, [])
+        self.assertEqual(value.shortcuts.invoked, [])
 
     async def test_held_drag_is_delivered_when_the_timer_fires(self):
         value = gesture_host()
@@ -478,7 +496,7 @@ class HostTouchIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(m[1] == 0.0 for m in moves))
         self.assertEqual(value.touch.messages, [])
         self.assertEqual(value.scrolls, 1)
-        self.assertEqual(value.kglobalaccel.invoked, [])
+        self.assertEqual(value.shortcuts.invoked, [])
         self.assertEqual(value.gestures.state, gestures.IDLE)
 
     async def test_scroll_direction_and_gain_are_applied(self):
@@ -502,6 +520,67 @@ class HostTouchIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([m["action"] for m in value.touch.messages[:2]], [0, 0])
         self.assertEqual(len(value.touch.messages), 8)
         self.assertEqual(value.gestures.state, gestures.PASS)
+
+    async def test_two_finger_tap_is_a_right_click_and_never_reaches_the_desktop(self):
+        value = gesture_host()
+        for slot in (0, 1):
+            value.handle_touch({"type": "touch", "action": 0, "slot": slot, "x": 0.3 + 0.1 * slot, "y": 0.5}, 4)
+        for slot in (1, 0):
+            value.handle_touch({"type": "touch", "action": 1, "slot": slot, "x": 0.0, "y": 0.0}, 4)
+
+        self.assertEqual(value.touch.clicks, [(0.35, 0.5, 0x111)])
+        self.assertEqual(value.touch.messages, [])
+        self.assertEqual(value.touch.scrolls, [])
+        self.assertEqual(value.right_clicks, 1)
+        self.assertEqual(value.gestures.state, gestures.IDLE)
+        self.assertEqual(value.timers, {})
+
+    async def test_two_finger_tap_reaches_the_desktop_when_the_session_cannot_click(self):
+        value = gesture_host()
+        value.touch.click_capable = False
+        for slot in (0, 1):
+            value.handle_touch({"type": "touch", "action": 0, "slot": slot, "x": 0.3 + 0.1 * slot, "y": 0.5}, 4)
+        for slot in (1, 0):
+            value.handle_touch({"type": "touch", "action": 1, "slot": slot, "x": 0.0, "y": 0.0}, 4)
+
+        self.assertEqual(value.touch.clicks, [])
+        self.assertEqual(value.right_clicks, 0)
+        self.assertEqual([(m["action"], m["slot"]) for m in value.touch.messages],
+                         [(0, 0), (0, 1), (1, 1), (1, 0)])
+        self.assertEqual(value.gestures.state, gestures.IDLE)
+
+    async def test_pen_button_while_hovering_opens_the_launcher(self):
+        value = gesture_host()
+        hover = {"type": "pen", "action": 3, "x": 0.2, "y": 0.3}
+        press = {"type": "pen", "action": 5, "x": 0.0, "y": 0.0}
+        release = {"type": "pen", "action": 6, "x": 0.0, "y": 0.0}
+
+        value.handle_touch(hover, 4)
+        value.handle_touch(press, 4)
+        value.handle_touch(release, 4)
+
+        self.assertEqual(value.shortcuts.invoked, ["activate application launcher"])
+        self.assertEqual(value.pen_buttons, 1)
+        # The button messages are not input: only the hover reached the pointer.
+        self.assertEqual(value.touch.messages, [hover])
+
+    async def test_pen_button_with_the_tip_down_is_left_alone(self):
+        value = gesture_host()
+        value.touch.pen_down = True
+
+        value.handle_touch({"type": "pen", "action": 5, "x": 0.0, "y": 0.0}, 4)
+
+        self.assertEqual(value.shortcuts.invoked, [])
+        self.assertEqual(value.pen_buttons, 0)
+
+    async def test_pen_button_off_ignores_the_press(self):
+        value = gesture_host()
+        value.pen_button = 'off'
+
+        value.handle_touch({"type": "pen", "action": 5, "x": 0.0, "y": 0.0}, 4)
+
+        self.assertEqual(value.shortcuts.invoked, [])
+        self.assertEqual(value.touch.messages, [])
 
     async def test_release_touch_drops_a_gesture_in_progress(self):
         value = gesture_host()

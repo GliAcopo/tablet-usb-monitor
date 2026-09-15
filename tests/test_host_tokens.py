@@ -34,6 +34,7 @@ def make_test_host(tmp_dir):
     h.session_watches = []
     h.touch = None
     h.gestures = None
+    h.pen_button = 'off'
     return h
 
 
@@ -419,6 +420,7 @@ class RunFinallyCleanupTests(unittest.TestCase):
         h.reverse_ports = [8890, 8891]
         h.touch = MagicMock()
         h.gestures = None
+        h.pen_button = 'off'
         h.closing = False
         h.failed = False
         return h

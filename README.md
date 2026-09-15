@@ -322,6 +322,48 @@ swipe, both directions and both axes, a pinch arrived as two touch contacts,
 portal's own pointer calls are refused by KDE 6.6, so without it two fingers
 fall back to ordinary touches.
 
+### Two-finger tap: right click
+
+Two fingers tapped together are a right click where they landed (their
+mean point): the pointer is moved there and BTN_RIGHT is pressed and
+released on the same libei device the pen uses, so the context menu of
+whatever is under the fingers opens, in any toolkit. "Together" means both
+land within `--gesture-hold-ms` and neither moves more than about 3 mm
+before the first lifts; two fingers that do move are a scroll or a pinch as
+above. There is no time limit on the hold. `--two-finger-tap off` restores
+the two ordinary taps. Verified live with `scripts/mt-inject` two-finger
+taps into a Qt window on the tablet: right press and release arrived at the
+fingers' mean point, to the pixel where a one-finger tap at the same place
+lands, both for a 60 ms and a 250 ms hold; 0 touches rejected. Needs the
+libei device, like scrolling.
+
+### S Pen side button: application launcher
+
+Pressing the S Pen's side button while the pen hovers over the tablet
+invokes Plasma's "Activate Application Launcher" global shortcut (the
+`plasmashell` kglobalaccel component), the same thing the Meta key does;
+a second press closes it again. The host acts on the press only while the
+pen is hovering: with the tip down the button is left alone (the stroke
+goes on) and the release is not used. `--pen-button off` ignores it.
+
+Where the launcher opens is Plasma's decision: it takes the panel on KWin's
+active output, which is the tablet while the pen hovers there, and falls
+back to any launcher when that output has no panel. So without a panel on
+the tablet the menu opens on the laptop's; add a panel with a launcher to
+the tablet's screen to have it open under the pen.
+
+Two things about the tablet side. Android never delivers the discrete
+`ACTION_BUTTON_PRESS` to an app while the stylus is only hovering (the
+input dispatcher drops button actions when no pointer is down, in AOSP 14
+through 16), so the app reads the button from the button state carried by
+the hover events instead and reports its edges. And Samsung's Air Command
+watches the same button: if pressing it opens Air Command's menu on the
+tablet, turn off its "open with the S Pen button" option in the tablet's S
+Pen settings. Verified live with a synthetic stylus hover and side-button
+press (`scripts/mt-inject penbutton`): the host saw one press per click,
+the launcher opened on the laptop's panel and closed on the next press.
+The physical S Pen button was not part of that test.
+
 ### Portal token persistence (one-time consent)
 
 The capture/RemoteDesktop session requests `persist_mode=2`. Per the XDG
