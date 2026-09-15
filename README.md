@@ -381,9 +381,10 @@ missing `wl-copy`).
 How it works: the app sends the bytes as base64 pieces small enough for the
 control channel's 4 KiB frame limit, the host reassembles them (32 MB cap;
 `text/plain` and the common image types only) and hands them to
-`wl-copy`, because on KWin only the focused client may set the clipboard
-through `wl_data_device` and clipboard managers use the data-control
-protocol instead. `wl-copy` comes from `wl-clipboard`: either install the
+`wl-copy`, because KWin only honours a `wl_data_device` selection that
+comes with a recent input serial (a process that never received input
+has none) while clipboard managers use the data-control protocol, which
+`wl-copy` speaks. `wl-copy` comes from `wl-clipboard`: either install the
 package or let `scripts/setup-native.sh` unpack it under
 `.local/sysroot` as it does for the headers (`scripts/doctor.py` says
 which). The buttons only appear when the host lists `clipboard` in its
@@ -396,6 +397,13 @@ bytes) arrived byte-for-byte, with `wl-paste --list-types` offering
 `image/jpeg`. Debug builds take the same actions from
 `DRILL_SEND_CLIPBOARD`, `DRILL_SEND_SCREENSHOT` and `DRILL_SEED_CLIPBOARD`
 broadcasts (see `DrillReceiver.kt`).
+
+### Platform notes
+
+[docs/platform-notes.md](docs/platform-notes.md) collects what was learned
+about Android's input dispatcher, Samsung's Air Command and DeX, KWin's
+EIS devices and clipboard rules, Plasma's launcher and shortcuts, with
+the source file and line each finding rests on.
 
 ### Planned: controlling the tablet from the PC
 
