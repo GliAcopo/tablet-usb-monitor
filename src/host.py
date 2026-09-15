@@ -43,6 +43,12 @@ from websockets.asyncio.server import serve
 from touch_input import LiveKScreenTarget, PortalTouchInput, TouchInputError
 from eis_touch import EisTouch, EisError
 from gestures import GestureFilter
+
+# Measured on Qt 6.10 (QScrollArea): 1 axis unit is 12 angle units, so 10
+# units of finger travel are one wheel notch (three lines). 0.2 makes the
+# content move about as far as the fingers do there; other toolkits were
+# not measured.
+DEFAULT_SCROLL_GAIN = 0.2
 from status import StatusWriter
 from tokens import load_tokens, save_token, discard_token
 
@@ -276,15 +282,23 @@ class Host:
         self.input_rejected = 0
         self.input_followon_rejected = 0
         self.gestures_fired = 0
+        self.scrolls = 0
         self.kglobalaccel = None
-        # Multi-finger swipes are picked out here, before the desktop sees
-        # the contacts (see gestures.py); off delivers every touch as is.
+        # Multi-finger swipes and two-finger scrolls are picked out here,
+        # before the desktop sees the contacts (see gestures.py); off
+        # delivers every touch as is.
         self.gestures = None
+        scroll = getattr(args, 'scroll', 'natural')
+        # Content follows the fingers ('natural', as one finger does in
+        # touch-aware apps) or moves against them like a mouse wheel.
+        self.scroll_sign = {'natural': -1.0, 'standard': 1.0}.get(scroll, 0.0)
+        self.scroll_gain = float(getattr(args, 'scroll_gain', DEFAULT_SCROLL_GAIN))
         if getattr(args, 'gestures', 'on') == 'on':
             self.gestures = GestureFilter(self._deliver_input, self.perform_gesture,
                 schedule=lambda ms, callback: GLib.timeout_add(ms, self._input_timer, callback),
                 cancel=GLib.source_remove,
-                hold_ms=getattr(args, 'gesture_hold_ms', 120))
+                hold_ms=getattr(args, 'gesture_hold_ms', 120),
+                scroll=self.perform_scroll if scroll != 'off' else None)
         self.resyncs = 0
         # Video-socket liveness (see video()): features the tablet advertised
         # on the control channel, per-connection generation, and counters.
@@ -512,6 +526,9 @@ class Host:
         if self.gestures is not None:
             print(f'Tablet gestures: 3 fingers = windows (up: Overview, down: Grid), '
                   f'4 fingers = desktops (fingers land within {self.gestures.hold_ms} ms)', flush=True)
+            if self.gestures.scroll is not None:
+                print(f'Tablet scrolling: 2 fingers = scroll ({self.args.scroll}, '
+                      f'gain {self.scroll_gain:g}; needs the libei device)', flush=True)
         self.fd = self.portal.OpenPipeWireRemote(self.session, dbus.Dictionary({}, signature='sv')).take()
         self.capture_node = int(node)
         self.start_pipeline()
@@ -1286,6 +1303,22 @@ class Host:
         self.invoke_kwin_shortcut(name)
         return True
 
+    def perform_scroll(self, phase, x, y):
+        """Two fingers moving together: pointer axes aimed at where they landed."""
+        if self.touch is None:
+            return False
+        if phase == 'begin':
+            if not self.touch.scroll_begin(x, y):
+                return False
+            self.scrolls += 1
+            return True
+        if phase == 'move':
+            self.touch.scroll(x * self.scroll_sign * self.scroll_gain,
+                              y * self.scroll_sign * self.scroll_gain)
+        else:
+            self.touch.scroll_end()
+        return True
+
     def invoke_kwin_shortcut(self, name):
         if self.kglobalaccel is None:
             self.kglobalaccel = dbus.Interface(
@@ -1427,6 +1460,7 @@ class Host:
             'tablet_input_rejected': self.input_rejected,
             'tablet_input_followon_rejected': self.input_followon_rejected,
             'tablet_gestures': self.gestures_fired,
+            'tablet_scrolls': self.scrolls,
             'client_resyncs': self.resyncs,
             'video_clients': len(self.clients), 'video_connects': self.video_connects,
             'video_disconnects': self.video_disconnects, 'last_video_disconnect': self.last_video_disconnect,
@@ -1560,6 +1594,14 @@ if __name__ == '__main__':
     parser.add_argument('--gesture-hold-ms', type=int, default=120, metavar='MS',
                         help='how long the fingers of a swipe may take to all land; also the '
                              'most a single-finger drag is delayed (default 120)')
+    parser.add_argument('--scroll', choices=['natural', 'standard', 'off'], default='natural',
+                        help='two fingers moving together scroll what is under them: natural '
+                             '(content follows the fingers, default), standard (mouse-wheel '
+                             'direction) or off (two fingers reach the desktop as touches)')
+    parser.add_argument('--scroll-gain', type=float, default=DEFAULT_SCROLL_GAIN, metavar='FACTOR',
+                        help='pointer-axis distance per logical pixel of finger travel (default '
+                             f'{DEFAULT_SCROLL_GAIN}: content keeps pace with the fingers in Qt '
+                             'apps, which read 10 axis units as one wheel notch)')
     parser.add_argument('--rate-control', choices=['cbr', 'vbr', 'cqp'], default='cbr')
     parser.add_argument('--qp', type=int, default=24)
     args = parser.parse_args()
@@ -1584,6 +1626,8 @@ if __name__ == '__main__':
         parser.error('Invalid resolution, scale or bitrate')
     if not 1 <= args.gesture_hold_ms <= 1000:
         parser.error('--gesture-hold-ms must be between 1 and 1000')
+    if not 0.1 <= args.scroll_gain <= 10:
+        parser.error('--scroll-gain must be between 0.1 and 10')
     os.umask(0o077)
     state_dir = ROOT / '.local/state'
     state_dir.mkdir(parents=True, exist_ok=True)

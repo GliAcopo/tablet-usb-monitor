@@ -237,6 +237,46 @@ class PortalTouchInputTests(unittest.TestCase):
             {"type": "pen", "action": 0, "x": 0.8, "y": 0.8}))
         self.assertEqual(portal.calls, before)
 
+    def test_scroll_converts_normalized_travel_to_logical_pixels(self):
+        class Backend:
+            pen_capable = True
+            scroll_capable = True
+            ready = True
+            def __init__(self):
+                self.calls = []
+            def scroll_begin(self, x, y): self.calls.append(("begin", x, y))
+            def scroll(self, dx, dy): self.calls.append(("scroll", dx, dy))
+            def scroll_end(self): self.calls.append(("end",))
+            def pen_down(self, x, y): self.calls.append(("pen_down", x, y))
+            def pen_up(self): self.calls.append(("pen_up",))
+            def release_all(self): self.calls.append(("release_all",))
+        touch, portal = controller(TOUCHSCREEN)
+        backend = Backend()
+        touch.touch_backend = backend
+        self.assertTrue(touch.scroll_begin(0.5, 0.25))
+        touch.scroll(0.0, -0.1)          # 10 % of 1232 logical rows
+        touch.scroll(0.05, 0.0)
+        touch.scroll_end()
+        self.assertEqual(backend.calls, [
+            ("begin", 986.5, 308.0), ("scroll", 0.0, -123.2), ("scroll", 98.65, 0.0), ("end",)])
+        self.assertEqual(portal.calls, [])
+        with self.assertRaises(TouchInputError):
+            touch.scroll(float("nan"), 0.0)
+        # A pen that is down keeps the pointer; a session without the libei
+        # device cannot scroll at all, and the host then replays the touches.
+        touch.handle_message({"type": "pen", "action": 0, "x": 0.25, "y": 0.5})
+        self.assertFalse(touch.scroll_begin(0.5, 0.5))
+        touch.handle_message({"type": "pen", "action": 1, "x": 0.25, "y": 0.5})
+        touch.touch_backend = None
+        self.assertFalse(touch.scroll_begin(0.5, 0.5))
+        with self.assertRaises(TouchInputError):
+            touch.scroll(0.0, 0.1)
+        # Disconnect during a scroll reaches the backend's release.
+        touch.touch_backend = backend
+        touch.scroll_begin(0.5, 0.5)
+        touch.release_all()
+        self.assertEqual(backend.calls[-1], ("release_all",))
+
     def test_non_touch_messages_are_left_for_host(self):
         touch, portal = controller()
         self.assertFalse(touch.handle_message({"type": "rendered", "seq": 9}))

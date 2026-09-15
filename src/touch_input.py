@@ -407,6 +407,40 @@ class PortalTouchInput:
             self.portal.NotifyPointerButton(
                 self.session_handle, {}, BTN_LEFT, BUTTON_RELEASED)
 
+    # -- two-finger scrolling (libei backend only) ---------------------------
+    @property
+    def scroll_capable(self) -> bool:
+        return bool(getattr(self.touch_backend, "scroll_capable", False))
+
+    def scroll_begin(self, x: float, y: float) -> bool:
+        """Aim a scroll at a normalized point; False when this session cannot scroll.
+
+        The portal has NotifyPointerAxis, but KDE 6.6 refuses this session's
+        pointer calls (see _handle_pen), so scrolling needs the libei device.
+        A pen that is down keeps the pointer: moving it would drag.
+        """
+        if not self.scroll_capable or self.pen_down or self.pointer_slot is not None:
+            return False
+        x, y = self._position({"x": x, "y": y})
+        self.touch_backend.scroll_begin(x, y)
+        return True
+
+    def scroll(self, dx: float, dy: float) -> None:
+        """Scroll by a normalized distance (converted to logical pixels)."""
+        if (isinstance(dx, bool) or isinstance(dy, bool) or
+                not isinstance(dx, (int, float)) or not isinstance(dy, (int, float)) or
+                not math.isfinite(dx) or not math.isfinite(dy)):
+            raise TouchInputError("scroll deltas must be finite numbers")
+        if not self.scroll_capable:
+            raise TouchInputError("scrolling needs the libei touch backend")
+        width, height = self.target.geometry().logical_size
+        self.touch_backend.scroll(dx * width, dy * height)
+
+    def scroll_end(self) -> None:
+        if not self.scroll_capable:
+            raise TouchInputError("scrolling needs the libei touch backend")
+        self.touch_backend.scroll_end()
+
     def release_all(self) -> None:
         """Best-effort release for websocket disconnect and host shutdown."""
         if self.touch_enabled:
@@ -432,3 +466,9 @@ class PortalTouchInput:
                 pass
             self.pointer_slot = None
             self.pen_down = False
+        if self.scroll_capable:
+            # A scroll cut short by a disconnect still gets its stop.
+            try:
+                self.touch_backend.release_all()
+            except Exception:
+                pass

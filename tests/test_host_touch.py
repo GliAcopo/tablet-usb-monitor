@@ -33,6 +33,10 @@ class FakeTouch:
         self.messages = []
         self.releases = 0
         self.error = None
+        self.scrolls = []
+        self.scroll_capable = True
+        self.pen_down = False
+        self.pointer_slot = None
 
     def handle_message(self, message):
         if self.error is not None:
@@ -41,6 +45,18 @@ class FakeTouch:
 
     def release_all(self):
         self.releases += 1
+
+    def scroll_begin(self, x, y):
+        if not self.scroll_capable:
+            return False
+        self.scrolls.append(("begin", x, y))
+        return True
+
+    def scroll(self, dx, dy):
+        self.scrolls.append(("move", round(dx, 4), round(dy, 4)))
+
+    def scroll_end(self):
+        self.scrolls.append(("end",))
 
 
 class FakeWebSocket:
@@ -100,6 +116,9 @@ def bare_host():
     value.client_features = set()
     value.gestures = None
     value.gestures_fired = 0
+    value.scrolls = 0
+    value.scroll_sign = -1.0
+    value.scroll_gain = 1.0
     value.kglobalaccel = None
     return value
 
@@ -127,8 +146,22 @@ def gesture_host():
 
     value.gestures = host_module.GestureFilter(
         value._deliver_input, value.perform_gesture,
-        schedule=schedule, cancel=value.timers.pop, hold_ms=120)
+        schedule=schedule, cancel=value.timers.pop, hold_ms=120,
+        scroll=value.perform_scroll)
     return value
+
+
+def two_finger_drag(value, dy, steps=3):
+    """Two fingers land, the hold window passes, they move together by dy."""
+    for slot in (0, 1):
+        value.handle_touch({"type": "touch", "action": 0, "slot": slot, "x": 0.3 + 0.1 * slot, "y": 0.5}, 4)
+    (handle, callback), = value.timers.items()
+    value.timers.pop(handle)
+    value._input_timer(callback)
+    for step in range(1, steps + 1):
+        for slot in (0, 1):
+            value.handle_touch({"type": "touch", "action": 2, "slot": slot,
+                                "x": 0.3 + 0.1 * slot, "y": 0.5 + dy * step / steps}, 4)
 
 
 def swipe(value, slots, dx):
@@ -429,6 +462,46 @@ class HostTouchIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(value.input_rejected, 1)
         self.assertEqual(value.gestures.state, gestures.IDLE)
         self.assertEqual(value.timers, {})
+
+    async def test_two_finger_drag_scrolls_naturally_and_never_reaches_the_desktop(self):
+        value = gesture_host()
+
+        two_finger_drag(value, 0.3)
+        for slot in (0, 1):
+            value.handle_touch({"type": "touch", "action": 1, "slot": slot, "x": 0.0, "y": 0.0}, 4)
+
+        self.assertEqual(value.touch.scrolls[0], ("begin", 0.35, 0.5))
+        self.assertEqual(value.touch.scrolls[-1], ("end",))
+        moves = [s for s in value.touch.scrolls if s[0] == "move"]
+        # Fingers moved down 0.3 in total: content follows them, so the axis is negative.
+        self.assertAlmostEqual(sum(m[2] for m in moves), -0.3, places=3)
+        self.assertTrue(all(m[1] == 0.0 for m in moves))
+        self.assertEqual(value.touch.messages, [])
+        self.assertEqual(value.scrolls, 1)
+        self.assertEqual(value.kglobalaccel.invoked, [])
+        self.assertEqual(value.gestures.state, gestures.IDLE)
+
+    async def test_scroll_direction_and_gain_are_applied(self):
+        value = gesture_host()
+        value.scroll_sign = 1.0
+        value.scroll_gain = 2.0
+
+        two_finger_drag(value, 0.3)
+
+        moves = [s for s in value.touch.scrolls if s[0] == "move"]
+        self.assertAlmostEqual(sum(m[2] for m in moves), 0.6, places=3)
+
+    async def test_two_fingers_reach_the_desktop_when_the_session_cannot_scroll(self):
+        value = gesture_host()
+        value.touch.scroll_capable = False
+
+        two_finger_drag(value, 0.3)
+
+        self.assertEqual(value.touch.scrolls, [])
+        self.assertEqual(value.scrolls, 0)
+        self.assertEqual([m["action"] for m in value.touch.messages[:2]], [0, 0])
+        self.assertEqual(len(value.touch.messages), 8)
+        self.assertEqual(value.gestures.state, gestures.PASS)
 
     async def test_release_touch_drops_a_gesture_in_progress(self):
         value = gesture_host()

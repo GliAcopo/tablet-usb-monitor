@@ -4,7 +4,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from gestures import GestureFilter, GESTURE, HOLD, IDLE, PASS  # noqa: E402
+from gestures import GestureFilter, GESTURE, HOLD, IDLE, PASS, SCROLL, TWO  # noqa: E402
 
 
 class FakeLoop:
@@ -245,10 +245,143 @@ class GestureFilterTests(unittest.TestCase):
 
     def test_parameters_are_checked(self):
         for kwargs in ({"hold_ms": 0}, {"threshold": 0.0}, {"threshold": 1.5},
-                       {"min_fingers": 5, "max_fingers": 4}):
+                       {"min_fingers": 5, "max_fingers": 4}, {"scroll_threshold": 0.0},
+                       {"scroll": lambda *a: True, "min_fingers": 2}):
             with self.assertRaises(ValueError):
                 GestureFilter(self.delivered.append, lambda *a: None,
                               schedule=self.loop.schedule, cancel=self.loop.cancel, **kwargs)
+
+
+class TwoFingerScrollTests(GestureFilterTests):
+    """The same filter with two-finger scrolling on: every swipe test still holds."""
+
+    def setUp(self):
+        super().setUp()
+        self.scrolled = []
+        self.can_scroll = True
+
+        def scroll(phase, x, y):
+            self.scrolled.append((phase, round(x, 4), round(y, 4)))
+            return self.can_scroll
+        self.filter.scroll = scroll
+        self.filter.scroll_threshold = 0.01
+
+    def two(self):
+        self.land([0, 1])
+        self.loop.advance(120)
+        self.assertEqual(self.filter.state, TWO)
+        self.assertEqual(self.delivered, [])
+        self.assertEqual(self.loop.timers, {})
+
+    def test_two_finger_pinch_is_not_a_gesture(self):
+        # Overrides the base test: the fingers are held until they move.
+        self.two()
+        self.send(touch(MOTION, 0, 0.28, 0.5), touch(MOTION, 1, 0.37, 0.5))   # apart
+        self.assertEqual(self.filter.state, PASS)
+        self.assertEqual(len(self.delivered), 4)
+        self.assertEqual(self.scrolled, [])
+        self.lift([0, 1])
+        self.assertEqual(self.filter.state, IDLE)
+
+    def test_fingers_moving_together_scroll_and_never_reach_the_desktop(self):
+        self.two()
+        self.send(touch(MOTION, 0, 0.3, 0.505))          # under the threshold
+        self.assertEqual(self.filter.state, TWO)
+        self.send(touch(MOTION, 1, 0.35, 0.52))          # mean moved 0.0125 down
+        self.assertEqual(self.filter.state, SCROLL)
+        self.assertEqual(self.scrolled, [("begin", 0.325, 0.5), ("move", 0.0, 0.0125)])
+        self.send(touch(MOTION, 0, 0.3, 0.6), touch(MOTION, 1, 0.35, 0.6))
+        self.assertEqual(self.scrolled[2:], [("move", 0.0, 0.0475), ("move", 0.0, 0.04)])
+        self.send(touch(UP, 0))
+        self.assertEqual(self.scrolled[-1], ("end", 0.0, 0.0))
+        self.send(touch(MOTION, 1, 0.35, 0.7))           # the other finger: nothing
+        self.send(touch(UP, 1))
+        self.assertEqual(len(self.scrolled), 5)
+        self.assertEqual(self.delivered, [])
+        self.assertEqual(self.filter.state, IDLE)
+        self.assertEqual(self.filter.scrolled, 1)
+
+    def test_scroll_that_cannot_begin_replays_the_contacts(self):
+        self.can_scroll = False
+        self.two()
+        self.send(touch(MOTION, 0, 0.3, 0.55), touch(MOTION, 1, 0.35, 0.55))
+        self.assertEqual(self.scrolled, [("begin", 0.325, 0.5)])
+        self.assertEqual(self.filter.state, PASS)
+        self.assertEqual(len(self.delivered), 4)
+        self.assertEqual(self.filter.scrolled, 0)
+
+    def test_resting_fingers_keep_one_motion_per_slot(self):
+        self.two()
+        for i in range(50):
+            self.send(touch(MOTION, 0, 0.3 + 0.0001 * (i % 3), 0.5), touch(MOTION, 1, 0.35, 0.5))
+        self.assertEqual(len(self.filter.buffer), 4)
+        self.send(touch(MOTION, 0, 0.28, 0.5), touch(MOTION, 1, 0.37, 0.5))   # apart
+        self.assertEqual(self.filter.state, PASS)
+        # The replay holds the latest position per slot; the second finger's
+        # move arrived after the classification and went straight through.
+        self.assertEqual([m["action"] for m in self.delivered], [DOWN, DOWN, MOTION, MOTION, MOTION])
+        self.assertEqual([m["x"] for m in self.delivered[2:]], [0.35, 0.28, 0.37])
+
+    def test_two_finger_tap_reaches_the_desktop(self):
+        self.two()
+        self.send(touch(UP, 1))
+        self.assertEqual(len(self.delivered), 3)
+        self.assertEqual(self.filter.state, PASS)
+        self.send(touch(UP, 0))
+        self.assertEqual(self.filter.state, IDLE)
+        self.assertEqual(self.scrolled, [])
+
+    def test_third_finger_after_the_window_is_ordinary_input(self):
+        # Overrides the base test: two fingers are still held when it lands.
+        self.land([0, 1], spacing_ms=70)
+        self.assertEqual(self.filter.state, TWO)   # 140 ms: the window closed
+        self.send(touch(DOWN, 2, 0.4, 0.5))
+        self.assertEqual(len(self.delivered), 3)
+        self.swipe([0, 1, 2], 0.3)
+        self.assertEqual(self.acted, [])
+
+    def test_late_third_finger_makes_it_ordinary_input(self):
+        self.two()
+        self.send(touch(DOWN, 2, 0.4, 0.5))
+        self.assertEqual(self.filter.state, PASS)
+        self.assertEqual(len(self.delivered), 3)
+        self.swipe([0, 1, 2], -0.3)
+        self.assertEqual(self.acted, [])
+        self.assertEqual(self.scrolled, [])
+
+    def test_third_finger_inside_the_window_is_still_a_swipe(self):
+        self.land([0, 1, 2])
+        self.assertEqual(self.filter.state, GESTURE)
+        self.swipe([0, 1, 2], -0.2)
+        self.assertEqual(self.acted, [(3, "left")])
+        self.assertEqual(self.scrolled, [])
+
+    def test_fingers_landing_during_a_scroll_are_dropped(self):
+        self.two()
+        self.send(touch(MOTION, 0, 0.3, 0.55), touch(MOTION, 1, 0.35, 0.55))
+        self.send(touch(DOWN, 2, 0.6, 0.5), touch(MOTION, 2, 0.6, 0.7))
+        self.lift([0, 1])
+        self.assertEqual(self.filter.state, SCROLL)   # the late finger is still down
+        self.send(touch(UP, 2))
+        self.assertEqual(self.filter.state, IDLE)
+        self.assertEqual(self.delivered, [])
+        self.assertEqual(self.scrolled[-1], ("end", 0.0, 0.0))
+
+    def test_late_timer_still_reaches_the_two_finger_state(self):
+        self.land([0, 1])
+        self.loop.time += 0.5     # the loop stalled; the timer has not run
+        self.send(touch(MOTION, 0, 0.3, 0.505))
+        self.assertEqual(self.filter.state, TWO)
+        self.assertEqual(self.delivered, [])
+        self.assertEqual(self.loop.timers, {})
+
+    def test_reset_during_a_scroll_forgets_it(self):
+        self.two()
+        self.send(touch(MOTION, 0, 0.3, 0.55), touch(MOTION, 1, 0.35, 0.55))
+        self.filter.reset()
+        self.assertEqual(self.filter.state, IDLE)
+        self.send(touch(DOWN, 0, 0.1, 0.1), touch(UP, 0))
+        self.assertEqual(len(self.delivered), 2)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ log = logging.getLogger(__name__)
 
 EI_DEVICE_CAP_POINTER_ABSOLUTE = 1 << 1
 EI_DEVICE_CAP_TOUCH = 1 << 3
+EI_DEVICE_CAP_SCROLL = 1 << 4
 EI_DEVICE_CAP_BUTTON = 1 << 5
 
 BTN_LEFT = 0x110  # Linux evdev code; libei buttons use evdev codes.
@@ -72,6 +73,7 @@ def _load():
         'ei_event_get_seat': (P, [P]),
         'ei_event_get_device': (P, [P]),
         'ei_device_get_name': (ctypes.c_char_p, [P]),
+        'ei_seat_has_capability': (ctypes.c_bool, [P, ctypes.c_int]),
         'ei_device_ref': (P, [P]),
         'ei_device_unref': (P, [P]),
         'ei_device_has_capability': (ctypes.c_bool, [P, ctypes.c_int]),
@@ -90,6 +92,8 @@ def _load():
         'ei_touch_unref': (P, [P]),
         'ei_device_pointer_motion_absolute': (None, [P, ctypes.c_double, ctypes.c_double]),
         'ei_device_button_button': (None, [P, ctypes.c_uint32, ctypes.c_bool]),
+        'ei_device_scroll_delta': (None, [P, ctypes.c_double, ctypes.c_double]),
+        'ei_device_scroll_stop': (None, [P, ctypes.c_bool, ctypes.c_bool]),
     }
     for fname, (restype, argtypes) in sigs.items():
         fn = getattr(lib, fname)
@@ -126,6 +130,7 @@ class EisTouch:
         self._sequence = 0
         self._touches: dict[int, ctypes.c_void_p] = {}
         self._pen_down = False
+        self._scrolling = False
         self._devices: dict[int, ctypes.c_void_p] = {}
         self._resumed: set[int] = set()
         self._closed = False
@@ -156,9 +161,14 @@ class EisTouch:
             self.region = None
         elif kind == EI_EVENT_SEAT_ADDED:
             seat = self.lib.ei_event_get_seat(event)
-            self.lib.ei_seat_bind_capabilities(seat, ctypes.c_int(EI_DEVICE_CAP_TOUCH),
-                ctypes.c_int(EI_DEVICE_CAP_POINTER_ABSOLUTE), ctypes.c_int(EI_DEVICE_CAP_BUTTON),
-                ctypes.c_void_p(None))
+            # Scroll rides on the same absolute device (KWin configures it
+            # whenever the portal granted pointer control); binding it is
+            # what lets two-finger scrolling send axis events.
+            caps = [EI_DEVICE_CAP_TOUCH, EI_DEVICE_CAP_POINTER_ABSOLUTE, EI_DEVICE_CAP_BUTTON]
+            if self.lib.ei_seat_has_capability(seat, EI_DEVICE_CAP_SCROLL):
+                caps.append(EI_DEVICE_CAP_SCROLL)
+            self.lib.ei_seat_bind_capabilities(seat, *[ctypes.c_int(cap) for cap in caps],
+                                               ctypes.c_void_p(None))
         elif kind == EI_EVENT_DEVICE_ADDED:
             device = self.lib.ei_event_get_device(event)
             if self.lib.ei_device_has_capability(device, EI_DEVICE_CAP_TOUCH):
@@ -248,7 +258,8 @@ class EisTouch:
             self.lib.ei_device_start_emulating(device, self._sequence)
         self.device, self.region, self.ready = device, region, True
         if changed:
-            log.info('EIS device bound; pen (absolute pointer + button): %s', self.pen_capable)
+            log.info('EIS device bound; pen (absolute pointer + button): %s, scroll: %s',
+                     self.pen_capable, self.scroll_capable)
         return True
 
     @property
@@ -256,6 +267,12 @@ class EisTouch:
         """Whether the bound device can also carry the S Pen as an absolute pointer."""
         return bool(self.device) and all(self.lib.ei_device_has_capability(self.device, cap)
             for cap in (EI_DEVICE_CAP_POINTER_ABSOLUTE, EI_DEVICE_CAP_BUTTON))
+
+    @property
+    def scroll_capable(self) -> bool:
+        """Whether the bound device can aim the pointer and send scroll axes."""
+        return bool(self.device) and all(self.lib.ei_device_has_capability(self.device, cap)
+            for cap in (EI_DEVICE_CAP_POINTER_ABSOLUTE, EI_DEVICE_CAP_SCROLL))
 
     # -- injection --------------------------------------------------------------
     def _absolute(self, x: float, y: float) -> tuple[float, float]:
@@ -335,6 +352,36 @@ class EisTouch:
         self.lib.ei_device_button_button(self.device, BTN_LEFT, False)
         self.lib.ei_device_frame(self.device, self.lib.ei_now(self.ei))
 
+    # -- two-finger scrolling: pointer axes aimed at the fingers ---------------
+    def _require_scroll(self):
+        self._require_ready()
+        if not self.scroll_capable:
+            raise EisError('EIS device has no scroll axes')
+
+    def scroll_begin(self, x: float, y: float) -> None:
+        """Aim the pointer at the fingers: axis events land on the window under it."""
+        self._require_scroll()
+        ax, ay = self._absolute(x, y)
+        self.lib.ei_device_pointer_motion_absolute(self.device, ax, ay)
+        self.lib.ei_device_frame(self.device, self.lib.ei_now(self.ei))
+        self._scrolling = True
+
+    def scroll(self, dx: float, dy: float) -> None:
+        """One axis step, in logical pixels (positive scrolls the content up/left)."""
+        if not self._scrolling:
+            raise EisError('EIS scroll has not begun')
+        self._require_scroll()
+        self.lib.ei_device_scroll_delta(self.device, dx, dy)
+        self.lib.ei_device_frame(self.device, self.lib.ei_now(self.ei))
+
+    def scroll_end(self) -> None:
+        if not self._scrolling:
+            raise EisError('EIS scroll has not begun')
+        self._scrolling = False
+        self._require_scroll()
+        self.lib.ei_device_scroll_stop(self.device, True, True)
+        self.lib.ei_device_frame(self.device, self.lib.ei_now(self.ei))
+
     def release_all(self) -> None:
         for slot in list(self._touches):
             try:
@@ -346,6 +393,11 @@ class EisTouch:
                 self.pen_up()
             except Exception:
                 self._pen_down = False
+        if self._scrolling:
+            try:
+                self.scroll_end()
+            except Exception:
+                self._scrolling = False
 
     def _release_contacts(self) -> None:
         for touch in self._touches.values():
@@ -357,11 +409,15 @@ class EisTouch:
         if self._pen_down and self.ready and self.device:
             with contextlib.suppress(Exception):
                 self.lib.ei_device_button_button(self.device, BTN_LEFT, False)
-        if (self._touches or self._pen_down) and self.ready and self.device:
+        if self._scrolling and self.ready and self.device:
+            with contextlib.suppress(Exception):
+                self.lib.ei_device_scroll_stop(self.device, True, True)
+        if (self._touches or self._pen_down or self._scrolling) and self.ready and self.device:
             with contextlib.suppress(Exception):
                 self.lib.ei_device_frame(self.device, self.lib.ei_now(self.ei))
         self._touches.clear()
         self._pen_down = False
+        self._scrolling = False
 
     def close(self) -> None:
         if self._closed:

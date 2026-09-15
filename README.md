@@ -293,6 +293,35 @@ first. And desktops are global (see "Virtual desktops and the tablet"): with
 `pin-desktop on` a four-finger swipe changes the laptop's desktop while the
 tablet's windows stay put.
 
+### Two-finger scrolling
+
+Two fingers moving together scroll whatever is under them, in any window:
+the host turns their travel into pointer-axis (mouse-wheel) events aimed at
+the point where they landed, so apps that ignore touch scrolling (TeXmacs,
+most Qt Widgets programs) scroll like they would under a touchpad. The
+content follows the fingers by default; `--scroll standard` gives the
+mouse-wheel direction, `--scroll off` leaves two fingers to the desktop as
+touches. The fingers must land within `--gesture-hold-ms` of each other and
+are then held until they move about 3 mm: moving together starts the
+scroll, spreading or closing is a pinch and is delivered as the two touch
+contacts it always was (zoom in apps that support it), a lift is a
+two-finger tap. Scrolling does move the desktop pointer to the fingers,
+because Wayland delivers axis events to the window under the pointer
+without activating it.
+
+`--scroll-gain` sets how far the content moves per logical pixel of finger
+travel. Wayland clients read an axis event without a source as a wheel: Qt
+6.10 turns 10 axis units into one notch (three lines), so the default 0.2
+keeps the content roughly in step with the fingers in Qt apps; 1.0 is about
+five times faster. Other toolkits were not measured; raise or lower the gain
+if a browser feels off. Measured live with `scripts/mt-inject`
+two-finger swipes into a Qt scroll area on the tablet: 400 logical pixels of
+travel scrolled 382-409 pixels at 0.2 (1901 at 1.0), 48-52 axis events per
+swipe, both directions and both axes, a pinch arrived as two touch contacts,
+0 touches rejected. Needs the libei device (`touchscreen-eis-ready`); the
+portal's own pointer calls are refused by KDE 6.6, so without it two fingers
+fall back to ordinary touches.
+
 ### Portal token persistence (one-time consent)
 
 The capture/RemoteDesktop session requests `persist_mode=2`. Per the XDG

@@ -41,6 +41,7 @@ def controller(regions, target):
     value._sequence = 0
     value._touches = {}
     value._pen_down = False
+    value._scrolling = False
     value._devices = {key: key for key in regions}
     value._resumed = set(regions)
     value._layout_changed = None
@@ -133,6 +134,57 @@ class EisPenTests(unittest.TestCase):
         self.assertFalse(touch.pen_capable)
         with self.assertRaises(Exception):
             touch.pen_motion(1.0, 1.0)
+
+
+class EisScrollTests(unittest.TestCase):
+    def scroller(self):
+        touch = controller({1: [(1463, 0, 1973, 1232)]}, [(1463, 0, 1973, 1232)])
+        calls = []
+        touch.lib.ei_device_pointer_motion_absolute = lambda d, x, y: calls.append(("motion", x, y))
+        touch.lib.ei_device_scroll_delta = lambda d, x, y: calls.append(("scroll", x, y))
+        touch.lib.ei_device_scroll_stop = lambda d, x, y: calls.append(("stop", x, y))
+        touch.lib.ei_device_button_button = lambda d, b, press: calls.append(("button", b, press))
+        touch.lib.ei_device_frame = lambda *a: calls.append(("frame",))
+        touch.lib.ei_now = lambda ei: 0
+        self.assertTrue(touch.refresh_binding())
+        return touch, calls
+
+    def test_scroll_aims_the_pointer_then_sends_axes_and_a_stop(self):
+        touch, calls = self.scroller()
+        self.assertTrue(touch.scroll_capable)
+        touch.scroll_begin(10.0, 20.0)
+        touch.scroll(0.0, -12.5)
+        touch.scroll(3.0, -4.0)
+        touch.scroll_end()
+        self.assertEqual(calls, [
+            ("motion", 1473.0, 20.0), ("frame",),
+            ("scroll", 0.0, -12.5), ("frame",),
+            ("scroll", 3.0, -4.0), ("frame",),
+            ("stop", True, True), ("frame",)])
+        with self.assertRaises(Exception):
+            touch.scroll(1.0, 1.0)       # not begun
+        with self.assertRaises(Exception):
+            touch.scroll_end()
+
+    def test_scroll_needs_the_scroll_capability(self):
+        touch, calls = self.scroller()
+        touch.lib.ei_device_has_capability = lambda d, cap: cap != 1 << 4
+        self.assertFalse(touch.scroll_capable)
+        with self.assertRaises(Exception):
+            touch.scroll_begin(1.0, 1.0)
+        self.assertEqual(calls, [])
+
+    def test_release_and_pause_stop_a_scroll_in_progress(self):
+        touch, calls = self.scroller()
+        touch.scroll_begin(1.0, 1.0)
+        touch.release_all()
+        self.assertEqual(calls[-2:], [("stop", True, True), ("frame",)])
+        self.assertFalse(touch._scrolling)
+        touch.scroll_begin(1.0, 1.0)
+        del calls[:]
+        touch._release_contacts()   # what pause/removal/disconnect do
+        self.assertEqual(calls, [("stop", True, True), ("frame",)])
+        self.assertFalse(touch._scrolling)
 
 
 if __name__ == '__main__':
