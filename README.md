@@ -36,10 +36,11 @@ Read this before anything else; the project is hardware-specific.
 - PipeWire ≥ 1.0, Python 3 with `gi` (GStreamer typelibs), `dbus`,
   `websockets` ≥ 13, and `libei` (`libei.so.1`; on Ubuntu the `libei1` package,
   pulled in by Xwayland).
-- `scripts/setup-native.sh` unpacks headers with `apt-get download`, so it is
+- `scripts/setup-native.sh` unpacks headers (and `wl-clipboard`, for the
+  tablet-to-PC clipboard) with `apt-get download`, so it is
   Debian/Ubuntu-only; on other distributions build `native/tabs9-capture`
   against your own `libpipewire-0.3`, `libva`, `libdrm` headers with
-  `make -C native SYSROOT=/usr/include`.
+  `make -C native SYSROOT=/usr/include` and install `wl-clipboard`.
 - A USB 3 **data** cable.
 
 **Tablet**
@@ -363,6 +364,38 @@ Pen settings. Verified live with a synthetic stylus hover and side-button
 press (`scripts/mt-inject penbutton`): the host saw one press per click,
 the launcher opened on the laptop's panel and closed on the next press.
 The physical S Pen button was not part of that test.
+
+### Tablet clipboard and screenshots to the PC
+
+The tablet's settings sheet (tap the gear) has a "Computer clipboard"
+section with two buttons. **Send clipboard** puts what the tablet copied
+last on the desktop clipboard: text as UTF-8, an image (copied from the
+gallery, a browser, the screenshot toolbar's copy...) as it is when it is
+PNG or JPEG, re-encoded as PNG otherwise. **Send last screenshot** sends
+the newest image in the tablet's Screenshots folder; the first press asks
+for the images permission. Either way, paste on the PC afterwards. The
+tablet shows a toast with the result ("Sent 433 KB image/jpeg...") or the
+reason it could not (an empty clipboard, the host refusing the type, a
+missing `wl-copy`).
+
+How it works: the app sends the bytes as base64 pieces small enough for the
+control channel's 4 KiB frame limit, the host reassembles them (32 MB cap;
+`text/plain` and the common image types only) and hands them to
+`wl-copy`, because on KWin only the focused client may set the clipboard
+through `wl_data_device` and clipboard managers use the data-control
+protocol instead. `wl-copy` comes from `wl-clipboard`: either install the
+package or let `scripts/setup-native.sh` unpack it under
+`.local/sysroot` as it does for the headers (`scripts/doctor.py` says
+which). The buttons only appear when the host lists `clipboard` in its
+features, so an older host shows nothing new. Reading the tablet's
+clipboard is only allowed while the app is the focused window (Android
+10+): if another window has the focus in DeX, the toast says the
+clipboard is empty. Verified live: a UTF-8 string seeded on the tablet
+came out of `wl-paste` intact, and a 2960x1848 JPEG screenshot (443,765
+bytes) arrived byte-for-byte, with `wl-paste --list-types` offering
+`image/jpeg`. Debug builds take the same actions from
+`DRILL_SEND_CLIPBOARD`, `DRILL_SEND_SCREENSHOT` and `DRILL_SEED_CLIPBOARD`
+broadcasts (see `DrillReceiver.kt`).
 
 ### Portal token persistence (one-time consent)
 

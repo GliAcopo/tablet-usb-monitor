@@ -1,6 +1,8 @@
 package local.tabs9.usbdisplay
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
@@ -8,8 +10,10 @@ import android.view.SurfaceView
 import android.view.View
 import android.view.WindowInsetsController
 import android.view.WindowManager
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -30,7 +34,10 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -47,6 +54,8 @@ class MainActivity : ComponentActivity() {
     private var showThanks by mutableStateOf(false)
     /** Host protocol version from its greeting; 0 until known. */
     private var hostProtocol by mutableStateOf(0)
+    /** The host takes clipboard transfers (it said so in its greeting). */
+    private var hostClipboard by mutableStateOf(false)
     private var videoState by mutableStateOf(VideoReceiver.VideoState.DISCONNECTED)
     private var videoReceiver: VideoReceiver? = null
     private var touchCapture: TouchCapture? = null
@@ -80,11 +89,14 @@ class MainActivity : ComponentActivity() {
             when (action) {
                 "local.tabs9.usbdisplay.DRILL_DROP_VIDEO" -> videoReceiver?.debugDropSocket()
                 "local.tabs9.usbdisplay.DRILL_RESET_DECODER" -> videoReceiver?.debugResetDecoder()
+                "local.tabs9.usbdisplay.DRILL_SEND_CLIPBOARD" -> sendClip { ClipSource.fromClipboard(this) }
+                "local.tabs9.usbdisplay.DRILL_SEND_SCREENSHOT" -> sendScreenshot()
             }
         }
         touchCapture?.onProtocolKnown = { version -> runOnUiThread { hostProtocol = version } }
         touchCapture?.onHostFeaturesKnown = { features ->
             videoReceiver?.hostHeartbeats = "video_heartbeat" in features
+            runOnUiThread { hostClipboard = "clipboard" in features }
         }
         // The picture drives the input: while video is being rebuilt the user
         // cannot see what a tap would land on, so gestures pause and any held
@@ -146,6 +158,9 @@ class MainActivity : ComponentActivity() {
                     showThanks = showThanks,
                     onDismissThanks = { showThanks = false },
                     hostProtocol = hostProtocol,
+                    hostClipboard = hostClipboard,
+                    onSendClipboard = { sendClip { ClipSource.fromClipboard(this) } },
+                    onSendScreenshot = { sendScreenshot() },
                     videoState = videoState,
                     videoReceiver = videoReceiver,
                     touchCapture = touchCapture,
@@ -305,6 +320,37 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // -- tablet clipboard / screenshot -> computer clipboard ----------------------
+    private val imagesPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) sendClip { ClipSource.latestScreenshot(this) }
+        else toast("Without access to images the last screenshot cannot be sent")
+    }
+
+    private fun sendScreenshot() {
+        val permission = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_IMAGES
+            else Manifest.permission.READ_EXTERNAL_STORAGE
+        val partial = Build.VERSION.SDK_INT >= 34 &&
+            checkSelfPermission(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED) == PackageManager.PERMISSION_GRANTED
+        if (checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED || partial) {
+            sendClip { ClipSource.latestScreenshot(this) }
+        } else {
+            imagesPermission.launch(permission)
+        }
+    }
+
+    /** Read the clip off the main thread, send it, and say how it went. */
+    private fun sendClip(read: () -> Result<ClipSource.Clip>) {
+        val capture = touchCapture ?: return
+        lifecycleScope.launch(Dispatchers.IO) {
+            val clip = read().getOrElse { toast(it.message ?: "Nothing to send"); return@launch }
+            capture.sendClip(clip.mime, clip.bytes) { error ->
+                toast(error ?: "Sent ${clip.what} to the computer's clipboard (${clip.mime}, ${clip.bytes.size / 1024} KB)")
+            }
+        }
+    }
+
+    private fun toast(text: String) = runOnUiThread { Toast.makeText(this, text, Toast.LENGTH_LONG).show() }
+
     override fun onGenericMotionEvent(event: android.view.MotionEvent): Boolean {
         val w = window.decorView.width
         val h = window.decorView.height
@@ -381,6 +427,9 @@ fun UScreenMain(
     showThanks: Boolean = false,
     onDismissThanks: () -> Unit = {},
     hostProtocol: Int = 0,
+    hostClipboard: Boolean = false,
+    onSendClipboard: () -> Unit = {},
+    onSendScreenshot: () -> Unit = {},
     videoState: VideoReceiver.VideoState = VideoReceiver.VideoState.DISCONNECTED,
     onSurfaceDestroyed: () -> Unit = {},
     videoReceiver: VideoReceiver? = null,
@@ -599,6 +648,9 @@ fun UScreenMain(
                     prefs?.hasUserSettings = true
                     touchCapture?.sendConfig(bitrateKbps, newFps)
                 },
+                hostClipboard = hostClipboard,
+                onSendClipboard = onSendClipboard,
+                onSendScreenshot = onSendScreenshot,
                 onDismiss = { showSettings = false }
             )
         }
@@ -706,6 +758,9 @@ private fun SettingsSheet(
     showStats: Boolean,
     onShowStatsChange: (Boolean) -> Unit,
     onApply: (bitrateKbps: Int, fps: Int) -> Unit,
+    hostClipboard: Boolean,
+    onSendClipboard: () -> Unit,
+    onSendScreenshot: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     var bitrateMbps by remember {
@@ -818,6 +873,22 @@ private fun SettingsSheet(
                 )
             }
             Spacer(Modifier.height(24.dp))
+
+            if (hostClipboard) {
+                Text("Computer clipboard", fontSize = 14.sp, color = Color(0xFFB0B0C0))
+                Text(
+                    "Put what this tablet copied last (text or an image), or its newest " +
+                        "screenshot, on the computer's clipboard; then paste there.",
+                    fontSize = 11.sp,
+                    color = Color(0xFF6A6A7E)
+                )
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = onSendClipboard) { Text("Send clipboard") }
+                    OutlinedButton(onClick = onSendScreenshot) { Text("Send last screenshot") }
+                }
+                Spacer(Modifier.height(24.dp))
+            }
 
             if (!penOnly) {
                 Button(

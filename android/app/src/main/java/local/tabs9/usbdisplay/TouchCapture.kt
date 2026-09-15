@@ -1,5 +1,6 @@
 package local.tabs9.usbdisplay
 
+import android.util.Base64
 import android.util.Log
 import android.view.MotionEvent
 import android.view.SurfaceView
@@ -28,6 +29,8 @@ class TouchCapture {
         /** Optional capabilities this client implements; the host enables each only when named here. */
         val FEATURES = listOf("video_heartbeat")
         const val WS_URL = "ws://127.0.0.1:8891"
+        /** Clip bytes per control message: base64 of 2400 is 3200 characters, inside the host's 4 KiB frame limit. */
+        private const val CLIP_CHUNK = 2400
         private const val TOOL_TYPE_PALM = 6
         const val RECONNECT_DELAY_MS = 2000L
     }
@@ -133,10 +136,16 @@ class TouchCapture {
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
-            // The host greets with its mode; everything else it might say is
-            // ignored, this channel is otherwise ours to talk on.
+            // The host greets with its mode and answers clipboard transfers;
+            // everything else it might say is ignored, this channel is
+            // otherwise ours to talk on.
             try {
                 val o = JSONObject(text)
+                if (o.optString("type") == "clip_ack") {
+                    finishClip(o.optInt("id", -1),
+                        if (o.optBoolean("ok", false)) null else o.optString("error", "The host refused the clip"))
+                    return
+                }
                 if (o.has("features")) {
                     val list = o.optJSONArray("features")
                     val names = HashSet<String>()
@@ -194,12 +203,14 @@ class TouchCapture {
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             isConnected = false
+            failClips("The connection to the host closed")
             scheduleReconnect()
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             isConnected = false
             Log.w(TAG, "Connection failed: ${t.message}")
+            failClips("The connection to the host failed")
             scheduleReconnect()
         }
     }
@@ -578,6 +589,60 @@ class TouchCapture {
             if (action == 1) activeTouches.remove(slot) else activeTouches[slot] = Pair(x, y)
         }
         webSocket?.send(msg.toString())
+    }
+
+    // -- tablet clipboard -> computer clipboard --------------------------------
+    /** Transfer id -> what to tell the user when the host has answered. */
+    private val clipResults = HashMap<Int, (error: String?) -> Unit>()
+    private var nextClipId = 0
+
+    /**
+     * Hand [bytes] of [mime] to the host for its clipboard, in control-channel
+     * sized pieces (the host keeps its 4 KiB frame limit). [onDone] runs on
+     * the socket thread with null on success or a reason to show the user.
+     */
+    fun sendClip(mime: String, bytes: ByteArray, onDone: (error: String?) -> Unit) {
+        val ws = webSocket
+        if (!isConnected || ws == null) {
+            onDone("Not connected to the host")
+            return
+        }
+        val id = synchronized(clipResults) { nextClipId += 1; clipResults[nextClipId] = onDone; nextClipId }
+        scope.launch {
+            var offset = 0
+            var seq = 0
+            do {
+                val end = minOf(offset + CLIP_CHUNK, bytes.size)
+                val msg = JSONObject().apply {
+                    put("type", "clip")
+                    put("id", id)
+                    put("seq", seq)
+                    put("mime", mime)
+                    put("size", bytes.size)
+                    put("data", Base64.encodeToString(bytes, offset, end - offset, Base64.NO_WRAP))
+                    put("last", end >= bytes.size)
+                }
+                // OkHttp queues outgoing frames; keep the queue short so a
+                // dropped socket does not take megabytes down with it.
+                while (ws.queueSize() > 1_000_000) delay(5)
+                if (!ws.send(msg.toString())) {
+                    finishClip(id, "The connection dropped while sending")
+                    return@launch
+                }
+                offset = end
+                seq += 1
+            } while (offset < bytes.size)
+        }
+    }
+
+    private fun failClips(error: String) {
+        val pending = synchronized(clipResults) { clipResults.values.toList().also { clipResults.clear() } }
+        for (done in pending) done(error)
+    }
+
+    private fun finishClip(id: Int, error: String?) {
+        val done = synchronized(clipResults) { clipResults.remove(id) } ?: return
+        done(error)
     }
 
     /**

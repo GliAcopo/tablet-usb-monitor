@@ -5,6 +5,7 @@ Never logs screen pixels, device identifiers, input messages, or session tokens.
 """
 import argparse
 import asyncio
+import base64
 import collections
 import contextlib
 import fcntl
@@ -15,6 +16,7 @@ import os
 from pathlib import Path
 import sys
 import secrets
+import shutil
 import signal
 import socket
 import struct
@@ -54,6 +56,13 @@ from tokens import load_tokens, save_token, discard_token
 
 ROOT = Path(__file__).resolve().parents[1]
 ADB = ROOT / '.local/platform-tools/adb'
+# wl-clipboard's wl-copy, from the system or unpacked by scripts/setup-native.sh:
+# the one way a client without keyboard focus may set KWin's clipboard
+# (the data-control protocol, which is what clipboard managers use).
+WL_COPY = shutil.which('wl-copy') or ROOT / '.local/sysroot/usr/bin/wl-copy'
+# The most the tablet may put on the clipboard in one transfer.
+CLIP_MAX_BYTES = 32 * 1024 * 1024
+CLIP_MIMES = {'text/plain', 'image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/bmp'}
 STATE_DIR = ROOT / '.local/state'
 STATUS_FILE = STATE_DIR / 'host.status.json'
 TOKENS_FILE = STATE_DIR / 'portal_tokens.json'
@@ -285,6 +294,10 @@ class Host:
         self.scrolls = 0
         self.right_clicks = 0
         self.pen_buttons = 0
+        # Tablet clipboard -> desktop clipboard: the transfer being reassembled
+        # (see receive_clip) and how many were put on the clipboard.
+        self.clip = None
+        self.clips = 0
         # kglobalaccel component name -> D-Bus interface, bound on first use.
         self.shortcut_components = {}
         # The S Pen's side button, pressed while hovering: 'launcher' opens
@@ -1209,6 +1222,10 @@ class Host:
                         self.tablet_render_ns = render_ns
                 elif msg.get('type') == 'keyframe':
                     GLib.idle_add(self.request_keyframe)
+                elif msg.get('type') == 'clip':
+                    reply = await self.receive_clip(msg)
+                    if reply is not None:
+                        await ws.send(json.dumps(reply))
                 elif msg.get('type') == 'config':
                     features = msg.get('features')
                     if isinstance(features, list):
@@ -1363,6 +1380,72 @@ class Host:
         self.invoke_shortcut(*shortcut)
         return True
 
+    # -- tablet clipboard -> desktop clipboard --------------------------------
+    async def receive_clip(self, message):
+        """One piece of a clipboard transfer; the reply to send, if any.
+
+        The tablet sends what its user asked it to (its clipboard or newest
+        screenshot) as ``{"type": "clip", "id", "seq", "mime", "size",
+        "data": base64, "last"}`` pieces small enough for the control
+        channel. They are reassembled here and, on the last one, handed to
+        wl-copy; the tablet is answered with ``clip_ack`` either way so it can
+        tell its user. A piece out of order, or beyond the announced size,
+        drops the transfer.
+        """
+        try:
+            transfer_id, seq, size = message.get('id'), message.get('seq'), message.get('size')
+            mime, last = message.get('mime'), message.get('last')
+            if (any(isinstance(v, bool) or not isinstance(v, int) for v in (transfer_id, seq, size)) or
+                    not isinstance(mime, str) or not isinstance(last, bool)):
+                raise ValueError('malformed clip piece')
+            if mime not in CLIP_MIMES:
+                raise ValueError(f'clipboard type {mime!r} is not accepted')
+            if not 0 <= size <= CLIP_MAX_BYTES:
+                raise ValueError(f'clip larger than {CLIP_MAX_BYTES // (1024 * 1024)} MB')
+            data = base64.b64decode(str(message.get('data', '')), validate=True)
+        except (ValueError, TypeError) as error:
+            self.clip = None
+            return {'type': 'clip_ack', 'id': message.get('id') if isinstance(message.get('id'), int) else -1,
+                    'ok': False, 'error': str(error)}
+        if seq == 0:
+            self.clip = {'id': transfer_id, 'mime': mime, 'size': size, 'seq': 0, 'data': bytearray()}
+        clip = self.clip
+        if clip is None or clip['id'] != transfer_id or clip['seq'] != seq or clip['mime'] != mime:
+            self.clip = None
+            return {'type': 'clip_ack', 'id': transfer_id, 'ok': False, 'error': 'clip pieces out of order'}
+        clip['data'] += data
+        clip['seq'] += 1
+        if len(clip['data']) > clip['size']:
+            self.clip = None
+            return {'type': 'clip_ack', 'id': transfer_id, 'ok': False, 'error': 'clip longer than announced'}
+        if not last:
+            return None
+        self.clip = None
+        if len(clip['data']) != clip['size'] or not clip['data']:
+            return {'type': 'clip_ack', 'id': transfer_id, 'ok': False, 'error': 'clip shorter than announced'}
+        try:
+            await asyncio.to_thread(self.set_clipboard, mime, bytes(clip['data']))
+        except Exception as error:
+            print(f'Clipboard from tablet failed: {error}', flush=True)
+            return {'type': 'clip_ack', 'id': transfer_id, 'ok': False, 'error': str(error)}
+        self.clips += 1
+        print(f'Clipboard from tablet: {mime}, {len(clip["data"])} bytes', flush=True)
+        return {'type': 'clip_ack', 'id': transfer_id, 'ok': True, 'bytes': len(clip['data'])}
+
+    def set_clipboard(self, mime, data):
+        """Put ``data`` on the desktop clipboard through wl-copy (blocking, brief)."""
+        if not Path(WL_COPY).is_file():
+            raise RuntimeError('wl-copy is missing: run scripts/setup-native.sh (it unpacks wl-clipboard)')
+        # wl-copy reads everything, forks a server for the selection and
+        # exits; text goes without a type so it offers the usual text types.
+        # The server keeps the inherited descriptors, so nothing is captured
+        # (a pipe would be held open until the clipboard changes hands).
+        command = [str(WL_COPY)] if mime == 'text/plain' else [str(WL_COPY), '--type', mime]
+        result = subprocess.run(command, input=data, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=10)
+        if result.returncode != 0:
+            raise RuntimeError(f'wl-copy exited with status {result.returncode}')
+
     def invoke_kwin_shortcut(self, name):
         self.invoke_shortcut('kwin', name)
 
@@ -1416,7 +1499,7 @@ class Host:
         return {'status': 'connected', 'protocol': self.PROTOCOL, 'width': self.args.width,
                 'height': self.args.height, 'codec': 'hevc', 'pen_only': False,
                 'fps': self.args.fps, 'bitrate': self.args.bitrate,
-                'features': ['keyframe_request', 'render_ns', 'video_heartbeat']}
+                'features': ['keyframe_request', 'render_ns', 'video_heartbeat', 'clipboard']}
 
     async def broadcast_settings(self):
         payload = json.dumps(self.settings())
@@ -1512,6 +1595,7 @@ class Host:
             'tablet_scrolls': self.scrolls,
             'tablet_right_clicks': self.right_clicks,
             'tablet_pen_buttons': self.pen_buttons,
+            'tablet_clips': self.clips,
             'client_resyncs': self.resyncs,
             'video_clients': len(self.clients), 'video_connects': self.video_connects,
             'video_disconnects': self.video_disconnects, 'last_video_disconnect': self.last_video_disconnect,

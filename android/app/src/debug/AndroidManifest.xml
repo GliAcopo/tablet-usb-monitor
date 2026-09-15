@@ -10,6 +10,9 @@
             <intent-filter>
                 <action android:name="local.tabs9.usbdisplay.DRILL_DROP_VIDEO" />
                 <action android:name="local.tabs9.usbdisplay.DRILL_RESET_DECODER" />
+                <action android:name="local.tabs9.usbdisplay.DRILL_SEND_CLIPBOARD" />
+                <action android:name="local.tabs9.usbdisplay.DRILL_SEND_SCREENSHOT" />
+                <action android:name="local.tabs9.usbdisplay.DRILL_SEED_CLIPBOARD" />
             </intent-filter>
         </receiver>
     </application>

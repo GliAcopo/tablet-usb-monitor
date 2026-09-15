@@ -28,6 +28,10 @@ def main():
         check(module, okay)
     adb = ROOT / '.local/platform-tools/adb'
     check('Local ADB', adb.is_file())
+    # Optional: the tablet's clipboard/screenshots reach the desktop through it.
+    wl_copy = shutil.which('wl-copy') or ROOT / '.local/sysroot/usr/bin/wl-copy'
+    print(f'wl-copy (tablet clipboard to PC, optional): '
+          f'{"ready" if Path(wl_copy).is_file() else "missing: run scripts/setup-native.sh"}')
     if adb.is_file():
         result = subprocess.run([str(adb), '-d', 'get-state'], capture_output=True, timeout=10)
         check('One authorized USB tablet', result.returncode == 0 and result.stdout.strip() == b'device')

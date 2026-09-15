@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -131,7 +132,20 @@ def bare_host():
     value.pen_buttons = 0
     value.pen_button = 'launcher'
     value.shortcut_components = {}
+    value.clip = None
+    value.clips = 0
+    value.clipboard = []
+    value.set_clipboard = lambda mime, data: value.clipboard.append((mime, data))
     return value
+
+
+def clip_pieces(transfer_id, mime, payload, chunk=5):
+    pieces = []
+    for i, offset in enumerate(range(0, len(payload), chunk)):
+        part = payload[offset:offset + chunk]
+        pieces.append({"type": "clip", "id": transfer_id, "seq": i, "mime": mime, "size": len(payload),
+                       "data": base64.b64encode(part).decode(), "last": offset + chunk >= len(payload)})
+    return pieces
 
 
 class FakeShortcuts:
@@ -344,6 +358,60 @@ class HostTouchIntegrationTests(unittest.IsolatedAsyncioTestCase):
         ws.stop()
         await task
         self.glib.drain()
+
+    async def test_clip_pieces_are_reassembled_onto_the_clipboard_and_acknowledged(self):
+        value = bare_host()
+        ws = FakeWebSocket(value.token)
+        task = asyncio.create_task(value.control(ws))
+        await self._settle()
+        self.assertIn('clipboard', ws.sent[0]['features'])
+
+        for piece in clip_pieces(7, "image/png", b"\x89PNG-twelve-bytes"):
+            ws.push(piece)
+        await self._settle()
+        ws.stop()
+        await task
+        self.glib.drain()
+
+        self.assertEqual(value.clipboard, [("image/png", b"\x89PNG-twelve-bytes")])
+        self.assertEqual(value.clips, 1)
+        self.assertEqual(ws.sent[-1], {"type": "clip_ack", "id": 7, "ok": True, "bytes": 17})
+        self.assertEqual(len(ws.sent), 2)   # nothing said about the pieces before the last
+
+    async def test_clip_transfer_rejects_bad_types_order_and_size(self):
+        value = bare_host()
+        text = clip_pieces(1, "text/plain", b"hello world", chunk=4)
+
+        reply = await value.receive_clip({**text[0], "mime": "application/x-sh"})
+        self.assertFalse(reply["ok"])
+        self.assertIn("not accepted", reply["error"])
+
+        self.assertIsNone(await value.receive_clip(text[0]))
+        reply = await value.receive_clip(text[2])            # piece 1 missing
+        self.assertEqual(reply, {"type": "clip_ack", "id": 1, "ok": False, "error": "clip pieces out of order"})
+        self.assertIsNone(value.clip)
+
+        big = dict(text[0], size=host_module.CLIP_MAX_BYTES + 1)
+        self.assertFalse((await value.receive_clip(big))["ok"])
+        short = dict(text[0], last=True)
+        self.assertIn("shorter", (await value.receive_clip(short))["error"])
+        self.assertFalse((await value.receive_clip({"type": "clip", "id": "x"}))["ok"])
+        self.assertFalse((await value.receive_clip(dict(text[0], data="not base64!")))["ok"])
+
+        # A whole transfer after all that still works, and a wl-copy failure is reported.
+        for piece in text[:-1]:
+            self.assertIsNone(await value.receive_clip(piece))
+        self.assertTrue((await value.receive_clip(text[-1]))["ok"])
+        self.assertEqual(value.clipboard, [("text/plain", b"hello world")])
+
+        def broken(mime, data):
+            raise RuntimeError("wl-copy is missing")
+        value.set_clipboard = broken
+        for piece in text[:-1]:
+            await value.receive_clip(piece)
+        reply = await value.receive_clip(text[-1])
+        self.assertEqual(reply["error"], "wl-copy is missing")
+        self.assertEqual(value.clips, 1)
 
     async def test_mismatched_tablet_panel_is_reported_once(self):
         value = bare_host()
