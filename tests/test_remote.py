@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import remote as remote_module
-from remote import RECORD, RemoteControl, RemoteError, TabletInjector
+from remote import RECORD, RemoteControl, RemoteError, TabletInjector, parse_chord
 from shortcuts import format_key, parse_key
 
 
@@ -17,11 +17,11 @@ class FakeInjector:
     def __init__(self):
         self.calls = []
 
-    def move(self, x, y):
-        self.calls.append(("move", round(x, 2), round(y, 2)))
+    def move(self, dx, dy):
+        self.calls.append(("move", dx, dy))
 
-    def button(self, code, press, x, y):
-        self.calls.append(("button", code, press, round(x, 2), round(y, 2)))
+    def button(self, code, press):
+        self.calls.append(("button", code, press))
 
     def scroll(self, vertical, horizontal):
         self.calls.append(("scroll", round(vertical, 4), round(horizontal, 4)))
@@ -89,7 +89,8 @@ class FakeCapture:
 def control(**kwargs):
     injector, capture = FakeInjector(), FakeCapture()
     nudges = []
-    value = RemoteControl(injector, capture, panel=(2960, 1848), sensitivity=2.0,
+    kwargs.setdefault("sensitivity", 1.0)
+    value = RemoteControl(injector, capture, panel=(2960, 1848),
                           barrier=lambda side: ((0, 0), (0, 1232)),
                           park=lambda x, y: nudges.append(("park", x, y)),
                           nudge=lambda dx, dy: nudges.append(("nudge", dx, dy)),
@@ -154,19 +155,19 @@ class RemoteControlTests(unittest.TestCase):
         self.assertEqual(capture.released, 1)
         self.assertEqual(states, ["control", "desktop"])
 
-    def test_motion_accumulates_into_tablet_pixels_and_is_clamped(self):
-        value, injector, capture, _ = control()
-        value.x, value.y = 100.0, 100.0
+    def test_motion_is_scaled_and_keeps_the_fraction_for_the_next_event(self):
+        value, injector, capture, _ = control(sensitivity=1.5)
 
-        value.handle("motion", 10.0, -20.0)
-        value.handle("motion", -1000.0, -1000.0)
+        value.handle("motion", 10.0, -20.0)      # 15, -30
+        value.handle("motion", 1.0, 0.0)         # 1.5 -> 1 now, 0.5 kept
+        value.handle("motion", 1.0, 0.0)         # 1.5 + 0.5 -> 2
+        value.handle("motion", 0.1, 0.0)         # 0.15: nothing to send yet
 
-        self.assertEqual(injector.calls[0], ("move", 120.0, 60.0))
-        self.assertEqual(injector.calls[1], ("move", 0.0, 0.0))
+        self.assertEqual(injector.calls, [
+            ("move", 15, -30), ("move", 1, 0), ("move", 2, 0)])
 
     def test_buttons_keys_and_wheels_are_converted(self):
         value, injector, capture, _ = control()
-        value.x, value.y = 10.0, 20.0
 
         value.handle("button", 0x110, True)
         value.handle("key", 30, True)
@@ -175,10 +176,49 @@ class RemoteControlTests(unittest.TestCase):
         value.handle("frame", 0, 0)
 
         self.assertEqual(injector.calls, [
-            ("button", 0x110, True, 10.0, 20.0),
+            ("button", 0x110, True),
             ("key", 30, True),
             ("scroll", -1.0, 0.0),
             ("scroll", -0.5, 0.0)])
+
+    def test_the_release_chord_is_caught_here_and_never_reaches_the_tablet(self):
+        value, injector, capture, _ = control(edge="none", release_chord="Meta+Shift+T")
+        capture.activate()
+        injector.calls.clear()
+
+        value.handle("key", 125, True)     # Meta down
+        value.handle("key", 42, True)      # Shift down
+        value.handle("key", 20, True)      # T: the chord
+
+        self.assertEqual(capture.released, 1)
+        self.assertNotIn(("key", 20, True), injector.calls)
+        # The modifiers themselves go to the tablet: they are ordinary keys
+        # until the chord completes.
+        self.assertEqual([call for call in injector.calls if call[0] == "key"],
+                         [("key", 125, True), ("key", 42, True)])
+
+    def test_the_chord_needs_its_modifiers_and_nothing_else(self):
+        value, injector, capture, _ = control(edge="none", release_chord="Meta+Shift+T")
+        capture.activate()
+
+        value.handle("key", 20, True)                  # T alone
+        value.handle("key", 125, True)                 # Meta
+        value.handle("key", 20, True)                  # Meta+T
+        value.handle("key", 56, True)                  # Alt as well
+        value.handle("key", 42, True)                  # and Shift
+        value.handle("key", 20, True)                  # Meta+Alt+Shift+T
+        self.assertEqual(capture.released, 0)
+
+        value.handle("key", 56, False)                 # Alt up -> exactly the chord
+        value.handle("key", 20, True)
+        self.assertEqual(capture.released, 1)
+
+    def test_a_chord_that_names_no_real_key_is_ignored(self):
+        value, injector, capture, _ = control(edge="none", release_chord="Meta+Shift+Nonsense")
+        capture.activate()
+        value.handle("key", 20, True)
+        self.assertEqual(capture.released, 0)
+        self.assertIn(("key", 20, True), injector.calls)
 
     def test_events_stop_and_the_capture_is_released_when_the_tablet_goes_away(self):
         value, injector, capture, _ = control()
@@ -214,8 +254,8 @@ class InjectorProtocolTests(unittest.TestCase):
         injector.sock = MagicMock()
         injector.sock.sendall.side_effect = lambda data: sent.append(data)
 
-        injector.move(1400.5, 900.4)
-        injector.button(0x111, False, 10, 20)
+        injector.move(1400, 900)
+        injector.button(0x111, False)
         injector.scroll(-1.5, 0.25)
         injector.key(30, True)
         injector.reset()
@@ -223,7 +263,7 @@ class InjectorProtocolTests(unittest.TestCase):
         self.assertTrue(all(len(record) == 12 for record in sent))
         self.assertEqual([RECORD.unpack(record) for record in sent], [
             (remote_module.TYPE_MOVE, 0, 0, 1400, 900),
-            (remote_module.TYPE_BUTTON, 0, 0x111, 10, 20),
+            (remote_module.TYPE_BUTTON, 0, 0x111, 0, 0),
             (remote_module.TYPE_SCROLL, 0, 0, -1500, 250),
             (remote_module.TYPE_KEY, 1, 30, 0, 0),
             (remote_module.TYPE_RESET, 0, 0, 0, 0)])
@@ -238,6 +278,17 @@ class InjectorProtocolTests(unittest.TestCase):
 
         self.assertIsNone(injector.sock)
         self.assertFalse(injector.alive)
+
+
+class ChordTests(unittest.TestCase):
+    def test_chords_parse_to_evdev_codes(self):
+        self.assertEqual(parse_chord("Meta+Shift+T"), (frozenset({"meta", "shift"}), 20))
+        self.assertEqual(parse_chord("Ctrl+Alt+Delete"), (frozenset({"ctrl", "alt"}), 111))
+        self.assertEqual(parse_chord("Meta+F5"), (frozenset({"meta"}), 63))
+
+    def test_what_cannot_be_watched_for_is_None(self):
+        for text in ("", "Meta+Nonsense", "Hyper+T", "+"):
+            self.assertIsNone(parse_chord(text))
 
 
 class ShortcutKeyTests(unittest.TestCase):

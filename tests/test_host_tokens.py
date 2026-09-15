@@ -38,6 +38,8 @@ def make_test_host(tmp_dir):
     h.air = None
     h.tablet_mode = 'screen'
     h.remote_control = None
+    h.shortcut_keys = {}
+    h.banner = None
     return h
 
 
@@ -427,6 +429,8 @@ class RunFinallyCleanupTests(unittest.TestCase):
         h.air = None
         h.tablet_mode = 'screen'
         h.remote_control = None
+        h.shortcut_keys = {}
+        h.banner = None
         h.closing = False
         h.failed = False
         return h

@@ -360,6 +360,10 @@ class Host:
         # (and has the input). Built on first use, so a host that never
         # remote-controls anything never talks to KWin's capture at all.
         self.shortcuts = None
+        # What each of the host's actions is bound to, for the banner's text
+        # and for the key the capture itself has to watch for.
+        self.shortcut_keys = {}
+        self.banner = None
         self.tablet_mode = 'screen'
         self.remote_control = None
         self.remote_watch = None
@@ -1459,7 +1463,9 @@ class Host:
             self.shortcuts = KdeShortcuts(self.bus)
             bound = []
             for name, label, default in HOST_SHORTCUTS:
-                bound.append(f'{self.shortcuts.register(name, label, default)} = {label}')
+                key = self.shortcuts.register(name, label, default)
+                self.shortcut_keys[name] = key
+                bound.append(f'{key} = {label}')
             self.shortcuts.listen(self.on_shortcut)
         except dbus.DBusException as error:
             self.shortcuts = None
@@ -1496,6 +1502,7 @@ class Host:
             if self.tablet_mode == 'screen':
                 self.tablet_app(front=False)
                 self.tablet_mode = 'desktop'
+                self.show_state()
                 notify('Tablet is showing its own desktop',
                        'Press the shortcut again to send your mouse and keyboard to it.')
             elif self.tablet_mode == 'desktop':
@@ -1513,6 +1520,7 @@ class Host:
             if self.remote_control is not None:
                 self.remote_control.stop()
         self.tablet_mode = 'screen'
+        self.show_state()
         with contextlib.suppress(Exception):
             self.tablet_app(front=True)
         notify("Tablet is the computer's screen again", '')
@@ -1549,8 +1557,56 @@ class Host:
                 barrier=self.output_edge, watch=self.watch_remote, unwatch=self.unwatch_remote,
                 park=self.park_pointer, nudge=self.nudge_pointer,
                 notify=lambda summary, body: notify(summary, body),
-                on_state=self.remote_state_changed, home=self.pointer_home)
+                on_state=self.remote_state_changed, home=self.pointer_home,
+                release_chord=self.shortcut_keys.get('remote-control', 'Meta+Shift+T'))
         return self.remote_control
+
+    # -- what the screens say -------------------------------------------------
+    BANNER = ROOT / 'scripts/tabs9-banner.py'
+
+    def banner_text(self):
+        """Title, hint and colour for the state the tablet is in."""
+        take = self.shortcut_keys.get('remote-control', 'Meta+Shift+T')
+        screen = self.shortcut_keys.get('tablet-screen', 'Meta+Shift+D')
+        if self.tablet_mode == 'control':
+            return ('The tablet has your mouse and keyboard',
+                    f'{take} gives them back to this computer. '
+                    'Meta+Shift+Escape always works too.', '#e0622e')
+        if self.tablet_mode == 'desktop':
+            return ('The tablet is showing its own desktop',
+                    f'{take} sends it your mouse and keyboard · '
+                    f'{screen} makes it a screen again', '#7a68ff')
+        return (None, None, None)
+
+    def show_state(self):
+        """Put the state on every screen (and take it away in screen mode)."""
+        title, hint, colour = self.banner_text()
+        message = {'state': self.tablet_mode, 'title': title, 'hint': hint, 'colour': colour}
+        try:
+            if self.banner is None or self.banner.poll() is not None:
+                if title is None:
+                    return              # nothing to say: no need to start it
+                self.banner = subprocess.Popen(
+                    [sys.executable, str(self.BANNER)], stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.banner.stdin.write((json.dumps(message) + '\n').encode())
+            self.banner.stdin.flush()
+        except (OSError, ValueError) as error:
+            print(f'Status banner unavailable: {error}', flush=True)
+            self.banner = None
+        return False
+
+    def close_banner(self):
+        if self.banner is None:
+            return
+        with contextlib.suppress(Exception):
+            self.banner.stdin.write(b'{"state": "quit"}\n')
+            self.banner.stdin.flush()
+        with contextlib.suppress(Exception):
+            self.banner.wait(timeout=2)
+        with contextlib.suppress(Exception):
+            self.banner.terminate()
+        self.banner = None
 
     def remote_state_changed(self, state):
         # 'control' while the tablet has the input, 'desktop' when it is given
@@ -1559,6 +1615,7 @@ class Host:
         # was asked to be a screen again) is not undone here.
         if not (state == 'desktop' and self.tablet_mode == 'screen'):
             self.tablet_mode = state
+        self.show_state()
         if state == 'control':
             print('Remote control: the tablet has the mouse and keyboard '
                   '(Meta+Shift+Escape always gives them back).', flush=True)
@@ -2019,6 +2076,8 @@ class Host:
             if getattr(self, 'shortcuts', None) is not None:
                 with contextlib.suppress(Exception):
                     self.shortcuts.release()
+            with contextlib.suppress(Exception):
+                self.close_banner()
             if getattr(self, 'eis', None) is not None:
                 with contextlib.suppress(Exception):
                     self.eis.close()
@@ -2099,9 +2158,10 @@ if __name__ == '__main__':
                         default='none', metavar='SIDE',
                         help='also hand the input over when the pointer is pushed against this '
                              "edge of the tablet's screen (default none: only the shortcut does)")
-    parser.add_argument('--remote-sensitivity', type=float, default=2.0, metavar='FACTOR',
+    parser.add_argument('--remote-sensitivity', type=float, default=1.0, metavar='FACTOR',
                         help='tablet pixels per logical pixel of mouse movement while the tablet '
-                             'has the input (default 2.0)')
+                             "has the input (default 1.0; the tablet's own pointer acceleration "
+                             'applies on top)')
     parser.add_argument('--remote-port', type=int, default=8892, metavar='PORT',
                         help='local port forwarded to the tablet input receiver (default 8892)')
     parser.add_argument('--rate-control', choices=['cbr', 'vbr', 'cqp'], default='cbr')

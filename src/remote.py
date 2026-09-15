@@ -52,9 +52,12 @@ log = logging.getLogger(__name__)
 RECORD = struct.Struct('<BBHii')
 TYPE_MOVE, TYPE_BUTTON, TYPE_SCROLL, TYPE_KEY, TYPE_RESET = 1, 2, 3, 4, 5
 
-# The receiver greets every connection with these two bytes: ADB's forward
-# accepts a local connection whether or not anything listens on the device,
-# so this is the only way to tell a running receiver from a missing one.
+# The receiver greets every connection with these two bytes and a third
+# saying how it delivers events ('u': a real mouse and keyboard through
+# /dev/uhid, so the tablet draws a pointer; 'i': injected events, which it
+# does not). ADB's forward accepts a local connection whether or not
+# anything listens on the device, so the greeting is the only way to tell a
+# running receiver from a missing one.
 HELLO = b'T9'
 
 # Portal capability bits, as KWin's addInputCapture takes them.
@@ -69,6 +72,41 @@ KWIN_CAPTURE_IFACE = 'org.kde.KWin.EIS.InputCapture'
 # deltas in logical pixels for a touchpad. Android wants notches, positive
 # away from the user, which is the opposite sign to Wayland's.
 SMOOTH_PIXELS_PER_NOTCH = 50.0
+
+# While a capture is active KWin's capture filter runs *before* its global
+# shortcuts (InputFilterOrder::EisInput is above GlobalShortcut), so no key
+# the user presses can reach KDE -- including the shortcut that started all
+# this. The way back therefore has to be recognised here, in the captured
+# stream, and the keys that make it up are never passed to the tablet.
+EVDEV_MODIFIERS = {29: 'ctrl', 97: 'ctrl', 42: 'shift', 54: 'shift',
+                   56: 'alt', 100: 'alt', 125: 'meta', 126: 'meta'}
+EVDEV_KEYS = {
+    'escape': 1, 'backspace': 14, 'tab': 15, 'return': 28, 'enter': 28, 'space': 57,
+    'minus': 12, 'equal': 13, 'insert': 110, 'delete': 111, 'home': 102, 'end': 107,
+    'pageup': 104, 'pagedown': 109, 'up': 103, 'down': 108, 'left': 105, 'right': 106,
+    'print': 99, 'pause': 119, 'menu': 127,
+}
+EVDEV_KEYS.update({chr(code): value for value, code in zip(
+    [30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20,
+     22, 47, 17, 45, 21, 44], range(ord('a'), ord('z') + 1))})
+EVDEV_KEYS.update({str(digit): code for digit, code in
+                   zip('1234567890', [2, 3, 4, 5, 6, 7, 8, 9, 10, 11])})
+EVDEV_KEYS.update({f'f{n}': code for n, code in
+                   zip(range(1, 13), [59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 87, 88])})
+
+
+def parse_chord(text: str) -> tuple[frozenset, int] | None:
+    """'Meta+Shift+T' -> ({'meta', 'shift'}, 20), or None if it has no evdev key."""
+    parts = [part.strip().lower() for part in str(text).split('+') if part.strip()]
+    if not parts:
+        return None
+    key = EVDEV_KEYS.get(parts[-1])
+    if key is None:
+        return None
+    modifiers = {part for part in parts[:-1] if part in ('ctrl', 'shift', 'alt', 'meta')}
+    if len(modifiers) != len(parts) - 1:
+        return None
+    return frozenset(modifiers), key
 
 
 class RemoteError(RuntimeError):
@@ -89,6 +127,9 @@ class TabletInjector:
         self.process: subprocess.Popen | None = None
         self.sock: socket.socket | None = None
         self.sent = 0
+        # 'u' while the tablet has a real mouse and keyboard, 'i' when the
+        # events are injected (no pointer is drawn then).
+        self.mode = '?'
 
     @property
     def alive(self) -> bool:
@@ -126,9 +167,21 @@ class TabletInjector:
                 sock = socket.create_connection(('127.0.0.1', self.port), timeout=2)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 sock.settimeout(2)
-                if sock.recv(len(HELLO)) == HELLO:
+                # recv gives what has arrived, not what was asked for.
+                greeting = b''
+                while len(greeting) < len(HELLO) + 1:
+                    piece = sock.recv(len(HELLO) + 1 - len(greeting))
+                    if not piece:
+                        break
+                    greeting += piece
+                if greeting[:len(HELLO)] == HELLO:
+                    self.mode = greeting[len(HELLO):].decode(errors='replace') or '?'
                     sock.settimeout(1)
                     self.sock = sock
+                    log.info('tablet input receiver: %s', {
+                        'u': 'a real mouse and keyboard (the tablet draws a pointer)',
+                        'i': 'injected events (the tablet draws no pointer)',
+                    }.get(self.mode, 'connected'))
                     return True
                 sock.close()
             except OSError:
@@ -148,11 +201,12 @@ class TabletInjector:
             log.warning('tablet receiver went away (%s); releasing the input', error)
             self.close_socket()
 
-    def move(self, x: float, y: float) -> None:
-        self._send(TYPE_MOVE, a=round(x), b=round(y))
+    def move(self, dx: int, dy: int) -> None:
+        """Relative motion, in tablet pixels (a mouse's own units)."""
+        self._send(TYPE_MOVE, a=dx, b=dy)
 
-    def button(self, code: int, press: bool, x: float, y: float) -> None:
-        self._send(TYPE_BUTTON, 1 if press else 0, code, round(x), round(y))
+    def button(self, code: int, press: bool) -> None:
+        self._send(TYPE_BUTTON, 1 if press else 0, code)
 
     def scroll(self, vertical: float, horizontal: float) -> None:
         # Thousandths of a notch, so a smooth touchpad scroll survives the trip.
@@ -307,7 +361,7 @@ class RemoteControl:
     """
 
     def __init__(self, injector: TabletInjector, capture: InputCapture, *,
-                 panel: tuple[int, int] = (2960, 1848), sensitivity: float = 2.0,
+                 panel: tuple[int, int] = (2960, 1848), sensitivity: float = 1.0,
                  edge: str = 'left', barrier: Callable[[str], tuple] | None = None,
                  watch: Callable[[int, Callable[[], bool]], None] | None = None,
                  unwatch: Callable[[], None] | None = None,
@@ -315,7 +369,8 @@ class RemoteControl:
                  nudge: Callable[[float, float], None] | None = None,
                  notify: Callable[[str, str], None] | None = None,
                  on_state: Callable[[str], None] | None = None,
-                 home: Callable[[], tuple[float, float]] | None = None):
+                 home: Callable[[], tuple[float, float]] | None = None,
+                 release_chord: str = 'Meta+Shift+T'):
         self.injector = injector
         self.capture = capture
         self.panel = panel
@@ -329,8 +384,15 @@ class RemoteControl:
         self.notify = notify or (lambda summary, body: None)
         self.on_state = on_state or (lambda state: None)
         self.home = home
-        self.x = panel[0] / 2
-        self.y = panel[1] / 2
+        # The key combination that gives the input back, watched for here
+        # because KDE cannot see it while the capture is on.
+        self.release_chord = parse_chord(release_chord)
+        self.release_chord_text = release_chord if self.release_chord else ''
+        self.held_modifiers: set[str] = set()
+        # Leftover fraction of a tablet pixel, so slow movement is not lost to
+        # rounding: the tablet's own pointer keeps the position now.
+        self.x = 0.0
+        self.y = 0.0
         self.sessions = 0
         self.events = 0
         # How many of each kind, so a live session can be told apart from a
@@ -484,14 +546,15 @@ class RemoteControl:
     # -- capture lifecycle ---------------------------------------------------
     def _activated(self, x, y):
         self.sessions += 1
+        self.held_modifiers.clear()
         self.on_state('control')
         # The barriers are left alone while the capture is active: KWin's
         # capture is only meant to be enabled and disabled in its inactive
         # state (the portal enforces that), and changing them under it stops
         # the events from being delivered at all. They are cleared on the way
         # out instead, which is when an unwanted barrier would matter.
+        self.x = self.y = 0.0
         self.injector.reset()
-        self.injector.move(self.x, self.y)
         self.notify('Tablet has your mouse and keyboard',
                     'Press the shortcut again (or Meta+Shift+Escape) to get them back.')
         log.info('remote control on; the desktop sees no input until it is released')
@@ -510,6 +573,29 @@ class RemoteControl:
         log.info('remote control off')
 
     # -- event pump ----------------------------------------------------------
+    def watch_for_release(self, code: int, press: bool) -> bool:
+        """Track modifiers and catch the chord that hands the input back.
+
+        Returns True when the key is the host's own and must not be sent to
+        the tablet.
+        """
+        modifier = EVDEV_MODIFIERS.get(code)
+        if modifier is not None:
+            if press:
+                self.held_modifiers.add(modifier)
+            else:
+                self.held_modifiers.discard(modifier)
+            return False
+        if not self.release_chord or not press:
+            return False
+        modifiers, key = self.release_chord
+        if code != key or self.held_modifiers != modifiers:
+            return False
+        log.info('%s pressed on the captured keyboard: giving the input back',
+                 self.release_chord_text)
+        self.stop()
+        return True
+
     def pump(self) -> bool:
         if self.capture.receiver is None:
             return False
@@ -526,21 +612,25 @@ class RemoteControl:
         self.events += 1
         self.kinds[kind] += 1
         if kind == 'motion':
-            self.x = min(max(self.x + a * self.sensitivity, 0), self.panel[0] - 1)
-            self.y = min(max(self.y + b * self.sensitivity, 0), self.panel[1] - 1)
-            self.injector.move(self.x, self.y)
-        elif kind == 'absolute':
-            self.x = min(max(a, 0), self.panel[0] - 1)
-            self.y = min(max(b, 0), self.panel[1] - 1)
-            self.injector.move(self.x, self.y)
+            # Whole tablet pixels go now, the fraction waits for the next
+            # event; a mouse moved slowly would otherwise not move at all.
+            self.x += a * self.sensitivity
+            self.y += b * self.sensitivity
+            dx, dy = int(self.x), int(self.y)
+            self.x -= dx
+            self.y -= dy
+            if dx or dy:
+                self.injector.move(dx, dy)
         elif kind == 'button':
-            self.injector.button(int(a), bool(b), self.x, self.y)
+            self.injector.button(int(a), bool(b))
         elif kind == 'discrete':
             # v120: 120 units per wheel notch, positive down/right on Wayland.
             self.injector.scroll(-b / 120.0, a / 120.0)
         elif kind == 'scroll':
             self.injector.scroll(-b / SMOOTH_PIXELS_PER_NOTCH, a / SMOOTH_PIXELS_PER_NOTCH)
         elif kind == 'key':
+            if self.watch_for_release(int(a), bool(b)):
+                return
             self.injector.key(int(a), bool(b))
         # 'frame' and 'scroll_stop' need no tablet event: Android has no frame
         # concept and a stopped wheel is simply the absence of more scrolls.

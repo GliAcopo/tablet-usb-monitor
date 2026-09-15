@@ -97,8 +97,8 @@ class EisReceiver:
     ``handler(kind, a, b)`` is called for each event, with:
 
     ``('motion', dx, dy)``        relative pointer motion, in logical pixels
-    ``('absolute', x, y)``        absolute pointer motion (KWin does not send
-                                  these for captures, handled for completeness)
+    ``('absolute', x, y)``        absolute pointer motion (KWin's capture filter
+                                  does not send these; handled for completeness)
     ``('button', code, press)``   evdev button code, press is a bool
     ``('scroll', dx, dy)``        smooth scroll, in logical pixels
     ``('discrete', dx, dy)``      wheel clicks, in v120 units

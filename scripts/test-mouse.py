@@ -12,6 +12,7 @@ and removes it again.
     python3 scripts/test-mouse.py demo          # moves, a click, a wheel notch, a key
     python3 scripts/test-mouse.py push-left     # shove the pointer against the left edge
     python3 scripts/test-mouse.py type kde      # type letters
+    python3 scripts/test-mouse.py chord meta+shift+t   # press a combination
 
 It needs write access to /dev/uinput (on this laptop the seat ACL grants
 it; otherwise run it as root or add yourself to the right group). Whatever
@@ -33,6 +34,7 @@ UI_DEV_SETUP = 0x405c5503
 
 # Enough of the evdev key codes to type a word (see Android's Generic.kl for
 # the other side of the same table).
+MODIFIERS = {'ctrl': 29, 'shift': 42, 'alt': 56, 'meta': 125}
 KEYS = {'a': 30, 'b': 48, 'c': 46, 'd': 32, 'e': 18, 'f': 33, 'g': 34, 'h': 35,
         'i': 23, 'j': 36, 'k': 37, 'l': 38, 'm': 50, 'n': 49, 'o': 24, 'p': 25,
         'q': 16, 'r': 19, 's': 31, 't': 20, 'u': 22, 'v': 47, 'w': 17, 'x': 45,
@@ -44,7 +46,7 @@ class VirtualInput:
         self.fd = open('/dev/uinput', 'wb', buffering=0)
         for bit in (EV_KEY, EV_REL, EV_SYN):
             fcntl.ioctl(self.fd, UI_SET_EVBIT, bit)
-        for code in {BTN_LEFT, *KEYS.values()}:
+        for code in {BTN_LEFT, *KEYS.values(), *MODIFIERS.values()}:
             fcntl.ioctl(self.fd, UI_SET_KEYBIT, code)
         for code in (REL_X, REL_Y, REL_WHEEL):
             fcntl.ioctl(self.fd, UI_SET_RELBIT, code)
@@ -72,6 +74,25 @@ class VirtualInput:
     def wheel(self, clicks):
         self.emit(EV_REL, REL_WHEEL, clicks)
         self.emit(EV_SYN, SYN_REPORT, 0)
+
+    def chord(self, text):
+        """Hold the modifiers, tap the key, let go -- as a hand would."""
+        parts = [part.strip().lower() for part in text.split('+') if part.strip()]
+        modifiers = [MODIFIERS[part] for part in parts[:-1]]
+        key = KEYS.get(parts[-1], MODIFIERS.get(parts[-1]))
+        for code in modifiers:
+            self.emit(EV_KEY, code, 1)
+            self.emit(EV_SYN, SYN_REPORT, 0)
+            time.sleep(0.05)
+        self.emit(EV_KEY, key, 1)
+        self.emit(EV_SYN, SYN_REPORT, 0)
+        time.sleep(0.08)
+        self.emit(EV_KEY, key, 0)
+        self.emit(EV_SYN, SYN_REPORT, 0)
+        for code in reversed(modifiers):
+            time.sleep(0.05)
+            self.emit(EV_KEY, code, 0)
+            self.emit(EV_SYN, SYN_REPORT, 0)
 
     def type(self, text):
         for character in text:
@@ -101,6 +122,8 @@ def main():
                 time.sleep(0.004)
         elif what == 'type':
             device.type(sys.argv[2] if len(sys.argv) > 2 else 'kde')
+        elif what == 'chord':
+            device.chord(sys.argv[2] if len(sys.argv) > 2 else 'meta+shift+t')
         else:
             for _ in range(20):
                 device.move(12, 6)
