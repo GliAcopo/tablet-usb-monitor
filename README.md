@@ -353,17 +353,29 @@ back to any launcher when that output has no panel. So without a panel on
 the tablet the menu opens on the laptop's; add a panel with a launcher to
 the tablet's screen to have it open under the pen.
 
-Two things about the tablet side. Android never delivers the discrete
-`ACTION_BUTTON_PRESS` to an app while the stylus is only hovering (the
-input dispatcher drops button actions when no pointer is down, in AOSP 14
-through 16), so the app reads the button from the button state carried by
-the hover events instead and reports its edges. And Samsung's Air Command
-watches the same button: if pressing it opens Air Command's menu on the
-tablet, turn off its "open with the S Pen button" option in the tablet's S
-Pen settings. Verified live with a synthetic stylus hover and side-button
-press (`scripts/mt-inject penbutton`): the host saw one press per click,
-the launcher opened on the laptop's panel and closed on the next press.
-The physical S Pen button was not part of that test.
+**Not working yet with the real S Pen** on the Tab S9 Ultra: pressing its
+button while hovering opens Samsung's Air Command panel on the tablet and
+nothing reaches the app. On this pen the button is not a digitizer barrel
+button but a Bluetooth one: Air Command's own service receives it over
+BLE (`[AirCmd]_BleDriver ... UUID_BUTTON_EVENT`, `StickySpenDriver:
+dispatchButtonData`), pairs it with its hover detector and opens its
+panel; the hover events the app sees carry no button state at all. The
+way to get it is Samsung's S Pen Remote SDK (`com.samsung.android.sdk.
+penremote`: connect while in the foreground, register a `ButtonEvent`
+listener), which is how apps take the button over from Air Command; that
+is planned with the rest of the PC-side work
+([docs/pc-to-tablet-control.md](docs/pc-to-tablet-control.md)).
+
+What is in place and verified: the host path (pen action 5 while hovering
+→ the launcher shortcut, action 5 with the tip down ignored) and the
+app's edge detection on the button state of hover events, which is what
+a digitizer-reported stylus button produces. Android never delivers the
+discrete `ACTION_BUTTON_PRESS` to an app while the stylus is only
+hovering (the input dispatcher drops button actions when no pointer is
+down, AOSP 14 through 16), hence the button-state reading. Verified live
+with a synthetic stylus hover and side-button press (`scripts/mt-inject
+penbutton`): the host saw one press per click, the launcher opened on
+the laptop's panel and closed on the next press.
 
 ### Tablet clipboard and screenshots to the PC
 

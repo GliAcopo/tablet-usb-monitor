@@ -8,12 +8,12 @@ phase 0 before writing the real thing.
 
 1. A global shortcut on the PC (say `Meta+Shift+T`) puts the tablet into
    Samsung DeX and minimises the USB display app, so the tablet shows its
-   own desktop. A notification on the PC says: *"Tablet is in DeX. Press
-   `Meta+Shift+T` again to send your mouse and keyboard to it."*
+   own desktop. A notification on the PC says: _"Tablet is in DeX. Press
+   `Meta+Shift+T` again to send your mouse and keyboard to it."_
 2. The same shortcut again captures the PC's mouse and keyboard and
    forwards them to the tablet, as if they were plugged into it (DeX is
    built for that). The PC pointer disappears; the notification changes to
-   *"Controlling the tablet — `Meta+Shift+T` returns to the PC."*
+   _"Controlling the tablet — `Meta+Shift+T` returns to the PC."_
 3. The shortcut once more releases the capture: mouse and keyboard are the
    PC's again, the tablet keeps its DeX desktop. A fourth press (or a
    long press / a second shortcut) brings the USB display app back to the
@@ -43,7 +43,7 @@ the desktop offers the right primitive. Two are available in this session
   the receiver side is the same library, `ei_new_receiver`). Capture is
   consent-gated like RemoteDesktop and can persist with a restore token,
   so it fits the existing one-time-consent model. Its activation model is
-  *pointer barriers* (capture starts when the pointer crosses a line at a
+  _pointer barriers_ (capture starts when the pointer crosses a line at a
   screen edge); whether KWin 6.6 also lets a session activate on demand
   (`Enable` + a zero-length barrier, or an all-edges barrier that is
   crossed by a synthetic pointer move from our own EIS sender) is the
@@ -110,8 +110,49 @@ KDE notifications over `org.freedesktop.Notifications` (`notify-send` or
 GlobalShortcuts session so the text is always right. Persistent while
 forwarding, replaced (same id) on each state change.
 
+### The S Pen button (prerequisite for the launcher feature too)
+
+On the Tab S9 Ultra the S Pen's button is a **Bluetooth button**, not a
+digitizer barrel button: a real press is received by Air Command's
+`RemoteSpenService` over BLE (`[AirCmd]_BleDriver GattCallback ...
+UUID_BUTTON_EVENT`, `StickySpenDriver: dispatchButtonData`), combined
+with its own hover detector (`SpenInputDetector:
+mPenButtonPressedOnHoverHandler`) and turned into `ButtonPressStarter:
+BtnClick(x, y)`, which opens the Air Command panel on the tablet. The
+hover `MotionEvent`s the app receives carry no button state, so nothing
+the app does with input events can see it (observed 2026-09-15 with the
+user's pen: 0 button messages at the app, 0 at the host).
+
+Samsung's answer is the **S Pen Remote SDK** (`com.samsung.android.sdk.
+penremote`, "spenremote-v1.0.x.jar" + "sdk-v1.0.0.jar" from
+developer.samsung.com, S Pen Remote SDK 1.0.2): `SpenRemote.getInstance()
+.connect(context, callback)` while the activity is in the foreground →
+`SpenUnitManager.getUnit(SpenUnit.TYPE_BUTTON)` →
+`registerSpenEventListener(listener, unit)` → `ButtonEvent.getAction()`
+`ACTION_DOWN`/`ACTION_UP`; unregister in `onPause`. That is the
+"advise Android that this app wants the pen button" step: while a
+foreground app is connected, the button is the app's instead of Air
+Command's/Air actions' (to verify: the docs do not spell out the hover
+case, and the forum has reports of button events not arriving on some
+devices). The jar is not on Maven Central, so `scripts/build-android.sh`
+needs a pinned download with a checksum, or the jar committed under
+`android/app/libs` if its licence allows. The app then sends the existing
+pen actions 5/6 and the host side needs no change.
+
+Sources: S Pen Remote SDK guide
+(https://developer.samsung.com/galaxy-spen-remote/s-pen-remote-sdk.html),
+overview (https://developer.samsung.com/galaxy-spen-remote/overview.html),
+API reference `SpenEventListener`
+(https://developer.samsung.com/galaxy-spen-remote/api-reference/),
+forum thread "S pen remote sdk button event is not working"
+(https://forum.developer.samsung.com/t/s-pen-remote-sdk-button-event-is-not-working/30605).
+
 ## Phases
 
+0a. **S Pen button via the S Pen Remote SDK** (small, app only): fetch the
+   SDK, connect/disconnect with the activity lifecycle, forward
+   `ButtonEvent` as pen actions 5/6, confirm with the physical pen that
+   Air Command stays closed and the PC launcher opens.
 0. **Probe (an evening, host code only):** (a) InputCapture on KWin 6.6:
    create a session, add a barrier along the laptop's edge, `Enable`, and
    see whether capture can be forced without the user reaching the edge
@@ -137,10 +178,15 @@ forwarding, replaced (same id) on each state change.
 
 - Default shortcut. `Meta+Shift+T` is free in this session; it can be
   anything the KDE dialog accepts.
+  It is ok for me.
+
 - Should DeX and forwarding be one shortcut cycling through states (as
   described) or two shortcuts (DeX on/off, forward on/off)? Two is
   simpler to explain and to escape from.
+  Only one shortcut for all.
+
 - While DeX is on, keep streaming the PC desktop to a DeX window (the app
   as a floating window) or stop the stream? Stopping saves power and USB
   bandwidth; keeping it makes "drag a window from the PC into the tablet"
   possible later.
+  Keep the stream.

@@ -86,6 +86,19 @@ grants it to a debug build without the dialog.
 
 ## Samsung specifics
 
+**The Tab S9 Ultra's S Pen button is a Bluetooth button.** A real press
+arrives in Air Command over BLE, not through the digitizer:
+`[AirCmd]_BleDriver: GattCallback : onCharacteristicChanged : ... /
+UUID_BUTTON_EVENT`, `[AirCmd]_StickySpenDriver: dispatchButtonData :
+Button Up(0), seq=7`, then `[AirCmd]_ButtonPressStarter: BtnClick(x, y)`
+when the pen was hovering (`SpenInputDetector:
+mPenButtonPressedOnHoverHandler`). The hover `MotionEvent`s an app
+receives carry no button state for it, so an app can only get the button
+through the S Pen Remote SDK (`com.samsung.android.sdk.penremote`, served
+by `[AirCmd]_RemoteSpenService`); see `docs/pc-to-tablet-control.md`.
+Observed 2026-09-15 with the physical pen: Air Command opened, the app
+logged no button, the host counted none.
+
 **Air Command watches the S Pen button system-wide.** Pressing it while
 hovering (even a synthetic press) logs `[AirCmd]_SpenInputDetector:
 mPenButtonPressedOnHoverHandler : true` and can start the Air Command
