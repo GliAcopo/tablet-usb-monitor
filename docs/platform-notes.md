@@ -333,3 +333,31 @@ are `plasmashell` (`caption` empty). Useful fields: `w.output.name`,
   Qt::WindowDoesNotAcceptFocus set"). An override-redirect XWayland window
   (`X11BypassWindowManagerHint`) has both properties, which is what
   `scripts/tabs9-banner.py` uses.
+
+## Two virtual outputs (2026-09-19)
+
+- **The KDE portal names a virtual output after the caller's app id**
+  (`xdg-desktop-portal-kde`, `OutputsModel::virtualScreenIdForApp`:
+  `"virtual-xdp-kde-" + appId`, deduplicated only against the portal's own
+  `QScreen` list, whose names lack KWin's `Virtual-` prefix, so the
+  deduplication never fires). A host without an app id gets
+  `Virtual-virtual-xdp-kde-` every time. Observed with two hosts: identical
+  names, and `kscreen-doctor output.3.mode.1872x1404@30` (by id) switched
+  output 2 as well — KScreen's KWin backend matches outputs by name. The
+  first tablet's PipeWire stream then changed size and the native helper
+  exited with "no more input formats".
+- **xdg-desktop-portal 1.21 derives a host app's id from its systemd unit**
+  when the unit is named `app-…`: the service pattern is
+  `^app-(?:[[:alnum:]]+-)?(.+?)(?:@[[:alnum:]]*|-autostart)?\.service$`
+  (from the binary's strings; `_xdp_app_info_host_parse_app_id_from_unit_name`).
+  `systemd-run --unit=app-tabs9.sm_x910.service` therefore yields the app id
+  `tabs9.sm_x910` and the output `Virtual-virtual-xdp-kde-tabs9.sm_x910`.
+  Restore tokens are keyed by app id, so a token issued to the empty id is
+  not accepted by `tabs9.sm_x910`: one more round of the two dialogs.
+- **Custom modes accumulate.** `kscreen-doctor output.N.addCustomMode` adds
+  a mode every start and nothing removes it; after a day of testing a
+  virtual output lists hundreds of 2960x1848 modes, and every virtual
+  output shows the same list. Harmless so far.
+- **The Huawei's Android also asks twice per `adb install`** (see the
+  README), and `adb` either blocks on the prompts or returns "Success"
+  before they are answered, depending on the run.
