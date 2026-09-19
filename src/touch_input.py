@@ -117,8 +117,11 @@ class LiveKScreenTarget:
             # every active slot.  Normalize command/JSON failures here so a
             # transient KScreen failure cannot leave a contact stuck down.
             raise TouchInputError("could not refresh bound output geometry") from error
+        # Matched by KScreen id first (virtual outputs share one name), by
+        # name for descriptions without an id.
         matches = [item for item in current_outputs
-                   if item.get("name") == self.output_name]
+                   if str(item.get("id")) == self.output_name or
+                   (item.get("id") is None and item.get("name") == self.output_name)]
         if len(matches) != 1 or not matches[0].get("enabled", False):
             raise TouchInputError("bound virtual output is missing or disabled")
         item = matches[0]

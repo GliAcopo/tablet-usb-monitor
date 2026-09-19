@@ -2,9 +2,14 @@
 set -euo pipefail
 cd "$(dirname "$(realpath "$0")")"
 # One host, one systemd user unit and one status file per tablet:
-# tabs9-<slug>.service and .local/state/host-<slug>.status.json, where the
-# slug is the tablet's model (sm_x910, hmw_w09). TABS9_UNIT/TABS9_STATUS_FILE
-# pin a single unit instead (tests, and the pre-multi-tablet layout).
+# app-tabs9.<slug>.service and .local/state/host-<slug>.status.json, where
+# the slug is the tablet's model (sm_x910, hmw_w09). The "app-" unit name is
+# how xdg-desktop-portal learns an app id ("tabs9.<slug>") for the host: the
+# KDE portal names the virtual output after it, and without one every
+# virtual output is called "Virtual-virtual-xdp-kde-" and KScreen applies a
+# mode meant for one tablet to both. Portal restore tokens are per app id,
+# hence per tablet. TABS9_UNIT/TABS9_STATUS_FILE pin a single unit instead
+# (tests, and the pre-multi-tablet layout).
 unit=${TABS9_UNIT:-}
 status_file=${TABS9_STATUS_FILE:-}
 legacy_unit=tab-s9-usb-display.service
@@ -34,15 +39,15 @@ pick_tablet() {
   fi
   slug=${line%%$'\t'*}
   label=${line#*$'\t'}
-  unit="tabs9-$slug.service"
+  unit="app-tabs9.$slug.service"
   status_file=".local/state/host-$slug.status.json"
 }
 
 # Every instance known to systemd or by a status file: "slug" per line.
 all_instances() {
   {
-    systemctl --user list-units --all --plain --no-legend 'tabs9-*.service' 2>/dev/null \
-      | awk '{print $1}' | sed -e 's/^tabs9-//' -e 's/\.service$//'
+    systemctl --user list-units --all --plain --no-legend 'app-tabs9.*.service' 2>/dev/null \
+      | awk '{print $1}' | sed -e 's/^app-tabs9\.//' -e 's/\.service$//'
     for f in .local/state/host-*.status.json; do
       [[ -f "$f" ]] || continue
       f=${f##*/host-}; printf '%s\n' "${f%.status.json}"
@@ -186,13 +191,13 @@ case "${1:-help}" in
       units=("$unit")
     else
       units=("$legacy_unit")
-      while read -r slug; do [[ -n "$slug" ]] && units+=("tabs9-$slug.service"); done < <(all_instances)
+      while read -r slug; do [[ -n "$slug" ]] && units+=("app-tabs9.$slug.service"); done < <(all_instances)
     fi
     stopped=0
     for u in "${units[@]}"; do
       if systemctl --user is-active --quiet "$u"; then
         systemctl --user stop "$u"
-        echo "stopped ${u#tabs9-}" | sed 's/\.service$//'
+        echo "stopped ${u#app-tabs9.}" | sed 's/\.service$//'
         stopped=1
       fi
     done
@@ -205,7 +210,7 @@ case "${1:-help}" in
       while read -r slug; do
         [[ -n "$slug" ]] || continue
         found=1
-        TABS9_UNIT="tabs9-$slug.service" TABS9_STATUS_FILE=".local/state/host-$slug.status.json" \
+        TABS9_UNIT="app-tabs9.$slug.service" TABS9_STATUS_FILE=".local/state/host-$slug.status.json" \
           TABS9_LABEL="$slug" "$0" status | sed "s/^USB display service/$slug/"
       done < <(all_instances)
       if systemctl --user is-active --quiet "$legacy_unit"; then
@@ -245,7 +250,7 @@ case "${1:-help}" in
       pick_tablet "$@"
       journalctl --user -u "$unit" --no-pager -n 30 -o cat
     else
-      journalctl --user -u 'tabs9-*' -u "$legacy_unit" --no-pager -n 40 -o cat
+      journalctl --user -u 'app-tabs9.*' -u "$legacy_unit" --no-pager -n 40 -o cat
     fi
     ;;
   pin-desktop)

@@ -56,7 +56,7 @@ ADB = LOCAL / 'platform-tools/adb'
 APK = LOCAL / 'artifacts/tab-s9-usb-display-debug.apk'
 APK_NAME = 'tab-s9-usb-display-debug.apk'
 PACKAGE = 'local.tabs9.usbdisplay'
-TOKENS = LOCAL / 'state/portal_tokens.json'
+STATE = LOCAL / 'state'
 HELPER = ROOT / 'native/tabs9-capture'
 RELEASES_API = 'https://api.github.com/repos/GliAcopo/tablet-usb-monitor/releases/latest'
 UDEV_RULE = Path('/etc/udev/rules.d/51-tablet-usb-monitor.rules')
@@ -882,27 +882,33 @@ def install_on(c, tablet, local_sha):
     c.ok(f'{tablet.label}: client installed')
 
 
-def step_consent(c):
+def step_consent(c, ready):
     c.step('KDE consent (the two portal dialogs)')
-    tokens = {}
-    try:
-        tokens = json.loads(TOKENS.read_text())
-    except (OSError, ValueError):
-        pass
-    have = {k for k in ('screencast_create', 'remotedesktop_capture') if isinstance(tokens.get(k), str) and tokens[k]}
-    if have == {'screencast_create', 'remotedesktop_capture'}:
-        c.ok('restore tokens stored: starts are silent (no dialogs)')
-        return
-    c.info('The first start shows two KDE dialogs on this computer, one after the other:')
-    c.guide([
-        '1. "Share virtual screen"  -> click Share.',
-        '2. Remote-control approval  -> click Allow. There is no screen to pick: KDE',
-        '   shares every screen and the host selects the virtual one; the laptop\'s',
-        '   own screen is never sent.',
-        'Leave "Allow restoring on future sessions" ticked in both: the tokens go to',
-        f'{TOKENS.relative_to(ROOT)} (mode 0600) and every later start is silent.',
-    ])
-    c.warn('consent', f'{"no" if not have else "one"} restore token stored yet', 'Answer the dialogs once at the first start.')
+    explained = False
+    for tablet, _ in ready or [(None, None)]:
+        slug = tablet.slug if tablet else None
+        tokens = {}
+        try:
+            tokens = json.loads((STATE / f'portal_tokens-{slug}.json').read_text()) if slug else {}
+        except (OSError, ValueError):
+            pass
+        have = {k for k in ('screencast_create', 'remotedesktop_capture') if isinstance(tokens.get(k), str) and tokens[k]}
+        if have == {'screencast_create', 'remotedesktop_capture'}:
+            c.ok(f'{tablet.label}: restore tokens stored, starts are silent (no dialogs)')
+            continue
+        if not explained:
+            explained = True
+            c.info('The first start of a tablet shows two KDE dialogs on this computer, one after the other:')
+            c.guide([
+                '1. "Share virtual screen"  -> click Share.',
+                '2. Remote-control approval  -> click Allow. There is no screen to pick: KDE',
+                '   shares every screen and the host selects the virtual one; the laptop\'s',
+                '   own screen is never sent.',
+                'Leave "Allow restoring on future sessions" ticked in both: the tokens go to',
+                '.local/state/portal_tokens-<model>.json (mode 0600) and every later start is silent.',
+            ])
+        c.warn('consent', f'{tablet.label if tablet else "tablet"}: {"no" if not have else "one"} restore token stored yet',
+               'Answer the dialogs once at the first start.')
 
 
 def suggested_command(facts, tablet_label=None):
@@ -936,7 +942,8 @@ def summary(c, ready, start):
     print('READY' + (f' with {len(c.warnings)} warning(s)' if c.warnings else ''))
     for step, what, _ in c.warnings:
         print(f'  - [{step}] {what}')
-    commands = [suggested_command(facts, tablet.label if len(ready) > 1 else None) for tablet, facts in ready] \
+    attached = len([t for t in list_tablets(ADB) if t.usb]) if ADB.is_file() else 0
+    commands = [suggested_command(facts, tablet.label if attached > 1 else None) for tablet, facts in ready] \
         or [suggested_command({})]
     print('\nStart the display with:\n')
     for tablet_command in commands:
@@ -995,7 +1002,8 @@ def main(argv=None):
     interactive = not args.doctor
     c = Console(interactive=interactive, assume_yes=args.yes)
     use_sudo = not args.no_sudo
-    print('Tablet USB monitor: ' + ('guided setup' if interactive else 'doctor (report only)'))
+    sys.stdout.reconfigure(line_buffering=True)   # keep child output (apt, make) in order when piped
+    print('tabs9: ' + ('guided setup' if interactive else 'doctor (report only)'))
     print(f'Project: {ROOT}')
     if interactive and not c.tty and not args.yes:
         print('No terminal: questions default to "no". Use --yes to accept the fixes.')
@@ -1006,7 +1014,7 @@ def main(argv=None):
     step_native_helper(c)
     ready = step_tablet(c, use_sudo, args.tablet) if have_adb else []
     step_app(c, ready)
-    step_consent(c)
+    step_consent(c, ready)
     return summary(c, ready, args.start)
 
 

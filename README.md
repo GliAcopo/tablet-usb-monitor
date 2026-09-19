@@ -1,7 +1,7 @@
-# Tablet USB monitor
+# tabs9 — your tablet as a second screen, over USB
 
-Use an Android tablet as a **real extended monitor** for a Linux laptop over a
-USB cable. The host creates a KDE virtual output, captures it through PipeWire
+**tabs9** turns an Android tablet into a **real extended monitor** for a Linux
+laptop over a USB cable — or two tablets into two monitors. The host creates a KDE virtual output, captures it through PipeWire
 as a DMA-BUF, converts and compresses it on the same Intel GPU with VA-API HEVC
 (zero copies, no readback) and sends it through authenticated loopback sockets
 forwarded by ADB. Touch and pen come back through KDE's RemoteDesktop portal
@@ -17,7 +17,7 @@ recommended mode. Two tablets:
 | Tablet | Panel | What was verified | Notes |
 |---|---|---|---|
 | **Samsung Galaxy Tab S9 Ultra** | 2960 × 1848, 120 Hz | Everything in this file: 60/120 Hz numbers, touch, pen, gestures, remote control | Every number in [docs/performance.md](docs/performance.md) comes from this pair |
-| **Huawei MatePad Paper** HMW-W09 (HarmonyOS 2.1 = Android 10, Kirin 820E), **E-ink** | 1872 × 1404, 40 Hz | Mirroring and touch, 2026-09-19 | `--profile light` (30 fps); frame rate is irrelevant on E-ink and was not measured. Its HEVC decoder holds frames until the next one arrives (see [Limitations](#limitations)); the host now works around it. Not Samsung, so no S Pen button/air gestures; remote control not tried |
+| **Huawei MatePad Paper** HMW-W09 (HarmonyOS 2.1 = Android 10, Kirin 820E), **E-ink** | 1872 × 1404, 40 Hz | Mirroring and touch, 2026-09-19; both tablets streaming at the same time as two extra monitors | `--profile light` (30 fps); frame rate is irrelevant on E-ink and was not measured. Its HEVC decoder holds frames until the next one arrives (see [Limitations](#limitations)); the host now works around it. Not Samsung, so no S Pen button/air gestures; remote control not tried |
 
 ## Requirements
 
@@ -57,9 +57,10 @@ Read this before anything else; the project is hardware-specific.
   GitHub release and checks the SHA-256 published in the release notes, or
   build it from source with `scripts/build-android.sh`.
 
-Internal names keep the `tabs9` prefix from the first tested device: the CLI
-is `./tabs9`, the systemd user unit is `tab-s9-usb-display.service`, the app id
-is `local.tabs9.usbdisplay`.
+The name comes from the first tablet it ran on. The CLI is `./tabs9`, each
+tablet's host runs as the systemd user unit `app-tabs9.<model>.service`
+(`app-tabs9.sm_x910.service`, `app-tabs9.hmw_w09.service`), the Android app
+id is `local.tabs9.usbdisplay`.
 
 ## Quick start: one command
 
@@ -67,8 +68,15 @@ is `local.tabs9.usbdisplay`.
 git clone https://github.com/GliAcopo/tablet-usb-monitor.git
 cd tablet-usb-monitor
 ./tabs9 setup          # walks through everything below, then prints the start line
-./tabs9 start          # e.g. ./tabs9 start --profile light --pen-button off
+./tabs9 ui             # control panel in the browser: Start, settings, status …
+./tabs9 start          # … or the command line, e.g. ./tabs9 start --profile light
 ```
+
+On a machine that already has the packages, `./tabs9 setup --yes` is
+hands-off from a fresh clone to an app on the tablet (verified: it downloads
+ADB, builds the capture helper, fetches the release APK, checks its SHA-256,
+installs it and answers the tablet's own prompts — no sudo asked when nothing
+is missing).
 
 `./tabs9 setup` is a guided installer and a doctor in one. It goes through
 eight steps in order and, at each one, says what it found, what it is about
@@ -160,16 +168,74 @@ one thing that needs the extra `scripts/tabs9-remote/build-and-push.sh`.
 
 ### First start
 
-The first start shows two KDE dialogs — "Share virtual screen" and the
-RemoteDesktop/ScreenCast approval. Leave "Allow restoring on future sessions"
-ticked in both: the host stores the restore tokens under `.local/state/` and
-every later start is silent. The host launches the app on the tablet itself
-over ADB; `./tabs9 status`, `./tabs9 logs` and `./tabs9 stop` do what they
-say. `--profile balanced` (native resolution, 60 Hz, HEVC 30 Mbit/s) is the
+The first start of each tablet shows two KDE dialogs — "Share virtual screen"
+and the RemoteDesktop/ScreenCast approval. Leave "Allow restoring on future
+sessions" ticked in both: the host stores the restore tokens under
+`.local/state/portal_tokens-<model>.json` and every later start of that
+tablet is silent. The host launches the app on the tablet itself over ADB;
+`./tabs9 status`, `./tabs9 logs` and `./tabs9 stop` do what they say.
+`--profile balanced` (native resolution, 60 Hz, HEVC 30 Mbit/s) is the
 measured usable mode on the Tab S9 Ultra; `--fps 120` is available and
 reaches 110–113 fps; `--profile light` (30 fps, 15 Mbit/s) is right for
 E-ink and other slow panels. Without `--resolution` the host uses the panel
 size the connected tablet reports.
+
+### The control panel: `./tabs9 ui`
+
+![tabs9 control panel with two tablets](docs/control-panel.png)
+
+`./tabs9 ui` serves a small page on `http://127.0.0.1:8899` (this computer
+only) and opens it in your browser. One card per attached tablet: its state
+(stopped / waiting for the KDE dialog / streaming / failed), **Start** and
+**Stop**, what the tablet is (panel, refresh rate, Android version, whether
+it has a hardware HEVC decoder), live figures while it streams (frames per
+second, frames shown on the tablet, latency, received bit rate, touches),
+its **settings** — which side of the laptop screen, profile, text size,
+resolution, and under *Advanced* frame rate, bitrate, gestures, scrolling,
+two-finger tap, S Pen button, remote control, capture path — the host log,
+and a **Run doctor** button that shows the same report as `./tabs9 doctor`.
+It is plain HTML and JavaScript served by Python's standard library, so it
+renders in any browser and needs no framework or build step.
+
+Settings are **remembered per tablet** in `.local/state/settings.json`
+(model names, never serials) and applied by `./tabs9 start` as well, so the
+Tab S9 can live on the left at 60 fps and the E-ink tablet on the right at
+30 fps, every time, with no options typed. Anything typed on the command
+line still wins. *Save and restart* applies a change to a running tablet.
+
+### Where the tablet goes: `--side`
+
+`--side left|right|top|bottom` (default right; the *Side of the laptop
+screen* buttons in the panel) places the virtual output next to the laptop
+screen. Right and bottom only add the output; left and top put the tablet at
+the origin and **move the laptop screen over** for the duration — KDE keeps
+the layout's top-left corner at (0, 0) — nudged so the laptop stays on whole
+device pixels at its own scale; the host puts it back where it was when it
+stops.
+
+### Two tablets at once
+
+Every attached tablet gets its own host: `./tabs9 start --tablet SM` and
+`./tabs9 start --tablet HMW` (a model name, or part of one; with a single
+tablet attached `--tablet` is not needed). Each instance has its own systemd
+unit (`app-tabs9.<model>.service`), status file, lock, listening ports (the
+first takes 8890–8892, the next 8894–8896, …; the app always dials 8890/8891
+on the tablet and `adb reverse` maps them) and portal tokens. `./tabs9
+status`, `./tabs9 stop` and `./tabs9 logs` cover every instance; add
+`--tablet` for one. `./tabs9 setup` prepares every attached tablet in one
+run.
+
+Two things had to change for this to work on KDE, both invisible in normal
+use: every adb call names its device (`adb -s`, never `-d`), and the unit
+is named `app-tabs9.<model>.service` so that xdg-desktop-portal derives an
+app id (`tabs9.<model>`) for each host. Without an app id KWin names every
+virtual output `Virtual-virtual-xdp-kde-`, identical, and KScreen — which
+addresses outputs by name — applied the second tablet's mode to the first
+tablet's output as well (observed: the Tab S9's 2960×1848 output switched
+to 1872×1404 and its capture stream died with "no more input formats").
+With per-host app ids the outputs are `Virtual-virtual-xdp-kde-tabs9.sm_x910`
+and `…hmw_w09`, the host tracks them by KScreen id, and portal restore
+tokens are per app id, hence per tablet.
 
 ## Measured results (2026-09-12, commit 3243ed3, one machine)
 
@@ -307,10 +373,10 @@ Recommended launch (the measured usable mode: native resolution, 60 Hz,
 HEVC 30 Mbit/s, native capture):
 
 ```sh
-./tabs9 start --profile balanced
-./tabs9 status
-./tabs9 logs
-./tabs9 stop
+./tabs9 start --profile balanced      # add --tablet MODEL with two tablets attached
+./tabs9 status                        # every running tablet
+./tabs9 logs                          # add --tablet MODEL for one
+./tabs9 stop                          # all, or --tablet MODEL
 ```
 
 `./tabs9 start --profile balanced --fps 120` selects the 120 Hz output mode
@@ -605,8 +671,10 @@ behave, and what is left to do.
 The capture/RemoteDesktop session requests `persist_mode=2`. Per the XDG
 RemoteDesktop spec, if the portal's **"Allow restoring on future sessions"**
 checkbox is checked, the portal should return a `restore_token` that the host
-stores in `.local/state/portal_tokens.json` (gitignored, 0600 permissions,
-atomic writes), and present on subsequent starts to `SelectDevices`. This
+stores in `.local/state/portal_tokens-<model>.json` (gitignored, 0600
+permissions, atomic writes), and present on subsequent starts to
+`SelectDevices`. Tokens are bound to the app id the portal derives from the
+host's unit name, so they are per tablet. This
 round trip is **confirmed live** on KDE 6.6.6: the checkbox is on by default,
 the token is returned and stored, and the next start restores the session
 without a dialog. If a

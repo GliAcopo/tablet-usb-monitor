@@ -147,7 +147,7 @@ def describe_wrong_source(size, outputs_now, expected):
         pw, ph = _resolve_mode_size(o)
         if _is_rotated_90(o.get('rotation', 1)):
             pw, ph = ph, pw
-        logical[o['name']] = ((o.get('pos') or {}).get('x', 0), (o.get('pos') or {}).get('y', 0),
+        logical[o.get('name') or output_key(o)] = ((o.get('pos') or {}).get('x', 0), (o.get('pos') or {}).get('y', 0),
             round(pw / scale), round(ph / scale), pw, ph)
     if len(logical) > 1:
         union_w = max(x + lw for x, y, lw, lh, pw, ph in logical.values())
@@ -201,6 +201,15 @@ def adb(*args):
 
 def outputs():
     return json.loads(subprocess.check_output(['kscreen-doctor', '-j']))['outputs']
+
+def output_key(o):
+    """What identifies a KScreen output: its id, as a string kscreen-doctor
+    accepts in `output.<id>.…`. Every virtual output KWin creates is named
+    `Virtual-virtual-xdp-kde-`, so with two tablets the name tells nothing.
+    Descriptions without an id (tests) fall back to the name."""
+    if isinstance(o, dict) and o.get('id') is not None:
+        return str(o['id'])
+    return o.get('name') if isinstance(o, dict) else None
 
 def tablet_panel_size():
     """'WIDTHxHEIGHT' of the connected tablet's panel in landscape, or None.
@@ -289,7 +298,7 @@ def _logical_extent(outputs_, previous_names):
     x1 = y1 = 0
     first_scale = None
     for o in outputs_:
-        if not isinstance(o, dict) or o.get('name') not in previous_names or not o.get('enabled', False):
+        if not isinstance(o, dict) or output_key(o) not in previous_names or not o.get('enabled', False):
             continue
         pos = o.get('pos') or {}
         pos_x, pos_y = pos.get('x', 0), pos.get('y', 0)
@@ -342,12 +351,12 @@ def compute_layout(current_outputs, previous_names, side='right', gap=1, scale=1
     shift_x = _nudge(logical_w + gap, laptop_scale) if side == 'left' else 0
     shift_y = _nudge(logical_h + gap, laptop_scale) if side == 'top' else 0
     for o in current_outputs:
-        if not isinstance(o, dict) or o.get('name') not in previous_names or not o.get('enabled', False):
+        if not isinstance(o, dict) or output_key(o) not in previous_names or not o.get('enabled', False):
             continue
         pos = o.get('pos') or {}
         px = pos.get('x', 0) if isinstance(pos.get('x', 0), (int, float)) else 0
         py = pos.get('y', 0) if isinstance(pos.get('y', 0), (int, float)) else 0
-        moves.append((o['name'], int(px - x0 + shift_x), int(py - y0 + shift_y)))
+        moves.append((output_key(o), int(px - x0 + shift_x), int(py - y0 + shift_y)))
     return (0, 0), moves
 
 
@@ -383,7 +392,7 @@ def compute_virtual_position(current_outputs, previous_names, gap=1, scale=None)
     right_edge = 0
     seen_enabled = False
     for o in current_outputs:
-        if not isinstance(o, dict) or o.get('name') not in previous_names or not o.get('enabled', False):
+        if not isinstance(o, dict) or output_key(o) not in previous_names or not o.get('enabled', False):
             continue
         seen_enabled = True
         pos_x = (o.get('pos') or {}).get('x', 0)
@@ -541,7 +550,7 @@ class Host:
         self.rendered = 0
         self.last_report = (time.monotonic(), 0, 0, 0)
         self.caps_reported = None
-        self.previous = {o['name'] for o in outputs()}
+        self.previous = {output_key(o) for o in outputs()}
         self.moved_outputs = {}     # name -> (x, y) before the host moved it (--side left/top)
         self.virtual_name = None
         self.touch = None
@@ -1193,11 +1202,11 @@ class Host:
 
     def _configure_output(self):
         current = outputs()
-        new = [o for o in current if o['name'] not in self.previous]
+        new = [o for o in current if output_key(o) not in self.previous]
         if len(new) != 1:
             print('Waiting for KDE to activate a separate virtual output.', flush=True)
             return True
-        name = new[0]['name']
+        name = output_key(new[0])       # the id: names repeat across virtual outputs
         self.virtual_name = name
         a = self.args
         def configure(*settings):
@@ -1208,13 +1217,13 @@ class Host:
         (x, y), moves = compute_layout(current, self.previous, side=a.side, gap=a.gap,
                                        scale=a.scale, width=a.width, height=a.height)
         for o in current:
-            if any(o.get('name') == m[0] for m in moves) and o.get('name') not in self.moved_outputs:
+            if any(output_key(o) == m[0] for m in moves) and output_key(o) not in self.moved_outputs:
                 pos = o.get('pos') or {}
-                self.moved_outputs[o['name']] = (int(pos.get('x', 0)), int(pos.get('y', 0)))
+                self.moved_outputs[output_key(o)] = (int(pos.get('x', 0)), int(pos.get('y', 0)))
         configure(f'output.{name}.mode.{a.width}x{a.height}@{a.fps}',
             f'output.{name}.scale.{a.scale}', f'output.{name}.position.{x},{y}', f'output.{name}.enable',
             *(f'output.{moved}.position.{mx},{my}' for moved, mx, my in moves))
-        final = next(o for o in outputs() if o['name'] == name)
+        final = next(o for o in outputs() if output_key(o) == name)
         mode = next(m for m in final['modes'] if m['id'] == final['currentModeId'])
         print('Extended output:', json.dumps({'size': mode['size'], 'Hz': mode['refreshRate'],
               'scale': final['scale'], 'position': final['pos']}), flush=True)
@@ -1262,7 +1271,7 @@ class Host:
 
     def _virtual_x(self):
         with contextlib.suppress(Exception):
-            return next(o['pos']['x'] for o in outputs() if o['name'] == self.virtual_name)
+            return next(o['pos']['x'] for o in outputs() if output_key(o) == self.virtual_name)
         return '?'
 
     def request_capture_session(self):
@@ -1861,7 +1870,7 @@ class Host:
     def pointer_home(self):
         """The middle of the computer's own screen: where the pointer is left."""
         own = next(o for o in outputs()
-                   if o['name'] != self.virtual_name and o.get('enabled', True))
+                   if output_key(o) != self.virtual_name and o.get('enabled', True))
         scale = own.get('scale') or 1
         return (own['pos']['x'] + own['size']['width'] / scale / 2,
                 own['pos']['y'] + own['size']['height'] / scale / 2)
@@ -2100,7 +2109,7 @@ class Host:
             return False
         try:
             if self.virtual_name and fps != self.args.fps:
-                output = next(o for o in outputs() if o['name'] == self.virtual_name)
+                output = next(o for o in outputs() if output_key(o) == self.virtual_name)
                 match = next((m for m in output['modes'] if m['size'] == {'width': self.args.width,
                     'height': self.args.height} and abs(m['refreshRate'] - fps) < .1), None)
                 if match is None:
@@ -2425,13 +2434,16 @@ if __name__ == '__main__':
     state_dir = ROOT / '.local/state'
     state_dir.mkdir(parents=True, exist_ok=True)
     # One host per tablet: the instance lock says "this tablet already has a
-    # host"; the slot lock hands out the listening ports and the portal token
-    # file. Slot 1 keeps the historical names (host.status.json is not one of
-    # them: the status file follows the instance so `tabs9 status` can list
-    # every running tablet).
+    # host"; the slot lock hands out the listening ports. Portal restore
+    # tokens follow the instance, because the portal binds them to the app
+    # id it derives from the unit name (app-tabs9.<slug>.service, see the
+    # tabs9 script) and that id is per tablet. The old single-tablet file
+    # (portal_tokens.json) belonged to a host with no app id and cannot be
+    # reused: each tablet answers the two dialogs once.
     instance = args.instance or tablet.slug
     args.tablet_label = tablet.label
     args.status_file = state_dir / f'host-{instance}.status.json'
+    args.tokens_file = state_dir / f'portal_tokens-{instance}.json'
     lock = (state_dir / f'host-{instance}.lock').open('w')
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2450,7 +2462,6 @@ if __name__ == '__main__':
     if slot_lock is None:
         raise SystemExit('Four hosts are already running; stop one first')
     args.port_base = 8890 + 4 * (slot - 1)
-    args.tokens_file = TOKENS_FILE if slot == 1 else state_dir / f'portal_tokens-{slot}.json'
     if args.remote_port is None:
         args.remote_port = args.port_base + 2
     print(f'Instance {instance}: slot {slot}, ports {args.port_base}-{args.port_base + 2}', flush=True)

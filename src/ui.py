@@ -72,7 +72,7 @@ cache = Cache()
 
 
 def unit_for(slug):
-    return f'tabs9-{slug}.service'
+    return f'app-tabs9.{slug}.service'
 
 
 def unit_pid(unit):
@@ -142,7 +142,6 @@ def state():
         'profiles': PROFILES,
         'options': {k: {'values': v[0] if isinstance(v[0], list) else None, 'label': v[1]}
                     for k, v in settings_store.OPTIONS.items()},
-        'consent': (STATE_DIR / 'portal_tokens.json').is_file(),
         'time': time.time(),
     }
 
@@ -209,7 +208,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(state())
         if url.path == '/api/logs':
             slug = self.slug_from(None, query)
-            unit = unit_for(slug) if slug else 'tabs9-*'
+            unit = unit_for(slug) if slug else 'app-tabs9.*'
             lines = [l for l in journal(unit, 120).splitlines() if not l.startswith('{')]
             return self.send_text('\n'.join(lines[-80:]))
         if url.path == '/api/settings':
