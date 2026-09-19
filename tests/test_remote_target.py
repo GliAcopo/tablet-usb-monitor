@@ -187,3 +187,49 @@ class HostRoutingTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class OuterSideTests(unittest.TestCase):
+    """The shortcut pushes the pointer against the tablet screen's free edge."""
+
+    def make(self, side, tablet_pos, laptop=(0, 0, 2560, 1600, 1.75)):
+        import host as host_module
+        from unittest.mock import patch
+        value = host_module.Host.__new__(host_module.Host)
+        value.args = type('A', (), {'side': side})()
+        value.virtual_name = '2'
+        geometry = type('G', (), {'x': tablet_pos[0], 'y': tablet_pos[1], 'logical_size': (1973, 1232)})()
+        value.touch = type('T', (), {'target': type('R', (), {'geometry': staticmethod(lambda: geometry)})()})()
+        lx, ly, lw, lh, ls = laptop
+        outs = [{'id': 1, 'enabled': True, 'pos': {'x': lx, 'y': ly}, 'size': {'width': lw, 'height': lh}, 'scale': ls},
+                {'id': 2, 'enabled': True, 'pos': {'x': tablet_pos[0], 'y': tablet_pos[1]},
+                 'size': {'width': 2960, 'height': 1848}, 'scale': 1.5}]
+        self.patcher = patch.object(host_module, 'outputs', lambda: outs)
+        self.patcher.start(); self.addCleanup(self.patcher.stop)
+        return value
+
+    def test_tablet_on_the_right_uses_its_right_edge(self):
+        self.assertEqual(self.make('right', (1464, 0)).outer_side(), 'right')
+
+    def test_tablet_on_the_left_uses_its_left_edge(self):
+        self.assertEqual(self.make('left', (-1973, 0)).outer_side(), 'left')
+
+    def test_a_rearranged_tablet_is_read_from_the_outputs(self):
+        # Placed with --side right but moved to the left of the laptop since.
+        self.assertEqual(self.make('right', (-1973, 0)).outer_side(), 'left')
+
+    def test_above_and_below(self):
+        self.assertEqual(self.make('top', (0, -1232)).outer_side(), 'top')
+        self.assertEqual(self.make('bottom', (0, 915)).outer_side(), 'bottom')
+
+
+class OutputEdgeTests(unittest.TestCase):
+    def test_right_and_bottom_segments_are_one_pixel_inside(self):
+        import host as host_module
+        value = host_module.Host.__new__(host_module.Host)
+        geometry = type('G', (), {'x': 1464, 'y': 0, 'logical_size': (1973, 1232)})()
+        value.touch = type('T', (), {'target': type('R', (), {'geometry': staticmethod(lambda: geometry)})()})()
+        self.assertEqual(value.output_edge('left'), ((1464, 0), (1464, 1231)))
+        self.assertEqual(value.output_edge('right'), ((3436, 0), (3436, 1231)))
+        self.assertEqual(value.output_edge('top'), ((1464, 0), (3436, 0)))
+        self.assertEqual(value.output_edge('bottom'), ((1464, 1231), (3436, 1231)))

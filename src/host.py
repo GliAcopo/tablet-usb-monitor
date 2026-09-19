@@ -1803,6 +1803,8 @@ class Host:
         if self.remote_control is None or self.remote_control.active:
             return False
         if attempts <= 0:
+            print('Remote control: KWin did not activate the capture (the pointer was pushed '
+                  f'against the tablet screen\'s {self.remote_control.side} edge).', flush=True)
             notify('The tablet did not take the input',
                    'Press the shortcut again, or push the pointer off that edge by hand.')
             return False
@@ -1823,6 +1825,7 @@ class Host:
                 park=self.park_pointer, nudge=self.nudge_pointer,
                 notify=lambda summary, body: notify(summary, body),
                 on_state=self.remote_state_changed, home=self.pointer_home,
+                outer=self.outer_side,
                 release_chord=self.shortcut_keys.get('remote-control', 'Meta+Shift+T'))
         return self.remote_control
 
@@ -1927,11 +1930,54 @@ class Host:
         geometry = self.touch.target.geometry()
         x, y = geometry.x, geometry.y
         width, height = geometry.logical_size
-        edges = {'left': ((x, y), (x, y + height)),
-                 'right': ((x + width, y), (x + width, y + height)),
-                 'top': ((x, y), (x + width, y)),
-                 'bottom': ((x, y + height), (x + width, y + height))}
+        # KWin keeps the pointer within [left, right - 1] x [top, bottom - 1]
+        # of the output (confineToBoundingBox in pointer_input.cpp), and a
+        # segment counts as reached only when the pointer's coordinate equals
+        # its own, so the right and bottom segments sit one pixel inside.
+        # The left and top ones are the output's own edge (that is why the
+        # feature only ever worked with the tablet on the left).
+        right, bottom = x + width - 1, y + height - 1
+        edges = {'left': ((x, y), (x, bottom)),
+                 'right': ((right, y), (right, bottom)),
+                 'top': ((x, y), (right, y)),
+                 'bottom': ((x, bottom), (right, bottom))}
         return edges.get(side)
+
+    def outer_side(self):
+        """The edge of the tablet's screen with no other screen beyond it.
+
+        The side the tablet was placed on (--side right puts it right of the
+        laptop, so its right edge is free) is the first candidate; the
+        outputs are checked in case they were rearranged since.
+        """
+        if self.touch is None:
+            return None
+        geometry = self.touch.target.geometry()
+        x, y = geometry.x, geometry.y
+        width, height = geometry.logical_size
+        others = []
+        for o in outputs():
+            if output_key(o) == self.virtual_name or not o.get('enabled', True):
+                continue
+            scale = o.get('scale') or 1
+            others.append((o['pos']['x'], o['pos']['y'], o['size']['width'] / scale,
+                           o['size']['height'] / scale))
+        def free(side):
+            # Logical sizes are fractional (2560 / 1.75), so "touching" is
+            # within a couple of pixels.
+            for ox, oy, ow, oh in others:
+                overlap_y = oy < y + height and oy + oh > y
+                overlap_x = ox < x + width and ox + ow > x
+                if side == 'left' and overlap_y and abs(ox + ow - x) <= 2: return False
+                if side == 'right' and overlap_y and abs(ox - (x + width)) <= 2: return False
+                if side == 'top' and overlap_x and abs(oy + oh - y) <= 2: return False
+                if side == 'bottom' and overlap_x and abs(oy - (y + height)) <= 2: return False
+            return True
+        preferred = getattr(self.args, 'side', None) or 'right'
+        for side in [preferred, 'right', 'left', 'top', 'bottom']:
+            if free(side):
+                return side
+        return preferred
 
     def pointer_home(self):
         """The middle of the computer's own screen: where the pointer is left."""

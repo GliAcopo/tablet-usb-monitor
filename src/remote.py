@@ -399,6 +399,7 @@ class RemoteControl:
                  notify: Callable[[str, str], None] | None = None,
                  on_state: Callable[[str], None] | None = None,
                  home: Callable[[], tuple[float, float]] | None = None,
+                 outer: Callable[[], str] | None = None,
                  release_chord: str = 'Meta+Shift+T'):
         self.injector = injector
         self.capture = capture
@@ -413,6 +414,11 @@ class RemoteControl:
         self.notify = notify or (lambda summary, body: None)
         self.on_state = on_state or (lambda state: None)
         self.home = home
+        # Which edge of the tablet's screen is a workspace edge (nothing
+        # beyond it): the shortcut pushes the pointer against that one when
+        # no --remote-edge was asked for. It depends on where the screens
+        # are, so it is asked each time.
+        self.outer = outer
         # The key combination that gives the input back, watched for here
         # because KDE cannot see it while the capture is on.
         self.release_chord = parse_chord(release_chord)
@@ -509,9 +515,11 @@ class RemoteControl:
         self.ensure_ready()
         if not self.wait_for_devices():
             raise RemoteError('KWin created no devices for the input capture')
-        edge = self.barrier(self.edge if self.edge != 'none' else 'left') if self.barrier else None
+        edge = self.barrier(self.side) if self.barrier else None
         if edge is None:
             raise RemoteError('no screen edge to hand the pointer over at')
+        log.info('input capture: pushing the pointer against the tablet screen\'s %s edge %s',
+                 self.side, edge)
         self.capture.arm(edge)
         self.cross(edge)
 
@@ -535,7 +543,18 @@ class RemoteControl:
 
     @property
     def side(self) -> str:
-        return self.edge if self.edge != 'none' else 'left'
+        """The edge the pointer is pushed against: the one asked for, else
+        the tablet screen's outer edge. KWin activates a capture only where
+        the pointer cannot go further; the edge next to the laptop's screen
+        is not such a place, and pushing against it did nothing."""
+        if self.edge != 'none':
+            return self.edge
+        if self.outer is not None:
+            with contextlib.suppress(Exception):
+                found = self.outer()
+                if found:
+                    return found
+        return 'left'
 
     # How far inside the screen the pointer is put back: on the barrier it
     # would cross it again with the first movement and be captured anew.

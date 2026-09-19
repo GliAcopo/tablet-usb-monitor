@@ -652,9 +652,15 @@ pointer and no keyboard. KWin only *starts* a capture when the pointer is
 pushed against a screen edge carrying a barrier, so the shortcut arms a
 barrier on the outer edge of the tablet's screen, parks the pointer there
 and pushes it across with the host's own libei sender — the motion a hand
-would have made. `--remote-edge left|right|top|bottom` leaves that edge
-armed so the hand can do it directly; by default the barrier exists only
-for the instant the shortcut needs it, so nothing is entered by accident.
+would have made. The edge is the tablet screen's *outer* one — the side
+with no other screen beyond it, the only place KWin lets
+this happen (with the tablet on the right, its right edge). Two details
+cost an afternoon: KWin keeps the pointer at most one pixel inside the
+right and bottom edges, so those segments sit at `x + width − 1`, and
+the edge next to the laptop is not an edge at all. `--remote-edge
+left|right|top|bottom` leaves that edge armed so the hand can do it
+directly; by default the barrier exists only for the instant the
+shortcut needs it, so nothing is entered by accident.
 The capture is asked of KWin directly, which asks nothing: it is the same
 interface `xdg-desktop-portal-kde` drives on the other side of
 `org.freedesktop.portal.InputCapture`, and only this session's own
