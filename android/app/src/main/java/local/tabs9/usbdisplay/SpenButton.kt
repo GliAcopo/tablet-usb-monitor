@@ -1,6 +1,7 @@
 package local.tabs9.usbdisplay
 
 import android.content.Context
+import android.os.Build
 import android.util.Log
 import com.samsung.android.sdk.penremote.AirMotionEvent
 import com.samsung.android.sdk.penremote.ButtonEvent
@@ -25,6 +26,12 @@ import com.samsung.android.sdk.penremote.SpenUnitManager
  * [disconnect] follow the activity's resumed state.  Nothing here interprets
  * the motion: the host decides what a flick or a loop means (see air.py),
  * because that is where it can be mapped to whatever the user bound it to.
+ *
+ * The SDK is only ever called on Samsung hardware: its feature check reads
+ * a Samsung framework class (SemFloatingFeature) that other devices do not
+ * ship, and the resulting NoClassDefFoundError took the whole activity down
+ * on a Huawei MatePad Paper. Every SDK entry point is also wrapped, so a
+ * pen problem can never cost the picture.
  */
 class SpenButton(private val context: Context) {
     companion object {
@@ -59,9 +66,29 @@ class SpenButton(private val context: Context) {
         onAirMotion?.invoke(motion.deltaX, motion.deltaY)
     }
 
+    /** Whether this device can have Samsung's pen service at all. */
+    private val samsung = Build.MANUFACTURER.equals("samsung", ignoreCase = true)
+
     fun connect() {
         if (wanted) return
         wanted = true
+        if (!samsung) {
+            setStatus("Not a Samsung device: no remote S Pen")
+            Log.i(TAG, status)
+            return
+        }
+        try {
+            connectSdk()
+        } catch (error: Throwable) {
+            // LinkageError, SecurityException from the pen service, anything:
+            // the pen is optional, the activity is not.
+            manager = null
+            setStatus("The pen service is unavailable")
+            Log.w(TAG, "S Pen Remote SDK failed: $error")
+        }
+    }
+
+    private fun connectSdk() {
         val remote = SpenRemote.getInstance()
         if (!remote.isFeatureEnabled(SpenRemote.FEATURE_TYPE_BUTTON)) {
             setStatus("This pen has no remote button")
@@ -108,6 +135,10 @@ class SpenButton(private val context: Context) {
         wanted = false
         val unitManager = manager
         manager = null
+        if (!samsung) {
+            setStatus("Not connected")
+            return
+        }
         if (unitManager != null) {
             for (type in intArrayOf(SpenUnit.TYPE_BUTTON, SpenUnit.TYPE_AIR_MOTION)) {
                 val unit = unitManager.getUnit(type)

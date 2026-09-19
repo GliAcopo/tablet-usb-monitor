@@ -45,7 +45,12 @@ and each side enables a feature only when the other named it. A greeting
 without `features` is a legacy host.
 
 The client uses those values, rather than local preferences, to configure the
-decoder and populate the UI. A settings request remains compatible with
+decoder and populate the UI. On every control connection the client first
+sends a `config` with only `protocol` and `features` (no `fps`/`bitrate`, so
+the host's profile stays in force) — a fresh install has no user settings,
+and before this hello the host never learned that such a client wanted
+heartbeats, so an idle desktop dropped the video every 10 s. A settings
+request is the same message with the values the user chose, compatible with
 UScreen:
 
 ```json

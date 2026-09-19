@@ -40,15 +40,15 @@ unit_main_pid() {
 }
 
 case "${1:-help}" in
-  setup) exec python3 scripts/setup.py ;;
-  doctor) exec python3 scripts/doctor.py ;;
+  setup) shift; exec python3 scripts/setup.py "$@" ;;
+  doctor) shift; exec python3 scripts/setup.py --doctor "$@" ;;
   start)
     shift
     if systemctl --user is-active --quiet "$unit"; then
       echo 'USB display is already running.'
       exit 0
     fi
-    python3 scripts/doctor.py --check
+    python3 scripts/setup.py --check
     # Clear stale status before starting
     rm -f "$status_file"
     systemd-run --user --quiet --collect --unit="$unit" \
@@ -201,7 +201,9 @@ case "${1:-help}" in
   test-motion) shift; exec python3 scripts/motion-test.py "$@" ;;
   bench-capture) shift; exec python3 scripts/capture_ab.py "$@" ;;
   *)
-    echo 'Usage: ./tabs9 {setup|doctor|start [options]|stop|status|logs|pin-desktop on|off}'
+    echo 'Usage: ./tabs9 {setup [--yes] [--no-sudo] [--start]|doctor|start [options]|stop|status|logs|pin-desktop on|off}'
+    echo '  setup walks through every requirement and fixes what it can (asks before sudo);'
+    echo '  doctor runs the same checks read-only and prints the fix for each failure.'
     echo '              {pen-actions [gesture target]|shortcuts [component]}'
     echo '              {test-motion [--seconds N]|bench-capture [--seconds N]}'
     echo '  start options: --profile smooth|balanced|light (120/60/30 fps)'

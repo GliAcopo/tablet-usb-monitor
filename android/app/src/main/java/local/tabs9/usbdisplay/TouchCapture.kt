@@ -128,7 +128,17 @@ class TouchCapture {
                 Log.i(TAG, "Reported native resolution: ${nativeWidth}x${nativeHeight} " +
                         "(${nativeWidthMm}x${nativeHeightMm} mm)")
             }
-            pendingConfig?.let { webSocket.send(it.toString()) }
+            // Always say which protocol and features this client speaks. A
+            // fresh install has no user settings, so pendingConfig is null and
+            // the host would otherwise never learn that we want heartbeats:
+            // every idle desktop then looked like a dead link after 10 s.
+            // This hello carries no fps/bitrate, so the host's own profile
+            // stays in force.
+            webSocket.send((pendingConfig ?: JSONObject().apply {
+                put("type", "config")
+                put("protocol", PROTOCOL)
+                put("features", JSONArray(FEATURES))
+            }).toString())
             pendingMode?.let {
                 webSocket.send(it.toString())
                 pendingMode = null

@@ -9,12 +9,15 @@ and are delivered to the desktop with libei. No root, no kernel module, no
 Wi-Fi, no system-wide installation: everything the tools download lives under
 `.local/` in this directory.
 
-**Tested hardware — the only combination that has ever run this:**
-a **Samsung Galaxy Tab S9 Ultra** (2960 × 1848, 120 Hz) connected to a laptop
-running **Ubuntu 26.04, KDE Plasma 6.6.6 on Wayland, Intel Core Ultra 7 155H
+**Tested hardware — the only combinations that have ever run this.** One
+laptop: **Ubuntu 26.04, KDE Plasma 6.6.6 on Wayland, Intel Core Ultra 7 155H
 with its Arc iGPU (i915)**; an NVIDIA RTX 4050 is present but idle in the
-recommended mode. Every number in this file and in
-[docs/performance.md](docs/performance.md) comes from that pair.
+recommended mode. Two tablets:
+
+| Tablet | Panel | What was verified | Notes |
+|---|---|---|---|
+| **Samsung Galaxy Tab S9 Ultra** | 2960 × 1848, 120 Hz | Everything in this file: 60/120 Hz numbers, touch, pen, gestures, remote control | Every number in [docs/performance.md](docs/performance.md) comes from this pair |
+| **Huawei MatePad Paper** HMW-W09 (HarmonyOS 2.1 = Android 10, Kirin 820E), **E-ink** | 1872 × 1404, 40 Hz | Mirroring and touch, 2026-09-19 | `--profile light` (30 fps); frame rate is irrelevant on E-ink and was not measured. Its HEVC decoder holds frames until the next one arrives (see [Limitations](#limitations)); the host now works around it. Not Samsung, so no S Pen button/air gestures; remote control not tried |
 
 ## Requirements
 
@@ -45,40 +48,117 @@ Read this before anything else; the project is hardware-specific.
 
 **Tablet**
 
-- Any Android tablet with a hardware HEVC decoder and USB debugging enabled
-  should work in principle: the client negotiates resolution, frame rate and
-  bitrate from the host, so the `2960x1848` defaults are only fallbacks
-  (`--resolution WIDTHxHEIGHT` picks yours). Only the Tab S9 Ultra has been
-  verified.
-- The client APK is debug-signed. Install it from the GitHub release (the
-  SHA-256 is in the release notes) or build it from source with
-  `scripts/build-android.sh`.
+- Any Android 8.1+ tablet with a hardware HEVC decoder and USB debugging
+  enabled should work in principle: the host asks the connected tablet for
+  its panel size (`--resolution WIDTHxHEIGHT` overrides it) and the client
+  negotiates frame rate and bitrate from the host. Two tablets have been
+  verified (table above); `./tabs9 setup` reports what yours has.
+- The client APK is debug-signed. `./tabs9 setup` downloads it from the
+  GitHub release and checks the SHA-256 published in the release notes, or
+  build it from source with `scripts/build-android.sh`.
 
 Internal names keep the `tabs9` prefix from the first tested device: the CLI
 is `./tabs9`, the systemd user unit is `tab-s9-usb-display.service`, the app id
 is `local.tabs9.usbdisplay`.
 
-## Quick start
+## Quick start: one command
 
 ```sh
-./tabs9 setup                 # checksum-pinned ADB into .local/, nothing system-wide
-./tabs9 doctor                # checks portals, GStreamer, kscreen-doctor, USB device
-scripts/setup-native.sh       # builds native/tabs9-capture (Debian/Ubuntu)
-scripts/build-android.sh      # builds .local/artifacts/tab-s9-usb-display-debug.apk ...
-gh release download v0.1.0 -p '*.apk' -D .local/artifacts   # ... or download it (check the SHA-256 in the release notes)
-.local/platform-tools/adb -d install -r .local/artifacts/tab-s9-usb-display-debug.apk
-./tabs9 start --profile balanced
+git clone https://github.com/GliAcopo/tablet-usb-monitor.git
+cd tablet-usb-monitor
+./tabs9 setup          # walks through everything below, then prints the start line
+./tabs9 start          # e.g. ./tabs9 start --profile light --pen-button off
 ```
 
-Before the first start: connect the tablet directly with a USB 3 data cable
-(a charging-only cable cannot work), unlock it, enable USB debugging and
-authorize this computer on the tablet. `setup` does not install system
-packages, load kernel modules, change the firewall or enable autostart;
-`doctor` deliberately does not print device serial numbers. The build script
-prints the APK's SHA-256; the toolchain (JDK, SDK, Gradle caches) lives under
+`./tabs9 setup` is a guided installer and a doctor in one. It goes through
+eight steps in order and, at each one, says what it found, what it is about
+to do, and — when only you can do it — exactly what to do on the tablet,
+then waits and checks again:
+
+1. **Desktop session** — KDE Plasma on Wayland (nothing else can work; it
+   tells you to log out and pick "Plasma (Wayland)").
+2. **Host packages** — probes every library and GStreamer element the host
+   needs and offers **one `sudo apt-get install` line** for the missing ones
+   (it asks first; `--no-sudo` prints the line instead; `--yes` accepts).
+   On non-Debian systems it lists what to install by hand.
+3. **GPU access** — the render nodes are readable, VA-API sees an HEVC
+   encoder on the Intel GPU; offers to add you to the `render` group.
+4. **ADB** — a checksum-pinned `platform-tools` under `.local/`, nothing
+   system-wide.
+5. **Native capture helper** — builds `native/tabs9-capture` (headers are
+   unpacked under `.local/sysroot`, no system change).
+6. **Tablet on USB** — see [Preparing the tablet](#preparing-the-tablet):
+   it tells apart *no tablet on the bus* (cable/port), *tablet but no ADB
+   interface* (USB debugging off or "charge only"), *ADB without permission*
+   (offers a udev rule with sudo), *unauthorized* (the prompt on the tablet)
+   and *authorized*; then reports model, Android version, panel size, refresh
+   rate and whether a hardware HEVC decoder exists. Model names yes, serial
+   numbers never.
+7. **Client app** — downloads the release APK (SHA-256 checked against the
+   release notes) or uses your build, installs it when the tablet runs a
+   different build, and answers the tablet's own install prompts for you
+   (Huawei shows two for every ADB install).
+8. **KDE consent** — whether the two portal dialogs are already remembered.
+
+It ends with the exact `./tabs9 start` line for your tablet (30 fps profile
+for panels under 55 Hz such as E-ink, 60 fps otherwise; `--pen-button off`
+off Samsung). `./tabs9 setup --start` runs it. `./tabs9 doctor` runs the
+same checks **read-only** — nothing installed, nothing waited for — and
+prints the fix next to every failure; paste its output in bug reports.
+
+`setup` never loads kernel modules, changes the firewall, enables autostart
+or sends power/lock keys to the tablet. Its only privileged actions are the
+package install and the udev rule, each after a yes. The Android toolchain
+(JDK, SDK, Gradle caches) for `scripts/build-android.sh` lives under
 `.local/android-toolchain`. The motion test additionally needs PyQt6. The
 control protocol between host and client is described in
 [android/README.md](android/README.md).
+
+### Preparing the tablet
+
+Read this once; `./tabs9 setup` repeats the relevant part whenever it is
+stuck on it. Nothing here is specific to this project — it is how any ADB
+tool talks to an Android device — but every one of these steps has cost
+somebody an afternoon.
+
+1. **Enable Developer options.** Settings → *About tablet* (About device /
+   About phone; on Samsung: *Software information*) → tap **Build number**
+   seven times until it says "You are now a developer".
+2. **Turn on USB debugging.** Settings → *System* (or *System & updates*) →
+   *Developer options* → **USB debugging: on**. Leave everything else in
+   Developer options alone.
+3. **Use a data cable, straight into the computer.** A charging-only cable
+   shows *nothing* on the USB bus, not even an error. Skip hubs for the
+   first attempt. USB 2 (480 Mbit/s) is enough for the 30 fps profile; a
+   USB 3 port and cable give 5 Gbit/s for 60/120 Hz.
+4. **Set the USB mode to file transfer.** Pull down the notification shade,
+   tap the *USB* / *Charging this device* notification and choose
+   **File transfer / Transfer files (MTP)**. In *Charge only* mode most
+   tablets hide the ADB interface, so the computer sees a charger.
+5. **Authorize this computer.** With the tablet unlocked, the first ADB
+   contact shows **"Allow USB debugging?"** with the computer's key
+   fingerprint. Tick **Always allow from this computer** and tap Allow/OK.
+   No prompt? Unplug and replug; or in Developer options tap *Revoke USB
+   debugging authorizations* and replug. Some tablets show a second question
+   when the cable goes in — *allow this computer to access the tablet's
+   data* (Samsung) — allow that too, it is the file-transfer mode.
+6. **Let the app install.** `adb install` is confirmed on the tablet by some
+   vendors: Huawei/Honor show a warning about apps from unknown sources
+   (*Continue*) and then their own install screen (*Install*); `./tabs9
+   setup` taps both for you (only the package installer's own button, found
+   through the accessibility tree — nothing else on the screen). Xiaomi
+   requires *Install via USB* in Developer options (needs a Mi account) and
+   the install is refused otherwise; the doctor prints the message.
+7. **Keep the tablet awake and unlocked** while it connects. The host opens
+   the app itself and the app keeps the screen on while streaming.
+
+Touch works out of the box: the app reads touches on its own surface and
+sends them to the host; no accessibility service, no *USB debugging (Security
+settings)* and no root are needed. Remote control of the tablet from the PC's
+mouse and keyboard (a separate, optional feature, Samsung-tested only) is the
+one thing that needs the extra `scripts/tabs9-remote/build-and-push.sh`.
+
+### First start
 
 The first start shows two KDE dialogs — "Share virtual screen" and the
 RemoteDesktop/ScreenCast approval. Leave "Allow restoring on future sessions"
@@ -86,7 +166,10 @@ ticked in both: the host stores the restore tokens under `.local/state/` and
 every later start is silent. The host launches the app on the tablet itself
 over ADB; `./tabs9 status`, `./tabs9 logs` and `./tabs9 stop` do what they
 say. `--profile balanced` (native resolution, 60 Hz, HEVC 30 Mbit/s) is the
-measured usable mode; `--fps 120` is available and reaches 110–113 fps.
+measured usable mode on the Tab S9 Ultra; `--fps 120` is available and
+reaches 110–113 fps; `--profile light` (30 fps, 15 Mbit/s) is right for
+E-ink and other slow panels. Without `--resolution` the host uses the panel
+size the connected tablet reports.
 
 ## Measured results (2026-09-12, commit 3243ed3, one machine)
 
@@ -159,8 +242,18 @@ reproduction command are in [docs/performance.md](docs/performance.md).
 
 ## Limitations
 
-- **One tested device pair.** Tab S9 Ultra + the laptop above. Other tablets
-  and other Intel machines are expected to work but nobody has tried.
+- **Two tested tablets, one laptop.** Tab S9 Ultra and MatePad Paper (E-ink)
+  with the laptop above. Other tablets and other Intel machines are expected
+  to work but nobody has tried; `./tabs9 doctor` output is welcome.
+- **Some tablet decoders hold a frame** until the next one is queued (the
+  MatePad Paper's `OMX.hisi.video.decoder.hevc` does). KWin sends nothing
+  while the desktop is static, so the last picture would stay inside the
+  decoder. The host re-feeds the last frame (identical, a few KB) when the
+  capture goes idle until the tablet reports it rendered — at most four
+  times, and zero times on a decoder that outputs at once, such as the Tab
+  S9's. `keyframe_replays` in `./tabs9 logs` counts them.
+- **E-ink**: the panel presents a frame in 1–3 s and reports 40 Hz; use
+  `--profile light`. The frame-rate figures in this file do not apply.
 - **KDE Plasma Wayland only**, Intel GPU only for the usable path (see
   Requirements).
 - **120 Hz mode delivers 110–113 fps**, not 120: KWin records that many frames
@@ -203,9 +296,10 @@ for the reasoning.
 
 ## Reporting problems
 
-Open an issue with the output of `./tabs9 doctor` and `./tabs9 logs`, your
-Plasma and GPU model, and the tablet model. Both commands avoid device
-serials, tokens and screen content by design; check anyway before pasting.
+Run `./tabs9 doctor` first: it names the failing step and the fix. If that
+is not enough, open an issue with its output, `./tabs9 logs`, your Plasma
+and GPU model, and the tablet model. Both commands avoid device serials,
+tokens and screen content by design; check anyway before pasting.
 
 ## Start and stop
 
@@ -648,9 +742,11 @@ captured frames, encoded frames and tablet-rendered frames.
 
 ## Attribution
 
-The Android client is adapted from [UScreen](https://github.com/majmichu1/UScreen),
-commit `402c94ecd04ebbe33cf7c50d16a9f22c0d73164e`. Its license and attribution are
-preserved with the client source. The host in this repository replaces UScreen's
+The Android client started as a fork of [UScreen](https://github.com/majmichu1/UScreen)
+by majmichu1, commit `402c94ecd04ebbe33cf7c50d16a9f22c0d73164e`, MIT. Its license
+and attribution are preserved with the client source (`android/LICENSE-USCREEN`),
+and the one-time note the app shows after its first picture links both this
+project and UScreen. The host in this repository replaces UScreen's
 EVDI/kernel-module pipeline with KDE/PipeWire and portal input.
 
 Protocol references: [XDG ScreenCast](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.ScreenCast.html)

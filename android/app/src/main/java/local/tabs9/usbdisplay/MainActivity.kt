@@ -435,6 +435,10 @@ private val AccentSoft = Color(0xFF8B85FF)
 private val Ok = Color(0xFF4CAF50)
 private val Warn = Color(0xFFFF9800)
 
+/** This project, and the app it was forked from (credited in the one-time note). */
+const val PROJECT_URL = "https://github.com/GliAcopo/tablet-usb-monitor"
+const val UPSTREAM_URL = "https://github.com/majmichu1/UScreen"
+
 @Composable
 fun UScreenTheme(content: @Composable () -> Unit) {
     MaterialTheme(
@@ -638,18 +642,27 @@ fun UScreenMain(
                     .padding(16.dp)
             ) {
                 Column {
-                    Text("UScreen is working.", fontSize = 15.sp, color = Color.White, fontWeight = FontWeight.Bold)
+                    Text("Tablet USB monitor is working.", fontSize = 15.sp, color = Color.White, fontWeight = FontWeight.Bold)
                     Text(
-                        "If it replaced a second monitor for you, a star on GitHub or a compatibility " +
-                            "report helps other Linux users find it. This note appears only once.",
+                        "If it replaced a second monitor for you, a star on GitHub or a report of " +
+                            "your tablet model helps other Linux users find it. This note appears only once.",
                         fontSize = 12.sp, color = Color(0xFFB0B0C0)
+                    )
+                    Text(
+                        "This client started as a fork of UScreen by majmichu1 (MIT).",
+                        fontSize = 11.sp, color = Color(0xFF8A8AA0), modifier = Modifier.padding(top = 4.dp)
                     )
                     Row(modifier = Modifier.padding(top = 10.dp)) {
                         Text("Open GitHub", fontSize = 13.sp, color = Accent,
                             modifier = Modifier.clickable {
                                 context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW,
-                                    android.net.Uri.parse("https://github.com/majmichu1/UScreen")))
+                                    android.net.Uri.parse(PROJECT_URL)))
                                 onDismissThanks()
+                            }.padding(end = 20.dp))
+                        Text("UScreen", fontSize = 13.sp, color = Color(0xFF9A9AB0),
+                            modifier = Modifier.clickable {
+                                context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW,
+                                    android.net.Uri.parse(UPSTREAM_URL)))
                             }.padding(end = 20.dp))
                         Text("Dismiss", fontSize = 13.sp, color = Color(0xFF9A9AB0),
                             modifier = Modifier.clickable { onDismissThanks() })

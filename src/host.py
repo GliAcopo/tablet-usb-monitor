@@ -15,6 +15,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import re
 import sys
 import secrets
 import shlex
@@ -195,6 +196,26 @@ def adb(*args):
 
 def outputs():
     return json.loads(subprocess.check_output(['kscreen-doctor', '-j']))['outputs']
+
+def tablet_panel_size():
+    """'WIDTHxHEIGHT' of the connected tablet's panel in landscape, or None.
+
+    The app announces the same size once connected, but by then the virtual
+    output exists and KWin has bound it to a stream, so it is asked here
+    first. `wm size` answers in the panel's natural orientation; the app
+    always runs in landscape."""
+    try:
+        result = subprocess.run([str(ADB), '-d', 'shell', 'wm', 'size'], capture_output=True,
+                                text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r'Physical size:\s*(\d+)x(\d+)', result.stdout)
+    if not match:
+        return None
+    width, height = sorted((int(match.group(1)), int(match.group(2))), reverse=True)
+    if not (320 <= width <= 4096 and 240 <= height <= 4096):
+        return None
+    return f'{width - width % 2}x{height - height % 2}'
 
 # libkscreen's Output::Rotation bitmask (as reported by `kscreen-doctor -j`):
 # None=1, Left=2, Inverted=4, Right=8. Left/Right are 90-degree turns that
@@ -395,6 +416,9 @@ class Host:
                 tap=self.perform_right_click
                     if getattr(args, 'two_finger_tap', 'right-click') == 'right-click' else None)
         self.resyncs = 0
+        self.replays = 0            # last frame fed again: keyframe or decoder flush on an idle desktop
+        self.last_acked_seq = None  # newest packet seq the tablet reported rendered
+        self.nudge_pending = False  # an idle-nudge timer is armed
         # Video-socket liveness (see video()): features the tablet advertised
         # on the control channel, per-connection generation, and counters.
         self.client_features = set()
@@ -919,6 +943,39 @@ class Host:
         if source.emit('push-buffer', buffer) != Gst.FlowReturn.OK:
             self.native_pushed.remove(frame.slot)
             self.native.release(frame.slot)
+            return
+        if not self.nudge_pending:
+            self.nudge_pending = True
+            GLib.timeout_add(self.IDLE_NUDGE_MS, self.idle_nudge, frame.seq, None, 0)
+
+    # Some tablet decoders (the Huawei MatePad Paper's OMX.hisi HEVC decoder)
+    # only output a frame once the next one is queued. KWin sends nothing
+    # while the desktop is static, so the last real frame would stay inside
+    # the decoder for as long as nothing moves: the tablet showed nothing
+    # for a minute after a fresh start. When the capture goes idle, the last
+    # frame is fed again (an identical P-frame, a few KB) until the tablet
+    # reports the real one rendered. A decoder that outputs at once has
+    # acknowledged it before the first timer fires, so it costs nothing there.
+    IDLE_NUDGE_MS = 150
+    IDLE_NUDGES_MAX = 4
+
+    def idle_nudge(self, seq, target, count):
+        """Main loop: replay the last frame while the tablet has not shown it."""
+        self.nudge_pending = False
+        if self.closing or self.pipeline is None or self.native is None:
+            return False
+        if self.native_last_seq != seq:
+            # A real frame arrived meanwhile; its own timer takes over.
+            return False
+        if target is None:
+            target = self.frames & 0xffffffff       # the packet seq of the last real frame
+        if not self.clients or (self.last_acked_seq is not None and
+                                self.last_acked_seq >= target) or count >= self.IDLE_NUDGES_MAX:
+            return False
+        self.replay_last_frame()
+        self.nudge_pending = True
+        GLib.timeout_add(self.IDLE_NUDGE_MS, self.idle_nudge, seq, target, count + 1)
+        return False
 
     def encoded_probe(self, pad, info):
         """Every encoded frame, before the appsink may drop it (drop=true).
@@ -935,6 +992,8 @@ class Host:
             self.encoded_arrivals.popitem(last=False)
         if self.native is not None and self.native_pushed:
             slot = self.native_pushed.popleft()
+            if slot is None:
+                return Gst.PadProbeReturn.OK       # replay of native_last_encoded
             if self.native_last_encoded is not None:
                 self.native.release(self.native_last_encoded)
             self.native_last_encoded = slot
@@ -1184,7 +1243,42 @@ class Host:
                 f'GstForceKeyUnit, running-time=(guint64){Gst.CLOCK_TIME_NONE}, '
                 'all-headers=(boolean)true, count=(uint)0')[0]
             encoder.send_event(Gst.Event.new_custom(Gst.EventType.CUSTOM_UPSTREAM, structure))
+        # A static desktop gives the encoder nothing to put the IDR in: KWin
+        # sends no frame while nothing changes, so a client that connects
+        # after the first frames would show nothing until something moved
+        # (seen on a fresh tablet: 0 rendered frames for a minute). On the
+        # native path the last encoded slot is still held, so feed it again.
+        if self.native is not None and self.native_last_encoded is not None and \
+                (self.capture_wall is None or time.monotonic() - self.capture_wall > 0.2):
+            self.replay_last_frame()
+            if not self.nudge_pending:
+                # The IDR is a frame the decoder may hold as well.
+                self.nudge_pending = True
+                GLib.timeout_add(self.IDLE_NUDGE_MS, self.idle_nudge, self.native_last_seq, None, 0)
         return False
+
+    def replay_last_frame(self):
+        """Push the last encoded ring slot once more (main thread)."""
+        source = self.pipeline.get_by_name('capture') if self.pipeline else None
+        slot = self.native_last_encoded
+        if source is None or self.closing or slot is None:
+            return
+        ring = self.native.ring
+        buffer = Gst.Buffer.new()
+        buffer.append_memory(self.native_memories[slot])
+        offsets = list(ring.offsets[slot]) + [0, 0]
+        strides = list(ring.pitches[slot]) + [0, 0]
+        GstVideo.buffer_add_video_meta_full(buffer, GstVideo.VideoFrameFlags.NONE,
+                                            GstVideo.VideoFormat.NV12, ring.width, ring.height,
+                                            2, offsets, strides)
+        buffer.offset = self.native_last_seq if self.native_last_seq is not None else 0
+        # encoded_probe sees None and keeps the slot held: it is still the
+        # newest picture until a real frame replaces it.
+        self.native_pushed.append(None)
+        if source.emit('push-buffer', buffer) != Gst.FlowReturn.OK:
+            self.native_pushed.remove(None)
+        else:
+            self.replays += 1
 
     def distribute(self, packet, keyframe, seq, arrival=None):
         self.sent[seq] = (time.monotonic(), arrival)
@@ -1306,6 +1400,7 @@ class Host:
                         self.ack_intervals.append((now - self.ack_wall) * 1000)
                     self.ack_wall = now
                     sent = self.sent.get(int(msg['seq']))
+                    self.last_acked_seq = int(msg['seq'])
                     if sent is not None:
                         self.stats.append((now - sent[0]) * 1000)
                         if sent[1] is not None:
@@ -1863,7 +1958,7 @@ class Host:
             self.panel_mismatch_reported = True
             print(f'Tablet panel is {width}x{height} but the virtual output is '
                   f'{self.args.width}x{self.args.height}; restart with '
-                  f'--width {width} --height {height} for a pixel-exact image.', flush=True)
+                  f'--resolution {width}x{height} for a pixel-exact image.', flush=True)
         return True
 
     def release_touch(self):
@@ -1985,6 +2080,7 @@ class Host:
             'remote_sessions': self.remote_control.sessions if self.remote_control is not None else 0,
             'remote_events': self.remote_control.events if self.remote_control is not None else 0,
             'client_resyncs': self.resyncs,
+            'keyframe_replays': self.replays,
             'video_clients': len(self.clients), 'video_connects': self.video_connects,
             'video_disconnects': self.video_disconnects, 'last_video_disconnect': self.last_video_disconnect,
             'heartbeats_sent': self.heartbeats_sent,
@@ -2114,8 +2210,9 @@ PROFILES = {
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--profile', choices=sorted(PROFILES), default='smooth')
-    parser.add_argument('--resolution', default='2960x1848', metavar='WIDTHxHEIGHT',
-                        help='pixel resolution, independently of --fps (default: 2960x1848)')
+    parser.add_argument('--resolution', default=None, metavar='WIDTHxHEIGHT',
+                        help='pixel resolution, independently of --fps (default: what the '
+                             'connected tablet reports through `wm size`, else 2960x1848)')
     parser.add_argument('--fps', type=int, choices=[30, 60, 90, 120])
     parser.add_argument('--bitrate', type=int)
     parser.add_argument('--scale', type=float, default=1.5)
@@ -2170,6 +2267,9 @@ if __name__ == '__main__':
     # The input-capture and libei modules report through logging; the rest of
     # the host prints. Keep both on stdout, where the journal collects them.
     logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stdout)
+    if args.resolution is None:
+        args.resolution = tablet_panel_size() or '2960x1848'
+        print(f'Resolution: {args.resolution} (from the tablet; --resolution overrides)', flush=True)
     try:
         args.width, args.height = (int(part) for part in args.resolution.lower().split('x', 1))
     except (TypeError, ValueError):
