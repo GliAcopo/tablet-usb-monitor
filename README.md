@@ -197,12 +197,14 @@ size the connected tablet reports.
 
 ### The control panel: `./tabs9 ui`
 
-![tabs9 control panel with two tablets](docs/control-panel.png)
+![tabs9 control panel](docs/control-panel.png)
 
 `./tabs9 ui` starts the panel as a user service (`app-tabs9.ui.service`,
 `./tabs9 ui --stop` ends it), serves it on `http://127.0.0.1:8899` (this
 computer only) and opens it in your browser; run it again and it just
-brings the page up. `./tabs9 launcher` adds **tabs9** to the application
+brings the page up — unless the panel on the port is from before an
+update (the page carries a version of its own code), in which case it is
+replaced, and an open tab reloads itself. `./tabs9 launcher` adds **tabs9** to the application
 launcher with its icon — find it there, right-click → *Pin to Task Manager*
 for a one-click panel. One card per attached tablet: its state
 (stopped / waiting for the KDE dialog / streaming / failed), **Start** and
@@ -210,11 +212,17 @@ for a one-click panel. One card per attached tablet: its state
 it has a hardware HEVC decoder), live figures while it streams (frames per
 second, frames shown on the tablet, latency, received bit rate, touches),
 its **settings** — which side of the laptop screen, profile, text size,
-resolution, and under *Advanced* frame rate, bitrate, gestures, scrolling,
-two-finger tap, S Pen button, remote control, capture path — the host log,
-and a **Run doctor** button that shows the same report as `./tabs9 doctor`.
+resolution, and under *Advanced* every other start option the host takes
+(frame rate, bitrate, gap, gestures, scrolling and its speed, two-finger
+tap, S Pen button, remote control and its hand-over edge, capture path),
+drawn from the same table `./tabs9 start` validates against, with the
+host's default shown selected when nothing is saved — the host log, and a
+**Run doctor** button that shows the same report as `./tabs9 doctor`. The
+page refreshes its figures every two seconds without rebuilding what you
+are looking at: an open *Advanced* section, a value being typed, stay put.
 It is plain HTML and JavaScript served by Python's standard library, so it
-renders in any browser and needs no framework or build step.
+renders in any browser, at phone width too, and needs no framework or
+build step; its colours are the app's.
 
 Settings are **remembered per tablet** in `.local/state/settings.json`
 (model names, never serials) and applied by `./tabs9 start` as well, so the

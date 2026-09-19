@@ -2395,7 +2395,8 @@ PROFILES = {
     'light': {'fps': 30, 'bitrate': 15000},      # static-content use
 }
 
-if __name__ == '__main__':
+def build_parser():
+    """The host's command line (also read by the control panel for its defaults)."""
     parser = argparse.ArgumentParser()
     parser.add_argument('--profile', choices=sorted(PROFILES), default='smooth')
     parser.add_argument('--resolution', default=None, metavar='WIDTHxHEIGHT',
@@ -2461,6 +2462,11 @@ if __name__ == '__main__':
                              "the tablet's model slug, e.g. sm_x910); one instance per tablet")
     parser.add_argument('--rate-control', choices=['cbr', 'vbr', 'cqp'], default='cbr')
     parser.add_argument('--qp', type=int, default=24)
+    return parser
+
+
+if __name__ == '__main__':
+    parser = build_parser()
     args = parser.parse_args()
     # The input-capture and libei modules report through logging; the rest of
     # the host prints. Keep both on stdout, where the journal collects them.

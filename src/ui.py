@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import hashlib
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -32,6 +33,17 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
 sys.path.insert(0, str(ROOT / 'scripts'))
+
+def _compute_version():
+    h = hashlib.sha256()
+    for p in (ROOT / 'src/ui.py', ROOT / 'src/ui.html'):
+        try:
+            h.update(p.read_bytes())
+        except OSError:
+            pass
+    return h.hexdigest()[:12]
+
+SERVER_VERSION = _compute_version()
 
 import settings as settings_store  # noqa: E402
 from status import status_summary  # noqa: E402
@@ -136,20 +148,38 @@ def tablet_entry(tablet):
     }
 
 
+def option_meta(key, spec):
+    rule, label = spec
+    meta = {'label': label}
+    if key in settings_store.DEFAULTS:
+        meta['default'] = settings_store.DEFAULTS[key]
+    if isinstance(rule, list):
+        meta['type'] = 'list'
+        meta['values'] = rule
+    elif isinstance(rule, tuple):
+        meta['type'] = 'range'
+        meta['min'] = rule[0]
+        meta['max'] = rule[1]
+        meta['step'] = 1 if isinstance(rule[0], int) else 0.1
+    elif rule == 'resolution':
+        meta['type'] = 'resolution'
+    return meta
+
+
 def state():
     tablets = [t for t in list_tablets(ADB) if t.usb]
     return {
         'tablets': [tablet_entry(t) for t in tablets],
         'adb': ADB.is_file(),
         'profiles': PROFILES,
-        'options': {k: {'values': v[0] if isinstance(v[0], list) else None, 'label': v[1]}
-                    for k, v in settings_store.OPTIONS.items()},
+        'options': {k: option_meta(k, v) for k, v in settings_store.OPTIONS.items()},
+        'version': SERVER_VERSION,
         'time': time.time(),
     }
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'tabs9/1'
+    server_version = f'tabs9/{SERVER_VERSION}'
 
     def log_message(self, fmt, *args):     # quiet; the terminal shows only the URL
         pass
@@ -253,12 +283,27 @@ class Handler(BaseHTTPRequestHandler):
         return self.send_json({'error': 'not found'}, HTTPStatus.NOT_FOUND)
 
 
+def running_version(url):
+    """The version a tabs9 panel on ``url`` advertises, or None."""
+    try:
+        with urllib.request.urlopen(f'{url}api/state', timeout=3) as response:
+            if not response.headers.get('Server', '').startswith('tabs9/'):
+                return None
+            return json.loads(response.read()).get('version') or 'unknown'
+    except (OSError, ValueError):
+        return None
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--port', type=int, default=8899)
     parser.add_argument('--open', action='store_true', help='open the page in the default browser')
+    parser.add_argument('--running', action='store_true',
+                        help='exit 0 when a panel of this version answers on the port, 1 otherwise')
     args = parser.parse_args(argv)
     url = f'http://127.0.0.1:{args.port}/'
+    if args.running:
+        return 0 if running_version(url) == SERVER_VERSION else 1
     def open_browser():
         if args.open and (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')) and shutil.which('xdg-open'):
             subprocess.Popen(['xdg-open', url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -269,17 +314,46 @@ def main(argv=None):
         # bring the page up. Anything else on the port is reported as such.
         if error.errno != errno.EADDRINUSE:
             raise
+        # Check if it's our server and what version it advertises.
+        remote_version = None
         try:
             with urllib.request.urlopen(f'{url}api/state', timeout=3) as response:
                 ours = response.headers.get('Server', '').startswith('tabs9/')
+                if ours:
+                    try:
+                        data = json.loads(response.read())
+                        remote_version = data.get('version')
+                    except (ValueError, KeyError):
+                        pass
         except (OSError, ValueError):
             ours = False
-        if ours:
+        if not ours:
+            print(f'Port {args.port} is taken by something else; try ./tabs9 ui --port 8900', file=sys.stderr)
+            return 1
+        if remote_version == SERVER_VERSION:
             print(f'tabs9 control panel is already running: {url}', flush=True)
             open_browser()
             return 0
-        print(f'Port {args.port} is taken by something else; try ./tabs9 ui --port 8900', file=sys.stderr)
-        return 1
+        # Different version: ask the old server to quit and take over.
+        print('Replacing tabs9 panel (version changed)…', flush=True)
+        try:
+            req = urllib.request.Request(f'{url}api/quit', data=b'{}',
+                                        headers={'Content-Type': 'application/json',
+                                                 'X-Requested-With': 'tabs9'})
+            urllib.request.urlopen(req, timeout=5)
+        except (OSError, ValueError):
+            pass
+        # Wait for the port to free
+        for _ in range(20):
+            time.sleep(0.25)
+            try:
+                server = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
+                break
+            except OSError:
+                continue
+        else:
+            print(f'Could not take over port {args.port} after asking the old server to quit.', file=sys.stderr)
+            return 1
     server.daemon_threads = True
     print(f'tabs9 control panel: {url}  (Ctrl-C stops it)', flush=True)
     open_browser()

@@ -37,6 +37,15 @@ OPTIONS = {
     'capture_memory': (['native', 'va', 'system', 'gl'], 'Capture path'),
 }
 
+# What the host does when an option is not set (src/host.py's argparse
+# defaults; tests/test_ui.py checks they match). The panel shows these as
+# the selected value so an untouched form reads the way the host will run.
+DEFAULTS = {
+    'side': 'right', 'profile': 'smooth', 'scale': 1.5, 'gap': 1, 'gestures': 'on',
+    'scroll': 'natural', 'scroll_gain': 0.2, 'two_finger_tap': 'right-click',
+    'pen_button': 'actions', 'remote': 'on', 'remote_edge': 'none', 'capture_memory': 'native',
+}
+
 
 def load() -> dict:
     try:

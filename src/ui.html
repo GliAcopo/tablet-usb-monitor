@@ -6,13 +6,15 @@
 <title>tabs9</title>
 <style>
   :root {
-    --bg: #f4f5f7; --card: #ffffff; --text: #1c1f26; --muted: #6b7280; --line: #e3e6eb;
-    --accent: #2f6fed; --accent-text: #ffffff; --ok: #1f9d55; --warn: #d97706; --bad: #dc2626;
-    --pill: #eef1f6; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --bg: #ffffff; --surface: #F4F7F5; --card: #ffffff; --text: #101512; --muted: #4A5A50; --line: #e3e8e5;
+    --accent: #1E7A4F; --accent-text: #ffffff; --ok: #1E7A4F; --warn: #B35C00; --bad: #B00020;
+    --pill: #EFF5F1; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
   @media (prefers-color-scheme: dark) {
-    :root { --bg: #14161b; --card: #1d2027; --text: #e8eaf0; --muted: #9aa3b2; --line: #2b3040;
-            --accent: #5b8cff; --pill: #262a35; }
+    :root { 
+      --bg: #0A0F0C; --surface: #13201A; --card: #1A2A22; --text: #e8eaf0; --muted: #6F8378; --line: #243D31;
+      --accent: #34C38F; --pill: #13201A; 
+    }
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text);
@@ -23,8 +25,11 @@
   header .sub { color: var(--muted); font-size: 13px; }
   header .spacer { flex: 1; }
   main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 60px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 18px; }
-  @media (max-width: 480px) { .grid { grid-template-columns: 1fr; } }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 18px; }
+  @media (max-width: 480px) { 
+    .grid { grid-template-columns: 1fr; } 
+    .field { grid-template-columns: 1fr; }
+  }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px; }
   .card h2 { margin: 0; font-size: 17px; font-weight: 650; }
   .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
@@ -50,8 +55,8 @@
   legend { font-weight: 650; font-size: 14px; margin-bottom: 8px; padding: 0; }
   .field { display: grid; grid-template-columns: 170px 1fr; align-items: center; gap: 8px; margin: 6px 0; }
   .field label { color: var(--muted); font-size: 13px; }
-  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
-  .seg button { border: 0; border-radius: 0; padding: 6px 12px; background: transparent; white-space: nowrap; }
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .seg button { border: 0; border-radius: 0; padding: 6px 10px; background: transparent; white-space: nowrap; font-size: 13px; min-width: 0; flex: 1 1 auto; }
   .seg button.on { background: var(--accent); color: var(--accent-text); }
   select, input[type=text], input[type=number] { font: inherit; padding: 6px 8px; border-radius: 8px;
       border: 1px solid var(--line); background: var(--bg); color: var(--text); max-width: 220px; }
@@ -93,7 +98,7 @@
 
 <script>
 const $ = (sel, el = document) => el.querySelector(sel);
-const state = { data: null, editing: {}, logsOpen: {}, busy: {} };
+const state = { data: null, editing: {}, logsOpen: {}, advancedOpen: {}, busy: {}, serverVersion: null, renderedSlugs: [] };
 
 const PHASE = {
   stopped:  ['Stopped', ''],
@@ -137,76 +142,97 @@ function pill(phase, tabletState) {
 }
 
 function seg(slug, key, values, current, labels) {
-  return `<span class="seg">${values.map(v =>
-    `<button class="${String(current) === String(v) ? 'on' : ''}" onclick="setField('${slug}','${key}','${v}')">${labels ? labels[v] : v}</button>`).join('')}</span>`;
+  return `<span class="seg" data-key="${key}">${values.map(v =>
+    `<button data-val="${v}" class="${String(current) === String(v) ? 'on' : ''}" onclick="setField('${slug}','${key}','${v}')">${labels && labels[v] ? labels[v] : v}</button>`).join('')}</span>`;
 }
 
-function settingsForm(t) {
+const BASIC_OPTIONS = ['side', 'profile', 'scale', 'resolution'];
+
+function optionControl(slug, key, meta, settings, labelMap) {
+  if (!meta) return '';
+  // Unset means the host's default: show that, so the form reads as the host runs.
+  const val = settings[key] ?? meta.default ?? '';
+  if (meta.type === 'list') {
+    const values = meta.values || [];
+    if (values.length <= 6) {
+      return seg(slug, key, values.map(String), val ?? '', labelMap);
+    }
+    return `<select data-field="${key}" onchange="setField('${slug}','${key}',this.value)">
+      <option value="">(default)</option>
+      ${values.map(v => `<option value="${v}"${String(val) === String(v) ? ' selected' : ''}>${labelMap?.[v] || v}</option>`).join('')}
+    </select>`;
+  }
+  if (meta.type === 'range') {
+    return `<input type="number" min="${meta.min}" max="${meta.max}" step="${meta.step}" value="${settings[key] ?? ''}" placeholder="${meta.default ?? 'profile'}" data-field="${key}" onchange="setField('${slug}','${key}',this.value)">`;
+  }
+  if (meta.type === 'resolution') {
+    return `<input type="text" placeholder="WIDTHxHEIGHT" value="${val || ''}" data-field="${key}" onchange="setField('${slug}','${key}',this.value)" style="width:150px">`;
+  }
+  return '';
+}
+
+function settingsForm(t, data) {
   const s = Object.assign({}, t.settings, state.editing[t.slug] || {});
+  const opts = data.options || {};
   const facts = t.facts || {};
   const panel = facts.panel ? `${facts.panel[0]}x${facts.panel[1]}` : '';
+  
+  let basic = '';
+  basic += `<div class="field"><label>${opts.side?.label || 'Side'}</label>${optionControl(t.slug, 'side', opts.side, s, {left:'Left',right:'Right',top:'Above',bottom:'Below'})}</div>`;
+  basic += `<div class="field"><label>${opts.profile?.label || 'Profile'}</label>${optionControl(t.slug, 'profile', opts.profile, s, {light:'Light',balanced:'Balanced',smooth:'Smooth'})}
+    <div></div><div class="hint">${facts.refresh && facts.refresh < 55 ? 'This panel reports ' + fmt(facts.refresh) + ' Hz (E-ink or similar): Light is right.' : 'Balanced is the measured usable mode; Smooth needs a 120 Hz panel.'}</div></div>`;
+  basic += `<div class="field"><label>${opts.scale?.label || 'Scale'}</label>${seg(t.slug, 'scale', ['1','1.25','1.5','2'], s.scale || 1.5)}</div>`;
+  basic += `<div class="field"><label>Resolution</label><div class="row">
+    <input type="text" placeholder="${panel || 'WIDTHxHEIGHT'}" value="${s.resolution || ''}" data-field="resolution" onchange="setField('${t.slug}','resolution',this.value)" style="width:150px">
+    <span class="hint">empty = tablet's panel${panel ? ' (' + panel + ')' : ''}</span></div></div>`;
+  
+  let advanced = '';
+  for (const [key, meta] of Object.entries(opts)) {
+    if (BASIC_OPTIONS.includes(key)) continue;
+    // For list options like fps, allow an empty value to clear the setting (use profile default).
+    let labelMap = undefined;
+    let adjustedMeta = meta;
+    if (key === 'fps' && meta.type === 'list') {
+      adjustedMeta = Object.assign({}, meta, { values: ['', ...meta.values] });
+      labelMap = {'': 'profile'};
+    }
+    advanced += `<div class="field"><label>${meta.label}</label>${optionControl(t.slug, key, adjustedMeta, s, labelMap)}</div>`;
+  }
+  
   return `
   <fieldset>
     <legend>Settings for this tablet</legend>
-    <div class="field"><label>Side of the laptop screen</label>${seg(t.slug, 'side', ['left','right','top','bottom'], s.side || 'right', {left:'Left',right:'Right',top:'Above',bottom:'Below'})}</div>
-    <div class="field"><label>Profile</label>${seg(t.slug, 'profile', ['light','balanced','smooth'], s.profile || (facts.refresh && facts.refresh < 55 ? 'light' : 'balanced'), {light:'Light · 30 fps',balanced:'Balanced · 60 fps',smooth:'Smooth · 120 fps'})}
-      <div></div><div class="hint">${facts.refresh && facts.refresh < 55 ? 'This panel reports ' + fmt(facts.refresh) + ' Hz (E-ink or similar): Light is right.' : 'Balanced is the measured usable mode; Smooth needs a 120 Hz panel.'}</div></div>
-    <div class="field"><label>Text size (scale)</label>${seg(t.slug, 'scale', ['1','1.25','1.5','2'], s.scale || 1.5)}</div>
-    <div class="field"><label>Resolution</label><div class="row">
-      <input type="text" placeholder="${panel || 'WIDTHxHEIGHT'}" value="${s.resolution || ''}" onchange="setField('${t.slug}','resolution',this.value)" style="width:150px">
-      <span class="hint">empty = the tablet's own panel${panel ? ' (' + panel + ')' : ''}</span></div></div>
-    <details><summary>Advanced</summary>
-      <div class="field"><label>Frame rate</label>${seg(t.slug, 'fps', ['', '30','60','90','120'], s.fps || '', {'':'profile',30:'30',60:'60',90:'90',120:'120'})}</div>
-      <div class="field"><label>Bitrate (kbit/s)</label><input type="number" min="1000" max="150000" step="1000" value="${s.bitrate || ''}" placeholder="profile" onchange="setField('${t.slug}','bitrate',this.value)"></div>
-      <div class="field"><label>Gap next to the laptop (px)</label><input type="number" min="0" max="64" value="${s.gap ?? ''}" placeholder="1" onchange="setField('${t.slug}','gap',this.value)"></div>
-      <div class="field"><label>Three/four-finger swipes</label>${seg(t.slug, 'gestures', ['on','off'], s.gestures || 'on')}</div>
-      <div class="field"><label>Two-finger scrolling</label>${seg(t.slug, 'scroll', ['natural','standard','off'], s.scroll || 'natural')}</div>
-      <div class="field"><label>Two-finger tap</label>${seg(t.slug, 'two_finger_tap', ['right-click','off'], s.two_finger_tap || 'right-click', {'right-click':'right click', off:'off'})}</div>
-      <div class="field"><label>S Pen button (Samsung)</label>${seg(t.slug, 'pen_button', ['actions','launcher','off'], s.pen_button || (facts.manufacturer && facts.manufacturer.toLowerCase() === 'samsung' ? 'actions' : 'off'))}</div>
-      <div class="field"><label>Remote-control shortcuts</label>${seg(t.slug, 'remote', ['on','off'], s.remote || 'on')}</div>
-      <div class="field"><label>Capture path</label>${seg(t.slug, 'capture_memory', ['native','va','system'], s.capture_memory || 'native')}</div>
+    ${basic}
+    <details${state.advancedOpen[t.slug] ? ' open' : ''} ontoggle="state.advancedOpen['${t.slug}']=this.open">
+      <summary>Advanced</summary>
+      ${advanced}
     </details>
     <div class="row" style="margin-top:12px">
       <button class="primary" onclick="saveSettings('${t.slug}')">Save</button>
       ${t.running ? `<button onclick="saveSettings('${t.slug}', true)">Save and restart</button>` : ''}
-      <span class="hint">${state.editing[t.slug] ? 'unsaved changes' : 'saved'}</span>
+      <span class="hint" data-bind="save-hint-${t.slug}">${state.editing[t.slug] ? 'unsaved changes' : 'saved'}</span>
     </div>
   </fieldset>`;
 }
 
-function card(t) {
+function card(t, d) {
   const f = t.facts || {};
-  const st = t.stats || {};
-  const tab = st.tablet || {};
-  const streaming = t.phase === 'streaming';
-  const canStart = t.state === 'device' && !t.running && !state.busy[t.slug];
   return `<article class="card" id="card-${t.slug}">
     <div class="row">
       <h2>${title(t)}</h2>
-      ${pill(t.phase, t.state)}
+      <span data-bind="phase-pill-${t.slug}"></span>
       <div style="flex:1"></div>
-      ${t.running
-        ? `<button class="danger" onclick="stopTablet('${t.slug}')">Stop</button>`
-        : `<button class="primary" ${canStart ? '' : 'disabled'} onclick="startTablet('${t.slug}')">Start</button>`}
+      <div data-bind="buttons-${t.slug}"></div>
     </div>
-    ${t.message && t.phase !== 'streaming' ? `<div class="hint" style="margin-top:8px">${t.message}</div>` : ''}
-    ${t.phase && t.phase.startsWith('waiting') ? `<div class="hint" style="margin-top:8px">Two KDE dialogs appear the first time: "Share virtual screen" → Share, then the remote-control approval → Allow. Keep "Allow restoring on future sessions" ticked and they never come back.</div>` : ''}
+    <div data-bind="message-${t.slug}"></div>
     <div class="facts">
       <div class="fact"><div class="k">Panel</div><div class="v">${f.panel ? f.panel[0] + ' × ' + f.panel[1] : '—'}${f.refresh ? ' · ' + fmt(f.refresh) + ' Hz' : ''}</div></div>
       <div class="fact"><div class="k">Android</div><div class="v">${f.android ? f.android + ' (API ' + f.sdk + ')' : '—'}</div></div>
       <div class="fact"><div class="k">Video decoder</div><div class="v">${f.hevc_hw && f.hevc_hw.length ? 'HEVC, hardware' : (f.hevc_hw ? 'software only' : '—')}</div></div>
       <div class="fact"><div class="k">Density</div><div class="v">${f.density ? f.density + ' dpi' : '—'}</div></div>
     </div>
-    ${streaming ? `<div class="stats">
-      <div class="stat"><div class="k">Frames / s</div><div class="v">${fmt(st.encoded_fps, 1)}</div></div>
-      <div class="stat"><div class="k">Shown on tablet / s</div><div class="v">${fmt(st.tablet_ack_fps, 1)}</div></div>
-      <div class="stat"><div class="k">Latency p50</div><div class="v">${fmt(st.capture_to_ack_ms_p50, 0, ' ms')}</div></div>
-      <div class="stat"><div class="k">Received</div><div class="v">${fmt(tab.received_mbps, 1, ' Mb/s')}</div></div>
-      <div class="stat"><div class="k">Touches</div><div class="v">${fmt(st.tablet_input_messages)}</div></div>
-      <div class="stat"><div class="k">Capture</div><div class="v">${st.capture_memory || '—'}</div></div>
-    </div>
-    <div class="hint" style="margin-top:6px">Frames only flow while something changes on that screen; ${fmt(st.heartbeats_sent)} idle heartbeats sent, ${fmt(st.video_disconnects)} reconnects.</div>` : ''}
-    ${settingsForm(t)}
+    <div data-bind="stats-${t.slug}"></div>
+    ${settingsForm(t, d)}
     <details ${state.logsOpen[t.slug] ? 'open' : ''} ontoggle="state.logsOpen['${t.slug}']=this.open; if(this.open) loadLogs('${t.slug}')">
       <summary>Host log</summary><pre id="log-${t.slug}">…</pre></details>
   </article>`;
@@ -227,13 +253,69 @@ function emptyCard(data) {
   </article>`;
 }
 
-function render() {
-  const d = state.data;
-  if (!d) return;
-  const box = $('#tablets');
-  const focused = document.activeElement && document.activeElement.tagName === 'INPUT';
-  if (focused) return;               // do not wipe a value being typed
-  box.innerHTML = d.tablets.length ? d.tablets.map(card).join('') : emptyCard(d);
+function updateCard(el, t, d) {
+  const canStart = t.state === 'device' && !t.running && !state.busy[t.slug];
+  const streaming = t.phase === 'streaming';
+  const st = t.stats || {};
+  const tab = st.tablet || {};
+
+  const pillEl = el.querySelector(`[data-bind="phase-pill-${t.slug}"]`);
+  if (pillEl) {
+    pillEl.innerHTML = pill(t.phase, t.state);
+  }
+
+  const btnsContainer = el.querySelector(`[data-bind="buttons-${t.slug}"]`);
+  if (btnsContainer) {
+    const btnHtml = t.running
+      ? `<button class="danger" onclick="stopTablet('${t.slug}')">Stop</button>`
+      : `<button class="primary" ${canStart ? '' : 'disabled'} onclick="startTablet('${t.slug}')">Start</button>`;
+    if (btnsContainer.innerHTML !== btnHtml) btnsContainer.innerHTML = btnHtml;
+  }
+
+  const msgContainer = el.querySelector(`[data-bind="message-${t.slug}"]`);
+  if (msgContainer) {
+    let msgHtml = '';
+    if (t.message && t.phase !== 'streaming') msgHtml += `<div class="hint" style="margin-top:8px">${t.message}</div>`;
+    if (t.phase && t.phase.startsWith('waiting')) msgHtml += `<div class="hint" style="margin-top:8px">Two KDE dialogs appear the first time: "Share virtual screen" → Share, then the remote-control approval → Allow. Keep "Allow restoring on future sessions" ticked and they never come back.</div>`;
+    if (msgContainer.innerHTML !== msgHtml) msgContainer.innerHTML = msgHtml;
+  }
+
+  const statsContainer = el.querySelector(`[data-bind="stats-${t.slug}"]`);
+  if (statsContainer) {
+    const wasStreaming = statsContainer.children.length > 0;
+    if (streaming && !wasStreaming) {
+      statsContainer.innerHTML = `<div class="stats">
+        <div class="stat"><div class="k">Frames / s</div><div class="v" data-stat="encoded_fps"></div></div>
+        <div class="stat"><div class="k">Shown / s</div><div class="v" data-stat="tablet_ack_fps"></div></div>
+        <div class="stat"><div class="k">Latency p50</div><div class="v" data-stat="capture_to_ack_ms_p50"></div></div>
+        <div class="stat"><div class="k">Received</div><div class="v" data-stat="received_mbps"></div></div>
+        <div class="stat"><div class="k">Touches</div><div class="v" data-stat="tablet_input_messages"></div></div>
+        <div class="stat"><div class="k">Capture</div><div class="v" data-stat="capture_memory"></div></div>
+      </div>
+      <div class="hint" style="margin-top:6px" data-stat="hint"></div>`;
+    } else if (!streaming && wasStreaming) {
+      statsContainer.innerHTML = '';
+    }
+    
+    if (streaming) {
+      el.querySelector('[data-stat="encoded_fps"]').textContent = fmt(st.encoded_fps, 1);
+      el.querySelector('[data-stat="tablet_ack_fps"]').textContent = fmt(st.tablet_ack_fps, 1);
+      el.querySelector('[data-stat="capture_to_ack_ms_p50"]').textContent = fmt(st.capture_to_ack_ms_p50, 0, ' ms');
+      el.querySelector('[data-stat="received_mbps"]').textContent = fmt(tab.received_mbps, 1, ' Mb/s');
+      el.querySelector('[data-stat="tablet_input_messages"]').textContent = fmt(st.tablet_input_messages);
+      el.querySelector('[data-stat="capture_memory"]').textContent = st.capture_memory || '—';
+      el.querySelector('[data-stat="hint"]').textContent = `Frames only flow while something changes on that screen; ${fmt(st.heartbeats_sent)} idle heartbeats sent, ${fmt(st.video_disconnects)} reconnects.`;
+    }
+  }
+
+  const saveHint = el.querySelector(`[data-bind="save-hint-${t.slug}"]`);
+  if (saveHint) {
+    const isEditing = !!state.editing[t.slug];
+    saveHint.textContent = isEditing ? 'unsaved changes' : 'saved';
+  }
+}
+
+function updateHeaderPill(d) {
   const streaming = d.tablets.filter(t => t.phase === 'streaming').length;
   const starting = d.tablets.filter(t => t.running && t.phase !== 'streaming').length;
   const p = $('#panel-state');
@@ -241,16 +323,80 @@ function render() {
   p.textContent = d.tablets.length
     ? `${d.tablets.length} tablet${d.tablets.length > 1 ? 's' : ''} · ${streaming} streaming${starting ? ' · ' + starting + ' starting' : ''}`
     : 'no tablet';
+}
+
+function render() {
+  const d = state.data;
+  if (!d) return;
+  const box = $('#tablets');
+  const currentSlugs = d.tablets.map(t => t.slug);
+  
+  if (!d.tablets.length) {
+    box.innerHTML = emptyCard(d);
+    state.renderedSlugs = [];
+    updateHeaderPill(d);
+    return;
+  }
+  
+  for (const slug of state.renderedSlugs) {
+    if (!currentSlugs.includes(slug)) {
+      const el = $(`#card-${slug}`, box);
+      if (el) el.remove();
+    }
+  }
+  
+  const emptyEl = box.querySelector('.empty');
+  if (emptyEl) emptyEl.remove();
+  
+  for (const t of d.tablets) {
+    let cardEl = $(`#card-${t.slug}`, box);
+    if (!cardEl) {
+      const wrapper = document.createElement('div');
+      wrapper.innerHTML = card(t, d);
+      cardEl = wrapper.firstElementChild;
+      box.appendChild(cardEl);
+    }
+    updateCard(cardEl, t, d);
+  }
+  state.renderedSlugs = [...currentSlugs];
+  
+  updateHeaderPill(d);
+  
   for (const t of d.tablets) if (state.logsOpen[t.slug]) loadLogs(t.slug);
 }
 
 async function refresh() {
-  try { state.data = await api('/api/state'); render(); }
-  catch (e) { $('#panel-state').className = 'pill bad'; $('#panel-state').textContent = 'panel not running (./tabs9 ui)'; }
+  try {
+    state.data = await api('/api/state');
+    if (state.serverVersion && state.data.version && state.data.version !== state.serverVersion) {
+      location.reload();
+      return;
+    }
+    state.serverVersion = state.data.version;
+    render();
+  } catch (e) {
+    $('#panel-state').className = 'pill bad';
+    $('#panel-state').textContent = 'panel not running (./tabs9 ui)';
+  }
 }
 
 function setField(slug, key, value) {
   state.editing[slug] = Object.assign({}, state.editing[slug] || {}, { [key]: value });
+  
+  const cardEl = $(`#card-${slug}`);
+  if (cardEl) {
+    const segContainer = cardEl.querySelector(`.seg[data-key="${key}"]`);
+    if (segContainer) {
+      segContainer.querySelectorAll('button').forEach(b => {
+        b.className = (String(b.dataset.val) === String(value)) ? 'on' : '';
+      });
+    }
+    const input = cardEl.querySelector(`[data-field="${key}"]`);
+    if (input && input.value !== value) {
+      input.value = value;
+    }
+  }
+  
   render();
 }
 

@@ -320,14 +320,18 @@ case "${1:-help}" in
     shift
     port=${TABS9_UI_PORT:-8899}
     url="http://127.0.0.1:$port/"
-    ui_up() { python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('${url}api/state', timeout=2).status == 200 else 1)" 2>/dev/null; }
+    # "Up" means a panel of *this* version answers: an older one (left from
+    # before an update) is replaced -- ui.py asks it to quit and takes over.
+    ui_up() { python3 src/ui.py --port "$port" --running; }
     case "${1:-}" in
       --stop) systemctl --user stop app-tabs9.ui.service 2>/dev/null || true; echo 'Control panel stopped.'; exit 0 ;;
     esac
     if ! ui_up; then
+      systemctl --user stop app-tabs9.ui.service 2>/dev/null || true
       systemd-run --user --quiet --collect --unit=app-tabs9.ui.service --working-directory="$PWD" \
         /usr/bin/python3 "$PWD/src/ui.py" --port "$port"
-      for _ in $(seq 1 20); do ui_up && break; sleep 0.25; done
+      for _ in $(seq 1 40); do ui_up && break; sleep 0.25; done
+      ui_up || { echo "The control panel did not come up; see: journalctl --user -u app-tabs9.ui.service" >&2; exit 1; }
     fi
     echo "tabs9 control panel: $url  (./tabs9 ui --stop ends it)"
     if [[ "${1:-}" != '--no-open' ]] && command -v xdg-open >/dev/null; then
