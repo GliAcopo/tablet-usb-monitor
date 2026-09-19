@@ -314,10 +314,51 @@ case "${1:-help}" in
       *) echo 'Usage: ./tabs9 pin-desktop on|off|status'; exit 1 ;;
     esac
     ;;
-  ui) shift; exec python3 src/ui.py --open "$@" ;;
+  ui)
+    # The control panel runs as a user service so the terminal (or the
+    # launcher icon) returns at once; the page is opened in the browser.
+    shift
+    port=${TABS9_UI_PORT:-8899}
+    url="http://127.0.0.1:$port/"
+    ui_up() { python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('${url}api/state', timeout=2).status == 200 else 1)" 2>/dev/null; }
+    case "${1:-}" in
+      --stop) systemctl --user stop app-tabs9.ui.service 2>/dev/null || true; echo 'Control panel stopped.'; exit 0 ;;
+    esac
+    if ! ui_up; then
+      systemd-run --user --quiet --collect --unit=app-tabs9.ui.service --working-directory="$PWD" \
+        /usr/bin/python3 "$PWD/src/ui.py" --port "$port"
+      for _ in $(seq 1 20); do ui_up && break; sleep 0.25; done
+    fi
+    echo "tabs9 control panel: $url  (./tabs9 ui --stop ends it)"
+    if [[ "${1:-}" != '--no-open' ]] && command -v xdg-open >/dev/null; then
+      xdg-open "$url" >/dev/null 2>&1 &
+    fi
+    ;;
+  launcher)
+    # A visible desktop entry: tabs9 in the application launcher, ready to be
+    # pinned to the panel (right-click it there -> "Pin to Task Manager").
+    dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+    mkdir -p "$dir"
+    cat > "$dir/tabs9.desktop" <<EOF_DESKTOP
+[Desktop Entry]
+Type=Application
+Name=tabs9
+GenericName=Tablet as a second screen
+Comment=Open the tabs9 control panel
+Exec=$PWD/tabs9 ui
+Icon=$PWD/docs/tabs9.svg
+Terminal=false
+Categories=Utility;System;
+Keywords=tablet;monitor;screen;usb;display;
+EOF_DESKTOP
+    update-desktop-database "$dir" >/dev/null 2>&1 || true
+    echo "Added 'tabs9' to the application launcher ($dir/tabs9.desktop)."
+    echo 'To keep it on the panel: find it in the launcher, right-click -> Pin to Task Manager.'
+    ;;
   forget)
     # Everything tabs9 put outside this directory: the desktop entries.
-    rm -f "${XDG_DATA_HOME:-$HOME/.local/share}"/applications/tabs9.*.desktop
+    rm -f "${XDG_DATA_HOME:-$HOME/.local/share}"/applications/tabs9.*.desktop \
+          "${XDG_DATA_HOME:-$HOME/.local/share}"/applications/tabs9.desktop
     echo 'Removed the tabs9 desktop entries; nothing else lives outside this directory.'
     ;;
   pen-actions) shift; exec python3 scripts/kde-actions.py "$@" ;;
@@ -325,7 +366,7 @@ case "${1:-help}" in
   test-motion) shift; exec python3 scripts/motion-test.py "$@" ;;
   bench-capture) shift; exec python3 scripts/capture_ab.py "$@" ;;
   *)
-    echo 'Usage: ./tabs9 {setup [--yes] [--no-sudo] [--start]|doctor|start [options]|stop|status|logs|ui|forget|pin-desktop on|off}'
+    echo 'Usage: ./tabs9 {setup [--yes] [--no-sudo] [--start]|doctor|start [options]|stop|status|logs|ui [--stop]|launcher|forget|pin-desktop on|off}'
     echo '  One host per tablet: start/stop/logs take --tablet MODEL when more than one is attached;'
     echo '  status and stop without it cover every tablet. ui opens the control panel in the browser.'
     echo '  setup walks through every requirement and fixes what it can (asks before sudo);'

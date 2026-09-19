@@ -53,9 +53,21 @@ Read this before anything else; the project is hardware-specific.
   its panel size (`--resolution WIDTHxHEIGHT` overrides it) and the client
   negotiates frame rate and bitrate from the host. Two tablets have been
   verified (table above); `./tabs9 setup` reports what yours has.
-- The client APK is debug-signed. `./tabs9 setup` downloads it from the
-  GitHub release and checks the SHA-256 published in the release notes, or
-  build it from source with `scripts/build-android.sh`.
+- The client APK is debug-signed. `./tabs9 setup` downloads the release
+  tagged with the source's own app version (`v0.2.0` for a checkout whose
+  `android/app/build.gradle.kts` says `versionName = "0.2.0"`), checks the
+  SHA-256 published in the release notes and installs it; the two therefore
+  never drift apart. `scripts/build-android.sh` builds the same APK from
+  source (downloads a JDK and the Android SDK, ~1 GB) for anyone changing
+  the app.
+- **The app's own screens** (start-up, settings, the one-time note) use a
+  green palette in a dark and a **light variant for E-ink**: *Settings →
+  Theme* is Auto / Light (E-ink) / Dark. Auto picks Light when the panel
+  looks like E-ink — a known model, or a refresh rate of 45 Hz or less, which
+  no LCD/OLED tablet reports (the MatePad Paper says 40 Hz; there is no
+  Android API that states the panel technology, so this stays a guess you
+  can override). The *mirrored desktop* keeps whatever colours KDE has: for
+  an E-ink tablet, a light Plasma colour scheme is the setting that matters.
 
 The name comes from the first tablet it ran on. The CLI is `./tabs9`, each
 tablet's host runs as the systemd user unit `app-tabs9.<model>.service`
@@ -186,8 +198,12 @@ size the connected tablet reports.
 
 ![tabs9 control panel with two tablets](docs/control-panel.png)
 
-`./tabs9 ui` serves a small page on `http://127.0.0.1:8899` (this computer
-only) and opens it in your browser. One card per attached tablet: its state
+`./tabs9 ui` starts the panel as a user service (`app-tabs9.ui.service`,
+`./tabs9 ui --stop` ends it), serves it on `http://127.0.0.1:8899` (this
+computer only) and opens it in your browser; run it again and it just
+brings the page up. `./tabs9 launcher` adds **tabs9** to the application
+launcher with its icon — find it there, right-click → *Pin to Task Manager*
+for a one-click panel. One card per attached tablet: its state
 (stopped / waiting for the KDE dialog / streaming / failed), **Start** and
 **Stop**, what the tablet is (panel, refresh rate, Android version, whether
 it has a hardware HEVC decoder), live figures while it streams (frames per
@@ -311,6 +327,14 @@ p95 31.1 / 30.9 ms (worst window), render p95 22.6 / 21.8 ms, 0 stalls, no
 fallback. Those are the figures a fresh install should reproduce; the
 59.x runs and the 30-minute soak stand as recorded. Details and the
 reproduction command are in [docs/performance.md](docs/performance.md).
+
+## Other platforms
+
+The Android app and the protocol are host-independent; the host is KDE
+Wayland only. What a Windows `.exe` or a macOS `.app` would take — virtual
+display driver vs. private API, capture, encoding, and why touch injection is
+easy on Windows and impossible on macOS — is worked out in
+[docs/ports.md](docs/ports.md).
 
 ## Limitations
 

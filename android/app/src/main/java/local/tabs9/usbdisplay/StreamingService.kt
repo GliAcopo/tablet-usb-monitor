@@ -14,9 +14,10 @@ import android.util.Log
 
 class StreamingService : Service() {
     companion object {
-        const val CHANNEL_ID = "uscreen_streaming"
+        const val CHANNEL_ID = "tabs9_streaming"
+        private const val LEGACY_CHANNEL_ID = "uscreen_streaming"
         const val NOTIFICATION_ID = 1
-        private const val TAG = "UScreenService"
+        private const val TAG = "tabs9Service"
     }
 
     private var wakeLock: PowerManager.WakeLock? = null
@@ -50,7 +51,7 @@ class StreamingService : Service() {
             startForeground(NOTIFICATION_ID, notification)
         } catch (e: Exception) {
             android.util.Log.e(
-                "UScreenService",
+                "tabs9Service",
                 "startForeground rejected: ${e.message}. Continuing without it.",
                 e
             )
@@ -68,7 +69,7 @@ class StreamingService : Service() {
             val pm = getSystemService(POWER_SERVICE) as PowerManager
             wakeLock = pm.newWakeLock(
                 PowerManager.PARTIAL_WAKE_LOCK,
-                "UScreen::StreamingWakeLock"
+                "tabs9::StreamingWakeLock"
             ).apply {
                 setReferenceCounted(false)
                 acquire(4 * 60 * 60 * 1000L) // 4 hours max
@@ -98,7 +99,7 @@ class StreamingService : Service() {
                     @Suppress("DEPRECATION")
                     WifiManager.WIFI_MODE_FULL_HIGH_PERF
                 }
-                wifiLock = wm.createWifiLock(mode, "UScreen::StreamingWifiLock").apply {
+                wifiLock = wm.createWifiLock(mode, "tabs9::StreamingWifiLock").apply {
                     setReferenceCounted(false)
                     acquire()
                 }
@@ -125,6 +126,10 @@ class StreamingService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun createNotificationChannel() {
+        val manager = getSystemService(NotificationManager::class.java)
+        // The channel created under the fork's name would otherwise stay
+        // listed in the app's notification settings forever.
+        manager.deleteNotificationChannel(LEGACY_CHANNEL_ID)
         val channel = NotificationChannel(
             CHANNEL_ID,
             "tabs9",

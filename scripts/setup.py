@@ -58,7 +58,7 @@ APK_NAME = 'tab-s9-usb-display-debug.apk'
 PACKAGE = 'local.tabs9.usbdisplay'
 STATE = LOCAL / 'state'
 HELPER = ROOT / 'native/tabs9-capture'
-RELEASES_API = 'https://api.github.com/repos/GliAcopo/tablet-usb-monitor/releases/latest'
+RELEASES_API = 'https://api.github.com/repos/GliAcopo/tablet-usb-monitor/releases'
 UDEV_RULE = Path('/etc/udev/rules.d/51-tablet-usb-monitor.rules')
 
 # USB vendor ids that ship Android tablets: a device from one of these on the
@@ -727,14 +727,26 @@ def step_tablet(c, use_sudo, selector=None):
 
 # --- the app -----------------------------------------------------------------
 
-def latest_release_apk():
-    """(url, sha256) of the APK in the latest GitHub release, from its notes."""
-    with urllib.request.urlopen(RELEASES_API, timeout=30) as response:
+def source_app_version():
+    """versionName in android/app/build.gradle.kts: the release the APK must come from."""
+    match = re.search(r'versionName\s*=\s*"([^"]+)"', (ROOT / 'android/app/build.gradle.kts').read_text())
+    return match.group(1) if match else None
+
+
+def release_apk(tag):
+    """(url, sha256, tag) of the APK in one GitHub release, SHA from its notes.
+
+    The release is the one tagged with the source's own version, so the
+    downloaded app is the one this checkout's host expects; `latest` could
+    be older or newer than the code in the working tree.
+    """
+    url = f'{RELEASES_API}/tags/{tag}' if tag else f'{RELEASES_API}/latest'
+    with urllib.request.urlopen(url, timeout=30) as response:
         release = json.load(response)
     asset = next((a for a in release.get('assets', []) if a.get('name', '').endswith('.apk')), None)
     match = re.search(r'\b([0-9a-f]{64})\b', release.get('body', ''))
     if not asset or not match:
-        raise RuntimeError('the latest release has no APK with a published SHA-256')
+        raise RuntimeError(f'release {tag or "latest"} has no APK with a published SHA-256')
     return asset['browser_download_url'], match.group(1), release.get('tag_name', '')
 
 
@@ -842,16 +854,20 @@ def step_app(c, ready):
         c.fail('app', 'no client APK under .local/artifacts',
                'Run ./tabs9 setup (downloads the release APK and checks its SHA-256), or scripts/build-android.sh.')
     else:
-        c.info('No local APK. The GitHub release ships one with its SHA-256 in the notes;')
-        c.info('scripts/build-android.sh builds the same thing from source (downloads a JDK and the SDK, ~1 GB).')
-        if c.ask('Download the release APK now?'):
+        version = source_app_version()
+        tag = f'v{version}' if version else None
+        c.info(f'No local APK. The GitHub release {tag or "(latest)"} ships the one built from this source,')
+        c.info('with its SHA-256 in the notes; scripts/build-android.sh builds the same thing (downloads a JDK and the SDK, ~1 GB).')
+        if c.ask(f'Download the {tag or "latest"} release APK now?'):
             try:
-                url, sha, tag = latest_release_apk()
+                url, sha, got = release_apk(tag)
                 APK.parent.mkdir(parents=True, exist_ok=True)
                 download_pinned(url, APK, sha)
-                c.ok(f'downloaded {tag} APK, SHA-256 verified')
+                c.ok(f'downloaded {got} APK, SHA-256 verified')
             except Exception as error:
-                c.fail('app', f'download failed: {error}', 'Check the network, or build with scripts/build-android.sh.')
+                c.fail('app', f'download of release {tag or "latest"} failed: {error}',
+                       f'This source is version {version}: publish that release, or build the APK with '
+                       'scripts/build-android.sh (nothing else can produce a matching app).')
         else:
             c.fail('app', 'no client APK', 'scripts/build-android.sh, or download the release APK into .local/artifacts/.')
     if not APK.is_file() or not ready:

@@ -35,7 +35,7 @@ import com.samsung.android.sdk.penremote.SpenUnitManager
  */
 class SpenButton(private val context: Context) {
     companion object {
-        const val TAG = "UScreenPen"
+        const val TAG = "tabs9Pen"
     }
 
     /** The button went down (true) or up (false). */

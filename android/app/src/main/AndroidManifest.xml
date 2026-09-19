@@ -30,7 +30,7 @@
         android:icon="@mipmap/ic_launcher"
         android:label="tabs9"
         android:supportsRtl="true"
-        android:theme="@style/Theme.UScreen"
+        android:theme="@style/Theme.Tabs9"
         android:usesCleartextTraffic="true"
         android:hardwareAccelerated="true">
 

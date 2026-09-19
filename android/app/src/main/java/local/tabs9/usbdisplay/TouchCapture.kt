@@ -23,7 +23,7 @@ data class HostStreamConfig(
 
 class TouchCapture {
     companion object {
-        const val TAG = "UScreenTouch"
+        const val TAG = "tabs9Touch"
         /** Control-channel contract this client implements (see host.py PROTOCOL). */
         const val PROTOCOL = 2
         /** Optional capabilities this client implements; the host enables each only when named here. */

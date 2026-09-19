@@ -6,7 +6,27 @@ import android.content.SharedPreferences
 /** Persisted user settings on the tablet side. */
 class Prefs(context: Context) {
     private val sp: SharedPreferences =
-        context.getSharedPreferences("uscreen", Context.MODE_PRIVATE)
+        context.getSharedPreferences("tabs9", Context.MODE_PRIVATE)
+
+    init {
+        // Settings saved by builds that still stored them under the fork's
+        // name are carried over once, so an update keeps the user's choices.
+        val legacy = context.getSharedPreferences("uscreen", Context.MODE_PRIVATE)
+        if (sp.all.isEmpty() && legacy.all.isNotEmpty()) {
+            val editor = sp.edit()
+            for ((key, value) in legacy.all) {
+                when (value) {
+                    is Int -> editor.putInt(key, value)
+                    is Boolean -> editor.putBoolean(key, value)
+                    is String -> editor.putString(key, value)
+                    is Long -> editor.putLong(key, value)
+                    is Float -> editor.putFloat(key, value)
+                }
+            }
+            editor.apply()
+            legacy.edit().clear().apply()
+        }
+    }
 
     companion object {
         /**
@@ -57,6 +77,11 @@ class Prefs(context: Context) {
     var hostToken: String?
         get() = sp.getString("host_token", null)
         set(v) = sp.edit().putString("host_token", v).apply()
+
+    /** "auto", "light" or "dark" (MainActivity.THEME_*); light is for E-ink. */
+    var theme: String
+        get() = sp.getString("theme", "auto") ?: "auto"
+        set(v) = sp.edit().putString("theme", v).apply()
 
     /** Shown once, after the first time video actually arrived. */
     var thankedOnce: Boolean

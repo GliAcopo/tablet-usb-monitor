@@ -15,6 +15,7 @@ other machines, and nothing here prints a serial number.
 from __future__ import annotations
 
 import argparse
+import errno
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -26,6 +27,7 @@ import sys
 import threading
 import time
 from urllib.parse import parse_qs, urlparse
+import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
@@ -256,12 +258,31 @@ def main(argv=None):
     parser.add_argument('--port', type=int, default=8899)
     parser.add_argument('--open', action='store_true', help='open the page in the default browser')
     args = parser.parse_args(argv)
-    server = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
-    server.daemon_threads = True
     url = f'http://127.0.0.1:{args.port}/'
+    def open_browser():
+        if args.open and (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')) and shutil.which('xdg-open'):
+            subprocess.Popen(['xdg-open', url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        server = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
+    except OSError as error:
+        # Already running (a second `./tabs9 ui`, or the launcher icon): just
+        # bring the page up. Anything else on the port is reported as such.
+        if error.errno != errno.EADDRINUSE:
+            raise
+        try:
+            with urllib.request.urlopen(f'{url}api/state', timeout=3) as response:
+                ours = response.headers.get('Server', '').startswith('tabs9/')
+        except (OSError, ValueError):
+            ours = False
+        if ours:
+            print(f'tabs9 control panel is already running: {url}', flush=True)
+            open_browser()
+            return 0
+        print(f'Port {args.port} is taken by something else; try ./tabs9 ui --port 8900', file=sys.stderr)
+        return 1
+    server.daemon_threads = True
     print(f'tabs9 control panel: {url}  (Ctrl-C stops it)', flush=True)
-    if args.open and (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')) and shutil.which('xdg-open'):
-        subprocess.Popen(['xdg-open', url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    open_browser()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

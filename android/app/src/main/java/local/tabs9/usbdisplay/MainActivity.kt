@@ -64,6 +64,7 @@ class MainActivity : ComponentActivity() {
     private var spenButton: SpenButton? = null
     /** What the S Pen Remote connection is doing, for the settings sheet. */
     private var penStatus by mutableStateOf("Not connected")
+    private var themeChoice by mutableStateOf(THEME_AUTO)
     private lateinit var prefs: Prefs
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -75,6 +76,8 @@ class MainActivity : ComponentActivity() {
         requestHighestRefreshRate()
 
         prefs = Prefs(this)
+
+        themeChoice = prefs.theme
         videoReceiver = VideoReceiver()
         touchCapture = TouchCapture()
         applyToken(intent, restart = false)
@@ -168,8 +171,19 @@ class MainActivity : ComponentActivity() {
         }
 
         setContent {
-            UScreenTheme {
-                UScreenMain(
+            val light = when (themeChoice) {
+                THEME_LIGHT -> true
+                THEME_DARK -> false
+                else -> looksLikeEink(actualPanelHz)
+            }
+            LaunchedEffect(light, themeChoice) {
+                Log.i("tabs9", "Theme: ${if (light) "light" else "dark"} (setting $themeChoice, panel $actualPanelHz Hz, " +
+                    "looks like E-ink: ${looksLikeEink(actualPanelHz)})")
+            }
+            Tabs9Theme(light = light) {
+                Tabs9Main(
+                    themeChoice = themeChoice,
+                    onThemeChange = { choice -> prefs.theme = choice; themeChoice = choice },
                     penOnly = penOnlyMode,
                     streamConfig = hostStreamConfig,
                     panelHz = actualPanelHz,
@@ -244,12 +258,12 @@ class MainActivity : ComponentActivity() {
             actualPanelHz = disp.refreshRate
 
             android.util.Log.i(
-                "UScreen",
+                "tabs9",
                 "Requested display mode ${best.modeId} @ ${best.refreshRate}Hz " +
                     "(current ${disp.refreshRate}Hz)"
             )
         } catch (e: Exception) {
-            android.util.Log.w("UScreen", "Could not request a refresh rate: ${e.message}")
+            android.util.Log.w("tabs9", "Could not request a refresh rate: ${e.message}")
         }
     }
 
@@ -289,7 +303,7 @@ class MainActivity : ComponentActivity() {
             }
         } catch (e: Exception) {
             // Fallback: some Samsung firmwares have issues with insetsController
-            android.util.Log.w("UScreen", "Immersive mode failed: ${e.message}")
+            android.util.Log.w("tabs9", "Immersive mode failed: ${e.message}")
         }
     }
 
@@ -329,7 +343,7 @@ class MainActivity : ComponentActivity() {
         // will connect with the new token anyway; reconnecting here as well
         // would leave a second socket behind.
         if (restart && changed && touchCapture?.isControlConnected() == true) {
-            Log.i("UScreen", "New session token — reconnecting")
+            Log.i("tabs9", "New session token — reconnecting")
             touchCapture?.disconnect()
             touchCapture?.connect()
             if (!penOnlyMode) {
@@ -430,33 +444,80 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private val Accent = Color(0xFF6C63FF)
-private val AccentSoft = Color(0xFF8B85FF)
-private val Ok = Color(0xFF4CAF50)
-private val Warn = Color(0xFFFF9800)
+/**
+ * The app's colours: a green palette in two variants. Dark is the default;
+ * Light is for E-ink panels (a white page refreshes cleanly, dark surfaces
+ * ghost) and is chosen by "Auto" when the panel looks like one.
+ */
+data class Palette(
+    val accent: Color, val accentSoft: Color, val ok: Color, val warn: Color,
+    val bg: Color, val surface: Color, val card: Color, val cardAlpha: Color, val cardSoft: Color,
+    val deep: Color, val gradient: Color, val overlay: Color,
+    val text: Color, val text2: Color, val muted: Color, val muted2: Color,
+    val video: Color, val error: Color, val light: Boolean,
+)
+
+val DarkPalette = Palette(
+    accent = Color(0xFF34C38F), accentSoft = Color(0xFF6EDDB0), ok = Color(0xFF4CAF50), warn = Color(0xFFFF9800),
+    bg = Color(0xFF0A0F0C), surface = Color(0xFF13201A), card = Color(0xFF1A2A22), cardAlpha = Color(0xE61A2A22),
+    cardSoft = Color(0xAA1A2A22), deep = Color(0xFF0B120E), gradient = Color(0xFF12291D), overlay = Color(0x99000000),
+    text = Color.White, text2 = Color(0xFFB4C4BB), muted = Color(0xFF6F8378), muted2 = Color(0xFF93A69B),
+    video = Color.Black, error = Color(0xCC7A2E2E), light = false,
+)
+
+val LightPalette = Palette(
+    accent = Color(0xFF1E7A4F), accentSoft = Color(0xFF2E9E6B), ok = Color(0xFF1E7A4F), warn = Color(0xFFB35C00),
+    bg = Color.White, surface = Color(0xFFF4F7F5), card = Color.White, cardAlpha = Color(0xF2FFFFFF),
+    cardSoft = Color(0xE6FFFFFF), deep = Color(0xFFF7F9F8), gradient = Color(0xFFEFF5F1), overlay = Color(0xCCFFFFFF),
+    text = Color(0xFF101512), text2 = Color(0xFF2E3B33), muted = Color(0xFF4A5A50), muted2 = Color(0xFF3E4E45),
+    video = Color.White, error = Color(0xFFB00020), light = true,
+)
+
+val LocalPalette = staticCompositionLocalOf { DarkPalette }
+
+/** Theme preference values stored in Prefs.theme. */
+const val THEME_AUTO = "auto"
+const val THEME_LIGHT = "light"
+const val THEME_DARK = "dark"
+
+/**
+ * Whether this panel looks like E-ink: a known model, or a refresh rate no
+ * LCD/OLED tablet reports (the MatePad Paper says 40 Hz). Nothing on Android
+ * states the panel technology, so this stays a guess the user can override.
+ */
+fun looksLikeEink(panelHz: Float): Boolean {
+    val id = (Build.MANUFACTURER + " " + Build.MODEL + " " + Build.PRODUCT).lowercase()
+    val known = listOf("onyx", "boox", "hmw-w09", "matepad paper", "remarkable", "bigme", "pocketbook",
+                       "meebook", "kobo", "hisense a", "xpaper", "supernote", "dasung")
+    return known.any { it in id } || (panelHz in 1f..45f)
+}
 
 /** This project, and the app it was forked from (credited in the one-time note). */
 const val PROJECT_URL = "https://github.com/GliAcopo/tablet-usb-monitor"
 const val UPSTREAM_URL = "https://github.com/majmichu1/UScreen"
 
 @Composable
-fun UScreenTheme(content: @Composable () -> Unit) {
-    MaterialTheme(
-        colorScheme = darkColorScheme(
-            primary = Accent,
-            secondary = Color(0xFF03DAC6),
-            background = Color(0xFF0A0A0A),
-            surface = Color(0xFF16161F),
-            surfaceVariant = Color(0xFF20202C),
-        )
-    ) {
-        content()
+fun Tabs9Theme(light: Boolean, content: @Composable () -> Unit) {
+    val palette = if (light) LightPalette else DarkPalette
+    val scheme = if (light) lightColorScheme(
+        primary = palette.accent, secondary = palette.accentSoft,
+        background = palette.bg, surface = palette.surface, surfaceVariant = palette.card,
+        onBackground = palette.text, onSurface = palette.text,
+    ) else darkColorScheme(
+        primary = palette.accent, secondary = palette.accentSoft,
+        background = palette.bg, surface = palette.surface, surfaceVariant = palette.card,
+        onBackground = palette.text, onSurface = palette.text,
+    )
+    CompositionLocalProvider(LocalPalette provides palette) {
+        MaterialTheme(colorScheme = scheme) { content() }
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun UScreenMain(
+fun Tabs9Main(
+    themeChoice: String = THEME_AUTO,
+    onThemeChange: (String) -> Unit = {},
     onSurfaceReady: (SurfaceView) -> Unit,
     penOnly: Boolean = false,
     streamConfig: HostStreamConfig = HostStreamConfig(),
@@ -474,6 +535,7 @@ fun UScreenMain(
     touchCapture: TouchCapture? = null,
     prefs: Prefs? = null,
 ) {
+    val P = LocalPalette.current
     val isConnected = videoState == VideoReceiver.VideoState.STREAMING
     val recovering = videoState == VideoReceiver.VideoState.RECOVERING
     var fps by remember { mutableStateOf(0f) }
@@ -494,7 +556,7 @@ fun UScreenMain(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.Black)
+            .background(P.video)
     ) {
         // Video surface — fills entire screen
         AndroidView(
@@ -552,7 +614,7 @@ fun UScreenMain(
             modifier = Modifier.align(Alignment.TopCenter).padding(top = 12.dp)
         ) {
             Surface(
-                color = Color(0xCC20202C),
+                color = P.cardAlpha,
                 shape = RoundedCornerShape(8.dp)
             ) {
                 Row(
@@ -562,13 +624,13 @@ fun UScreenMain(
                     CircularProgressIndicator(
                         modifier = Modifier.size(14.dp),
                         strokeWidth = 2.dp,
-                        color = Color(0xFFB0B0C0)
+                        color = P.text2
                     )
                     Spacer(Modifier.width(8.dp))
                     Text(
                         text = "Reconnecting video…",
                         fontSize = 12.sp,
-                        color = Color(0xFFB0B0C0)
+                        color = P.text2
                     )
                 }
             }
@@ -577,7 +639,7 @@ fun UScreenMain(
         // Stats chip (top-left, only while streaming)
         if (isConnected && showStats) {
             Surface(
-                color = Color(0x99000000),
+                color = P.overlay,
                 shape = RoundedCornerShape(8.dp),
                 modifier = Modifier
                     .align(Alignment.TopStart)
@@ -588,7 +650,7 @@ fun UScreenMain(
                         fps, streamConfig.fps, panelHz, mbps
                     ),
                     fontSize = 12.sp,
-                    color = Color(0xFFB0B0C0),
+                    color = P.text2,
                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
                 )
             }
@@ -602,13 +664,13 @@ fun UScreenMain(
                     .align(Alignment.TopCenter)
                     .padding(12.dp)
                     .clip(RoundedCornerShape(8.dp))
-                    .background(Color(0xCC7A2E2E))
+                    .background(P.error)
             ) {
                 Text(
                     text = "Host protocol $hostProtocol, app protocol ${TouchCapture.PROTOCOL}: " +
                         "update the ${if (hostProtocol < TouchCapture.PROTOCOL) "host" else "app"}",
                     fontSize = 12.sp,
-                    color = Color.White,
+                    color = P.text,
                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
                 )
             }
@@ -623,11 +685,11 @@ fun UScreenMain(
                 .size(38.dp)
                 .alpha(if (isConnected) 0.35f else 0.9f)
                 .clip(CircleShape)
-                .background(Color(0xAA20202C))
+                .background(P.cardSoft)
                 .clickable { showSettings = true },
             contentAlignment = Alignment.Center
         ) {
-            Text("⚙", fontSize = 18.sp, color = Color.White)
+            Text("⚙", fontSize = 18.sp, color = P.text)
         }
 
         // One-time note after the first successful picture. Dismissable, never
@@ -638,33 +700,33 @@ fun UScreenMain(
                     .align(Alignment.BottomCenter)
                     .padding(24.dp)
                     .clip(RoundedCornerShape(14.dp))
-                    .background(Color(0xE620202C))
+                    .background(P.cardAlpha)
                     .padding(16.dp)
             ) {
                 Column {
-                    Text("tabs9 is working.", fontSize = 15.sp, color = Color.White, fontWeight = FontWeight.Bold)
+                    Text("tabs9 is working.", fontSize = 15.sp, color = P.text, fontWeight = FontWeight.Bold)
                     Text(
                         "If it replaced a second monitor for you, a star on GitHub or a report of " +
                             "your tablet model helps other Linux users find it. This note appears only once.",
-                        fontSize = 12.sp, color = Color(0xFFB0B0C0)
+                        fontSize = 12.sp, color = P.text2
                     )
                     Text(
                         "This client started as a fork of UScreen by majmichu1 (MIT).",
-                        fontSize = 11.sp, color = Color(0xFF8A8AA0), modifier = Modifier.padding(top = 4.dp)
+                        fontSize = 11.sp, color = P.muted2, modifier = Modifier.padding(top = 4.dp)
                     )
                     Row(modifier = Modifier.padding(top = 10.dp)) {
-                        Text("Open GitHub", fontSize = 13.sp, color = Accent,
+                        Text("Open GitHub", fontSize = 13.sp, color = P.accent,
                             modifier = Modifier.clickable {
                                 context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW,
                                     android.net.Uri.parse(PROJECT_URL)))
                                 onDismissThanks()
                             }.padding(end = 20.dp))
-                        Text("UScreen", fontSize = 13.sp, color = Color(0xFF9A9AB0),
+                        Text("tabs9", fontSize = 13.sp, color = P.muted2,
                             modifier = Modifier.clickable {
                                 context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW,
                                     android.net.Uri.parse(UPSTREAM_URL)))
                             }.padding(end = 20.dp))
-                        Text("Dismiss", fontSize = 13.sp, color = Color(0xFF9A9AB0),
+                        Text("Dismiss", fontSize = 13.sp, color = P.muted2,
                             modifier = Modifier.clickable { onDismissThanks() })
                     }
                 }
@@ -673,6 +735,8 @@ fun UScreenMain(
 
         if (showSettings) {
             SettingsSheet(
+                themeChoice = themeChoice,
+                onThemeChange = onThemeChange,
                 appliedConfig = streamConfig,
                 penOnly = penOnly,
                 onPenOnlyChange = { wantPenOnly ->
@@ -707,29 +771,30 @@ fun UScreenMain(
 
 @Composable
 private fun PenOnlyScreen() {
+    val P = LocalPalette.current
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(
                 Brush.verticalGradient(
-                    listOf(Color(0xFF0D0D14), Color(0xFF141B2A), Color(0xFF0D0D14))
+                    listOf(P.deep, P.gradient, P.deep)
                 )
             ),
         contentAlignment = Alignment.Center
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Text("Graphics tablet", fontSize = 34.sp, fontWeight = FontWeight.Bold,
-                color = Color.White)
+                color = P.text)
             Spacer(Modifier.height(10.dp))
             Text(
                 "Draw here — it goes to the screen on your computer.",
-                fontSize = 15.sp, color = AccentSoft, textAlign = TextAlign.Center
+                fontSize = 15.sp, color = P.accentSoft, textAlign = TextAlign.Center
             )
             Spacer(Modifier.height(28.dp))
             Text(
                 "Nothing is streamed to this screen in this mode, so there is no\n" +
                     "display latency at all. Pressure, tilt and the eraser all work.",
-                fontSize = 13.sp, lineHeight = 22.sp, color = Color(0xFF9A9AAE),
+                fontSize = 13.sp, lineHeight = 22.sp, color = P.muted2,
                 textAlign = TextAlign.Center
             )
         }
@@ -738,12 +803,13 @@ private fun PenOnlyScreen() {
 
 @Composable
 private fun ConnectionScreen() {
+    val P = LocalPalette.current
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(
                 Brush.verticalGradient(
-                    listOf(Color(0xFF0D0D14), Color(0xFF14142A), Color(0xFF0D0D14))
+                    listOf(P.deep, P.gradient, P.deep)
                 )
             ),
         contentAlignment = Alignment.Center
@@ -753,23 +819,23 @@ private fun ConnectionScreen() {
                 text = "tabs9",
                 fontSize = 42.sp,
                 fontWeight = FontWeight.Bold,
-                color = Color.White
+                color = P.text
             )
             Text(
                 text = "Your tablet as a second screen, over USB",
                 fontSize = 15.sp,
-                color = AccentSoft
+                color = P.accentSoft
             )
             Spacer(modifier = Modifier.height(36.dp))
             CircularProgressIndicator(
-                color = Accent,
+                color = P.accent,
                 strokeWidth = 3.dp,
                 modifier = Modifier.size(40.dp)
             )
             Spacer(modifier = Modifier.height(36.dp))
             Card(
                 shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = Color(0x8C1A1A2A))
+                colors = CardDefaults.cardColors(containerColor = P.cardAlpha)
             ) {
                 Column(
                     modifier = Modifier.padding(horizontal = 28.dp, vertical = 20.dp),
@@ -778,17 +844,17 @@ private fun ConnectionScreen() {
                     Text(
                         text = "Waiting for the host…",
                         fontSize = 16.sp,
-                        color = Warn,
+                        color = P.warn,
                         fontWeight = FontWeight.Medium
                     )
                     Spacer(modifier = Modifier.height(10.dp))
                     Text(
                         text = "1. Connect the USB cable\n" +
                             "2. Allow USB debugging if asked\n" +
-                            "3. Make sure uscreen is running on your PC",
+                            "3. Make sure tabs9 is running on your computer",
                         fontSize = 13.sp,
                         lineHeight = 22.sp,
-                        color = Color(0xFF9A9AAE),
+                        color = P.muted2,
                         textAlign = TextAlign.Start
                     )
                 }
@@ -800,6 +866,8 @@ private fun ConnectionScreen() {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SettingsSheet(
+    themeChoice: String,
+    onThemeChange: (String) -> Unit,
     appliedConfig: HostStreamConfig,
     penOnly: Boolean,
     onPenOnlyChange: (Boolean) -> Unit,
@@ -812,6 +880,7 @@ private fun SettingsSheet(
     onSendScreenshot: () -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val P = LocalPalette.current
     var bitrateMbps by remember {
         mutableStateOf(appliedConfig.bitrateKbps / 1000f)
     }
@@ -819,14 +888,14 @@ private fun SettingsSheet(
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
-        containerColor = Color(0xFF16161F)
+        containerColor = P.surface
     ) {
         Column(modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp)) {
             Text(
                 "Settings",
                 fontSize = 20.sp,
                 fontWeight = FontWeight.Bold,
-                color = Color.White
+                color = P.text
             )
             Spacer(Modifier.height(20.dp))
 
@@ -834,7 +903,7 @@ private fun SettingsSheet(
                 "Host applied: ${appliedConfig.fps} fps at " +
                     "${appliedConfig.bitrateKbps / 1000f} Mbps",
                 fontSize = 12.sp,
-                color = AccentSoft
+                color = P.accentSoft
             )
             Spacer(Modifier.height(16.dp))
 
@@ -846,19 +915,19 @@ private fun SettingsSheet(
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(modifier = Modifier.weight(1f)) {
-                    Text("Graphics tablet", fontSize = 14.sp, color = Color(0xFFB0B0C0))
+                    Text("Graphics tablet", fontSize = 14.sp, color = P.text2)
                     Text(
                         "Draw on the computer's own screen with the pen, " +
                             "instead of showing a second screen here",
                         fontSize = 11.sp,
-                        color = Color(0xFF6A6A7E)
+                        color = P.muted
                     )
                 }
                 Spacer(Modifier.width(12.dp))
                 Switch(
                     checked = penOnly,
                     onCheckedChange = onPenOnlyChange,
-                    colors = SwitchDefaults.colors(checkedTrackColor = Accent)
+                    colors = SwitchDefaults.colors(checkedTrackColor = P.accent)
                 )
             }
             Spacer(Modifier.height(20.dp))
@@ -867,7 +936,7 @@ private fun SettingsSheet(
             Text(
                 "Bitrate: ${bitrateMbps.roundToInt()} Mbps",
                 fontSize = 14.sp,
-                color = Color(0xFFB0B0C0)
+                color = P.text2
             )
             Slider(
                 value = bitrateMbps,
@@ -875,17 +944,17 @@ private fun SettingsSheet(
                 valueRange = (Prefs.MIN_BITRATE_KBPS / 1000).toFloat()..
                         (Prefs.MAX_BITRATE_KBPS / 1000).toFloat(),
                 steps = 28,
-                colors = SliderDefaults.colors(thumbColor = Accent, activeTrackColor = Accent)
+                colors = SliderDefaults.colors(thumbColor = P.accent, activeTrackColor = P.accent)
             )
             Text(
                 "Higher bitrates can preserve more detail but use more USB bandwidth. " +
                     "The applied value appears above after the host confirms it.",
                 fontSize = 11.sp,
-                color = Color(0xFF6A6A7E)
+                color = P.muted
             )
             Spacer(Modifier.height(20.dp))
 
-            Text("Frame rate", fontSize = 14.sp, color = Color(0xFFB0B0C0))
+            Text("Frame rate", fontSize = 14.sp, color = P.text2)
             Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 listOf(30, 60, 90, 120).forEach { f ->
@@ -894,7 +963,29 @@ private fun SettingsSheet(
                         onClick = { fpsChoice = f },
                         label = { Text("$f fps") },
                         colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = Accent,
+                            selectedContainerColor = P.accent,
+                            selectedLabelColor = Color.White
+                        )
+                    )
+                }
+            }
+            Spacer(Modifier.height(20.dp))
+
+            Text("Theme", fontSize = 14.sp, color = P.text2)
+            Text(
+                "Light is meant for E-ink screens (dark surfaces ghost on them). Auto picks " +
+                    "Light when the panel looks like E-ink: a known model or a refresh rate of 45 Hz or less.",
+                fontSize = 11.sp, color = P.muted
+            )
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf(THEME_AUTO to "Auto", THEME_LIGHT to "Light (E-ink)", THEME_DARK to "Dark").forEach { (value, label) ->
+                    FilterChip(
+                        selected = themeChoice == value,
+                        onClick = { onThemeChange(value) },
+                        label = { Text(label) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = P.accent,
                             selectedLabelColor = Color.White
                         )
                     )
@@ -908,37 +999,37 @@ private fun SettingsSheet(
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(modifier = Modifier.weight(1f)) {
-                    Text("Show stats overlay", fontSize = 14.sp, color = Color(0xFFB0B0C0))
+                    Text("Show stats overlay", fontSize = 14.sp, color = P.text2)
                     Text(
                         "FPS and bandwidth in the corner",
                         fontSize = 11.sp,
-                        color = Color(0xFF6A6A7E)
+                        color = P.muted
                     )
                 }
                 Switch(
                     checked = showStats,
                     onCheckedChange = onShowStatsChange,
-                    colors = SwitchDefaults.colors(checkedTrackColor = Accent)
+                    colors = SwitchDefaults.colors(checkedTrackColor = P.accent)
                 )
             }
             Spacer(Modifier.height(24.dp))
 
-            Text("S Pen button", fontSize = 14.sp, color = Color(0xFFB0B0C0))
+            Text("S Pen button", fontSize = 14.sp, color = P.text2)
             Text(
                 "$penStatus. While this app is in front, the pen's button and its air " +
                     "gestures go to the computer instead of opening Air Command here.",
                 fontSize = 11.sp,
-                color = Color(0xFF6A6A7E)
+                color = P.muted
             )
             Spacer(Modifier.height(24.dp))
 
             if (hostClipboard) {
-                Text("Computer clipboard", fontSize = 14.sp, color = Color(0xFFB0B0C0))
+                Text("Computer clipboard", fontSize = 14.sp, color = P.text2)
                 Text(
                     "Put what this tablet copied last (text or an image), or its newest " +
                         "screenshot, on the computer's clipboard; then paste there.",
                     fontSize = 11.sp,
-                    color = Color(0xFF6A6A7E)
+                    color = P.muted
                 )
                 Spacer(Modifier.height(8.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -955,7 +1046,7 @@ private fun SettingsSheet(
                         onDismiss()
                     },
                     modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.buttonColors(containerColor = Accent)
+                    colors = ButtonDefaults.buttonColors(containerColor = P.accent)
                 ) {
                     Text("Apply", fontSize = 16.sp, modifier = Modifier.padding(vertical = 4.dp))
                 }
@@ -963,7 +1054,7 @@ private fun SettingsSheet(
                 Text(
                     "Applying restarts the stream for a moment.",
                     fontSize = 11.sp,
-                    color = Color(0xFF6A6A7E),
+                    color = P.muted,
                     textAlign = TextAlign.Center,
                     modifier = Modifier.fillMaxWidth()
                 )

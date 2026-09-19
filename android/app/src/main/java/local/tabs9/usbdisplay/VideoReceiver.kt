@@ -22,7 +22,7 @@ class VideoReceiver {
         const val PORT = 8890
         const val MIME_TYPE = "video/avc"
         const val MIME_TYPE_HEVC = "video/hevc"
-        const val TAG = "UScreenVideo"
+        const val TAG = "tabs9Video"
         const val MAX_FRAME_SIZE = 8 * 1024 * 1024
         const val FRAME_HEADER_SIZE = StreamFramer.FRAME_HEADER_SIZE
 
@@ -301,7 +301,7 @@ class VideoReceiver {
     }
 
     /**
-     * Decoder ownership. One HandlerThread ("uscreen-codec") owns the
+     * Decoder ownership. One HandlerThread ("tabs9-codec") owns the
      * MediaCodec lifecycle and every input submission; the network reader
      * only appends access units to [inputQueue]. MediaCodec runs in
      * asynchronous mode, so no thread ever polls dequeueInputBuffer with a
@@ -376,7 +376,7 @@ class VideoReceiver {
             }
 
             val generation = ++codecGeneration
-            val thread = HandlerThread("uscreen-codec").apply { start() }
+            val thread = HandlerThread("tabs9-codec").apply { start() }
             val handler = Handler(thread.looper)
             codecThread = thread
             codecHandler = handler
@@ -424,7 +424,7 @@ class VideoReceiver {
             // Fires when a frame has actually reached the output surface —
             // the true "it is on screen" moment. The frame is identified
             // through its media timestamp (arrival time on this device).
-            val cbThread = HandlerThread("uscreen-frame-cb").apply { start() }
+            val cbThread = HandlerThread("tabs9-frame-cb").apply { start() }
             frameCallbackThread = cbThread
             codec.setOnFrameRenderedListener({ _, presentationTimeUs, nanoTime ->
                 submittedSinceRender.set(0)
