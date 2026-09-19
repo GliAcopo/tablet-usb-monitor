@@ -50,6 +50,7 @@ from touch_input import LiveKScreenTarget, PortalTouchInput, TouchInputError
 from eis_touch import EisTouch, EisError
 from gestures import GestureFilter
 from air import AirGestures, GESTURES
+from picture import LightPicture
 from remote_target import Instances
 from shortcuts import KdeShortcuts
 from remote import InputCapture, RemoteControl, RemoteError, TabletInjector
@@ -444,6 +445,7 @@ class Host:
         self.fd = None
         self.capture_node = None
         self.memory_mode = args.capture_memory
+        self.light_picture = None
         self.native = None
         self.native_pushed = collections.deque()   # slots in encoder order
         self.native_last_encoded = None
@@ -776,6 +778,15 @@ class Host:
         self.capture_node = int(node)
         self.start_pipeline()
 
+    def light_picture_fragment(self):
+        """The luma-inverting hop for the VA paths, or nothing (see picture.py)."""
+        self.light_picture = None
+        if self.args.light_picture != 'on':
+            return ''
+        self.light_picture = LightPicture(self.args.width, self.args.height, self.args.fps)
+        print('Light picture: brightness inverted for the tablet (colours keep their hue).', flush=True)
+        return self.light_picture.fragment()
+
     def start_pipeline(self):
         if self.memory_mode == 'native':
             return self.start_native_pipeline()
@@ -789,11 +800,16 @@ class Host:
             # The queue puts the converter and the encoder on separate threads so
             # the RGB->NV12 job of frame N+1 overlaps the encode of frame N
             # (about 6 ms + 3 ms of GPU time per frame; serial they miss 8.33 ms).
-            encode = ('! vapostproc ! video/x-raw(memory:VAMemory),format=NV12 '
+            encode = ('! vapostproc ' + self.light_picture_fragment() +
+                      '! video/x-raw(memory:VAMemory),format=NV12 '
                       '! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream '
                       f'! vah265enc name=encoder {rc} '
                       f'key-int-max={self.args.fps} b-frames=0 ref-frames=1 target-usage=7 ')
         else:
+            self.light_picture = None
+            if self.args.light_picture == 'on':
+                print(f'Light picture: not available on the {self.memory_mode} capture path '
+                      '(it needs the VA converter); the picture is sent as it is.', flush=True)
             conversion = ('! glupload ! glcolorconvert ! video/x-raw(memory:GLMemory),format=RGBA '
                           if self.memory_mode == 'gl' else '! video/x-raw,format=BGRx ')
             encode = (conversion +
@@ -817,6 +833,7 @@ class Host:
             # once, so the drop here only fires if Python itself stalls; the
             # per-client queues in distribute() hold the real backlog policy.
             '! appsink name=encoded emit-signals=true sync=false max-buffers=4 drop=true'
+            + (' async=false' if self.light_picture is not None else '')
         )
         if os.environ.get('TABS9_DEBUG_TAIL'):
             # Diagnostics only: replace everything after pipewiresrc's queue.
@@ -827,6 +844,8 @@ class Host:
             self.pipeline = Gst.parse_launch(description)
             self.pipeline.get_by_name('capture').get_static_pad('src').add_probe(
                 Gst.PadProbeType.BUFFER, self.capture_probe)
+            if self.light_picture is not None:
+                self.light_picture.attach(self.pipeline)
             encoder_element = self.pipeline.get_by_name('encoder')
             if encoder_element is not None:
                 encoder_element.get_static_pad('sink').add_probe(Gst.PadProbeType.BUFFER, self.encoder_in_probe)
@@ -989,16 +1008,20 @@ class Host:
             # it into its own VAMemory pool, exactly the boundary the encoder
             # already handles; feeding the encoder our DMA-BUFs directly made it
             # re-import every frame and fail on its reconstruct pool.
-            '! vapostproc ! video/x-raw(memory:VAMemory),format=NV12,colorimetry=bt709 '
+            '! vapostproc ' + self.light_picture_fragment() +
+            '! video/x-raw(memory:VAMemory),format=NV12,colorimetry=bt709 '
             f'! vah265enc name=encoder {rc} '
             f'key-int-max={self.args.fps} b-frames=0 ref-frames=1 target-usage=7 '
             '! video/x-h265,profile=main '
             '! h265parse config-interval=-1 ! video/x-h265,stream-format=byte-stream,alignment=au '
-            '! appsink name=encoded emit-signals=true sync=false max-buffers=4 drop=true')
+            '! appsink name=encoded emit-signals=true sync=false max-buffers=4 drop=true'
+            + (' async=false' if self.light_picture is not None else ''))
         try:
             self.pipeline = Gst.parse_launch(description)
             self.pipeline.get_by_name('capture').get_static_pad('src').add_probe(
                 Gst.PadProbeType.BUFFER, self.capture_probe)
+            if self.light_picture is not None:
+                self.light_picture.attach(self.pipeline)
             self.pipeline.get_by_name('encoder').get_static_pad('sink').add_probe(
                 Gst.PadProbeType.BUFFER, self.encoder_in_probe)
             self.pipeline.get_by_name('encoded').get_static_pad('sink').add_probe(
@@ -2299,6 +2322,7 @@ class Host:
             'remote_events': self.remote_control.events if self.remote_control is not None else 0,
             'client_resyncs': self.resyncs,
             'keyframe_replays': self.replays, 'keyframes': self.keyframes,
+            **(self.light_picture.stats() if self.light_picture is not None else {}),
             'video_clients': len(self.clients), 'video_connects': self.video_connects,
             'video_disconnects': self.video_disconnects, 'last_video_disconnect': self.last_video_disconnect,
             'heartbeats_sent': self.heartbeats_sent,
@@ -2489,6 +2513,9 @@ def build_parser():
                         help='how far the pen must move in the air, with its button held, for '
                              'the press to be a direction rather than a click (default 1.5; the '
                              'host logs what each gesture measured)')
+    parser.add_argument('--light-picture', choices=['on', 'off'], default='off',
+                        help='invert the brightness of what the tablet shows, so a dark desktop '
+                             'reads as a light page on E-ink; colours keep their hue (default off)')
     parser.add_argument('--remote', choices=['on', 'off'], default='on',
                         help='register the KDE shortcuts that show the tablet its own desktop '
                              "and send it this computer's mouse and keyboard (default on)")

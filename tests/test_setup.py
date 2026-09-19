@@ -5,6 +5,7 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+import unittest.mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('tabs9_setup', REPO_ROOT / 'scripts/setup.py')
@@ -67,10 +68,23 @@ class InstallerButton(unittest.TestCase):
 
 
 class SuggestedCommand(unittest.TestCase):
+    def setUp(self):
+        patcher = unittest.mock.patch.object(setup, 'dark_desktop', return_value=False)
+        patcher.start(); self.addCleanup(patcher.stop)
+
     def test_eink_huawei(self):
         facts = {'manufacturer': 'HUAWEI', 'panel': (1872, 1404), 'refresh': 40.0}
         self.assertEqual(setup.suggested_command(facts),
                          './tabs9 start --profile light --resolution 1872x1404 --pen-button off')
+
+    def test_eink_with_a_dark_desktop_gets_the_light_picture(self):
+        facts = {'manufacturer': 'HUAWEI', 'panel': (1872, 1404), 'refresh': 40.0}
+        with unittest.mock.patch.object(setup, 'dark_desktop', return_value=True):
+            self.assertEqual(setup.suggested_command(facts),
+                             './tabs9 start --profile light --light-picture on --resolution 1872x1404 --pen-button off')
+            # Not on a 120 Hz LCD/OLED: the dark desktop looks fine there.
+            self.assertNotIn('light-picture', setup.suggested_command(
+                {'manufacturer': 'samsung', 'panel': (2960, 1848), 'refresh': 120.0}))
 
     def test_samsung_120hz(self):
         facts = {'manufacturer': 'samsung', 'panel': (2960, 1848), 'refresh': 120.0}

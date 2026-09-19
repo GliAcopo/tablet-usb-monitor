@@ -17,6 +17,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -894,7 +896,12 @@ private fun SettingsSheet(
         onDismissRequest = onDismiss,
         containerColor = P.surface
     ) {
-        Column(modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp)) {
+        // Scrollable: in landscape on a 700 dp-tall panel (the MatePad Paper)
+        // the sheet is taller than the screen, and without this the rows at
+        // the bottom (Theme among them) could not be reached at all.
+        Column(modifier = Modifier
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 24.dp, vertical = 8.dp)) {
             Text(
                 "Settings",
                 fontSize = 20.sp,
@@ -933,6 +940,30 @@ private fun SettingsSheet(
                     onCheckedChange = onPenOnlyChange,
                     colors = SwitchDefaults.colors(checkedTrackColor = P.accent)
                 )
+            }
+            Spacer(Modifier.height(20.dp))
+
+            // The theme applies to every screen of the app, so it sits above
+            // the stream controls and stays when they fold away.
+            Text("Theme", fontSize = 14.sp, color = P.text2)
+            Text(
+                "Light is meant for E-ink screens (dark surfaces ghost on them). Auto picks " +
+                    "Light when the panel looks like E-ink: a known model or a refresh rate of 45 Hz or less.",
+                fontSize = 11.sp, color = P.muted
+            )
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf(THEME_AUTO to "Auto", THEME_LIGHT to "Light (E-ink)", THEME_DARK to "Dark").forEach { (value, label) ->
+                    FilterChip(
+                        selected = themeChoice == value,
+                        onClick = { onThemeChange(value) },
+                        label = { Text(label) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = P.accent,
+                            selectedLabelColor = Color.White
+                        )
+                    )
+                }
             }
             Spacer(Modifier.height(20.dp))
 
@@ -975,27 +1006,6 @@ private fun SettingsSheet(
             }
             Spacer(Modifier.height(20.dp))
 
-            Text("Theme", fontSize = 14.sp, color = P.text2)
-            Text(
-                "Light is meant for E-ink screens (dark surfaces ghost on them). Auto picks " +
-                    "Light when the panel looks like E-ink: a known model or a refresh rate of 45 Hz or less.",
-                fontSize = 11.sp, color = P.muted
-            )
-            Spacer(Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf(THEME_AUTO to "Auto", THEME_LIGHT to "Light (E-ink)", THEME_DARK to "Dark").forEach { (value, label) ->
-                    FilterChip(
-                        selected = themeChoice == value,
-                        onClick = { onThemeChange(value) },
-                        label = { Text(label) },
-                        colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = P.accent,
-                            selectedLabelColor = Color.White
-                        )
-                    )
-                }
-            }
-            Spacer(Modifier.height(20.dp))
             }
 
             Row(

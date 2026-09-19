@@ -146,7 +146,7 @@ function seg(slug, key, values, current, labels) {
     `<button data-val="${v}" class="${String(current) === String(v) ? 'on' : ''}" onclick="setField('${slug}','${key}','${v}')">${labels && labels[v] ? labels[v] : v}</button>`).join('')}</span>`;
 }
 
-const BASIC_OPTIONS = ['side', 'profile', 'scale', 'resolution'];
+const BASIC_OPTIONS = ['side', 'profile', 'light_picture', 'scale', 'resolution'];
 
 function optionControl(slug, key, meta, settings, labelMap) {
   if (!meta) return '';
@@ -181,6 +181,8 @@ function settingsForm(t, data) {
   basic += `<div class="field"><label>${opts.side?.label || 'Side'}</label>${optionControl(t.slug, 'side', opts.side, s, {left:'Left',right:'Right',top:'Above',bottom:'Below'})}</div>`;
   basic += `<div class="field"><label>${opts.profile?.label || 'Profile'}</label>${optionControl(t.slug, 'profile', opts.profile, s, {light:'Light',balanced:'Balanced',smooth:'Smooth'})}
     <div></div><div class="hint">${facts.refresh && facts.refresh < 55 ? 'This panel reports ' + fmt(facts.refresh) + ' Hz (E-ink or similar): Light is right.' : 'Balanced is the measured usable mode; Smooth needs a 120 Hz panel.'}</div></div>`;
+  basic += `<div class="field"><label>Light picture</label>${optionControl(t.slug, 'light_picture', opts.light_picture, s, {off:'As on the PC',on:'Light (E-ink)'})}
+    <div></div><div class="hint">${facts.refresh && facts.refresh < 55 ? 'Brightness inverted, hues kept: a dark desktop reads as a light page on E-ink.' : 'Inverts brightness (hues kept); meant for E-ink, where dark surfaces ghost.'}</div></div>`;
   basic += `<div class="field"><label>${opts.scale?.label || 'Scale'}</label>${seg(t.slug, 'scale', ['1','1.25','1.5','2'], s.scale || 1.5)}</div>`;
   basic += `<div class="field"><label>Resolution</label><div class="row">
     <input type="text" placeholder="${panel || 'WIDTHxHEIGHT'}" value="${s.resolution || ''}" data-field="resolution" onchange="setField('${t.slug}','resolution',this.value)" style="width:150px">

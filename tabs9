@@ -382,6 +382,7 @@ EOF_DESKTOP
     echo '              {test-motion [--seconds N]|bench-capture [--seconds N]}'
     echo '  start options: --tablet MODEL  --side left|right|top|bottom'
     echo '                 --profile smooth|balanced|light (120/60/30 fps)'
+    echo '                 --light-picture on|off (brightness inverted for E-ink, hues kept)'
     echo '                 --resolution 2960x1848  --fps 30|60|90|120'
     echo '                 --bitrate 40000  --scale 1.5  --gap 1  --capture-memory va|system|gl'
     echo '                 --scroll natural|standard|off  --scroll-gain 0.2  --gestures on|off'

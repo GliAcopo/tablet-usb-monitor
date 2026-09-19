@@ -927,6 +927,16 @@ def step_consent(c, ready):
                'Answer the dialogs once at the first start.')
 
 
+def dark_desktop():
+    """True when Plasma's colour scheme is a dark one (BreezeDark and friends)."""
+    try:
+        scheme = subprocess.run(['kreadconfig6', '--file', 'kdeglobals', '--group', 'General',
+                                 '--key', 'ColorScheme'], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return 'dark' in scheme.strip().lower()
+
+
 def suggested_command(facts, tablet_label=None):
     """The ./tabs9 start line for this tablet, from what it told us."""
     parts = ['./tabs9', 'start']
@@ -935,6 +945,9 @@ def suggested_command(facts, tablet_label=None):
     refresh = facts.get('refresh') or 0
     if refresh and refresh < 55:
         parts += ['--profile', 'light']           # 30 fps: e-ink and 40 Hz panels
+        if dark_desktop():
+            # A dark Plasma scheme on E-ink: send it upside down, as a light page.
+            parts += ['--light-picture', 'on']
     else:
         parts += ['--profile', 'balanced']        # 60 fps: the measured usable mode
     if facts.get('panel'):

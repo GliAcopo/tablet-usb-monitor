@@ -126,9 +126,9 @@ class TestNoTablets(UITestBase):
         self.assertIsInstance(data['version'], str)
         self.assertGreater(len(data['version']), 0)
 
-    def test_options_all_15_keys(self):
+    def test_options_every_settings_key(self):
         _, data = self.get_json('/api/state')
-        self.assertEqual(len(data['options']), 15)
+        self.assertEqual(list(data["options"]), list(settings_store.OPTIONS))
 
     def test_options_metadata_list_type(self):
         _, data = self.get_json('/api/state')

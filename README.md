@@ -17,7 +17,25 @@ recommended mode. Two tablets:
 | Tablet | Panel | What was verified | Notes |
 |---|---|---|---|
 | **Samsung Galaxy Tab S9 Ultra** | 2960 × 1848, 120 Hz | Everything in this file: 60/120 Hz numbers, touch, pen, gestures, remote control | Every number in [docs/performance.md](docs/performance.md) comes from this pair |
-| **Huawei MatePad Paper** HMW-W09 (HarmonyOS 2.1 = Android 10, Kirin 820E), **E-ink** | 1872 × 1404, 40 Hz | Mirroring and touch, 2026-09-19; both tablets streaming at the same time as two extra monitors | `--profile light` (30 fps); frame rate is irrelevant on E-ink and was not measured. Its HEVC decoder holds frames until the next one arrives (see [Limitations](#limitations)); the host now works around it. Not Samsung, so no S Pen button/air gestures; remote control not tried |
+| **Huawei MatePad Paper** HMW-W09 (HarmonyOS 2.1 = Android 10, Kirin 820E), **E-ink** | 1872 × 1404, 40 Hz | Mirroring, touch, remote control (mouse and keyboard handed over and back), the light picture, 2026-09-19; both tablets streaming at the same time as two extra monitors | `--profile light` (30 fps, held at 28–30 fps with `--light-picture on`); frame rate is irrelevant on E-ink and was not measured further. Its HEVC decoder holds frames until the next one arrives (see [Limitations](#limitations)); the host works around it. Not Samsung, so no S Pen button/air gestures |
+
+## What it looks like
+
+![A dark editor as the desktop shows it, and the same window on the E-ink tablet with the light picture on](docs/eink-light-picture.png)
+
+*Left: a dark window as the desktop shows it. Right: the same window on the
+E-ink tablet with `--light-picture on` — brightness inverted, hues kept, the
+desktop itself untouched (both are screenshots of the tablet; the window is
+a synthetic one drawn for this picture).*
+
+![The app's start screen and its settings sheet, in the light theme an E-ink panel gets by default](docs/app-light-theme.png)
+
+*The app on the E-ink tablet: the screen it shows until the host connects,
+and its settings sheet (Theme: Auto / Light / Dark; Auto picked Light here).*
+
+![The control panel with one tablet streaming](docs/control-panel.png)
+
+*`./tabs9 ui`: one card per tablet, its live figures and every start option.*
 
 ## Requirements
 
@@ -54,8 +72,8 @@ Read this before anything else; the project is hardware-specific.
   negotiates frame rate and bitrate from the host. Two tablets have been
   verified (table above); `./tabs9 setup` reports what yours has.
 - The client APK is debug-signed. `./tabs9 setup` downloads the release
-  tagged with the source's own app version (`v0.2.0` for a checkout whose
-  `android/app/build.gradle.kts` says `versionName = "0.2.0"`), checks the
+  tagged with the source's own app version (`v0.2.2` for a checkout whose
+  `android/app/build.gradle.kts` says `versionName = "0.2.2"`), checks the
   SHA-256 published in the release notes and installs it; the two therefore
   never drift apart. `scripts/build-android.sh` builds the same APK from
   source (downloads a JDK and the Android SDK, ~1 GB) for anyone changing
@@ -66,8 +84,18 @@ Read this before anything else; the project is hardware-specific.
   looks like E-ink — a known model, or a refresh rate of 45 Hz or less, which
   no LCD/OLED tablet reports (the MatePad Paper says 40 Hz; there is no
   Android API that states the panel technology, so this stays a guess you
-  can override). The *mirrored desktop* keeps whatever colours KDE has: for
-  an E-ink tablet, a light Plasma colour scheme is the setting that matters.
+  can override). The Theme row sits at the top of the settings sheet (⚙ in
+  the corner), which scrolls — on a panel as short as the MatePad Paper's
+  in landscape it used to be cut off below the fold.
+- **The mirrored desktop** keeps whatever colours KDE has — unless the host
+  is started with **`--light-picture on`** (the *Light picture* control in
+  the panel), which turns the brightness of every frame upside down before
+  encoding: black backgrounds become white, white text black, and colours
+  keep their hue, so a dark Plasma theme reads as a light page on E-ink
+  without changing the desktop. Only the luma plane is inverted, in Python,
+  between the GPU converter and the encoder (≈5 ms a frame at 1872 × 1404;
+  the E-ink tablet still gets its 30 fps). `./tabs9 setup` suggests it for
+  an E-ink panel when the Plasma colour scheme is a dark one.
 
 The name comes from the first tablet it ran on. The CLI is `./tabs9`, each
 tablet's host runs as the systemd user unit `app-tabs9.<model>.service`
@@ -193,7 +221,9 @@ tablet is silent. The host launches the app on the tablet itself over ADB;
 measured usable mode on the Tab S9 Ultra; `--fps 120` is available and
 reaches 110–113 fps; `--profile light` (30 fps, 15 Mbit/s) is right for
 E-ink and other slow panels. Without `--resolution` the host uses the panel
-size the connected tablet reports.
+size the connected tablet reports. Until the host connects, the app shows
+the start screen in [What it looks like](#what-it-looks-like) — three steps
+and a spinner; the moment the video arrives it is the desktop, edge to edge.
 
 ### The control panel: `./tabs9 ui`
 
@@ -211,8 +241,9 @@ for a one-click panel. One card per attached tablet: its state
 **Stop**, what the tablet is (panel, refresh rate, Android version, whether
 it has a hardware HEVC decoder), live figures while it streams (frames per
 second, frames shown on the tablet, latency, received bit rate, touches),
-its **settings** — which side of the laptop screen, profile, text size,
-resolution, and under *Advanced* every other start option the host takes
+its **settings** — which side of the laptop screen, profile, the light
+picture for E-ink, text size, resolution, and under *Advanced* every other
+start option the host takes
 (frame rate, bitrate, gap, gestures, scrolling and its speed, two-finger
 tap, S Pen button, remote control and its hand-over edge, capture path),
 drawn from the same table `./tabs9 start` validates against, with the
@@ -366,7 +397,10 @@ easy on Windows and impossible on macOS — is worked out in
   times, and zero times on a decoder that outputs at once, such as the Tab
   S9's. `keyframe_replays` in `./tabs9 logs` counts them.
 - **E-ink**: the panel presents a frame in 1–3 s and reports 40 Hz; use
-  `--profile light`. The frame-rate figures in this file do not apply.
+  `--profile light`, and `--light-picture on` if your desktop is dark. The
+  frame-rate figures in this file do not apply. The light picture is only
+  available on the Intel VA paths (`native`, the default, and `va`); the
+  NVIDIA reference paths send the picture as it is and say so.
 - **KDE Plasma Wayland only**, Intel GPU only for the usable path (see
   Requirements).
 - **120 Hz mode delivers 110–113 fps**, not 120: KWin records that many frames
@@ -621,7 +655,7 @@ and `./tabs9 target`).
 
 Coming back is instant: the picture is on the tablet within a third of a
 second of `Meta+Shift+D`, even on a desktop where nothing is moving. Two
-things used to spoil it and are fixed in 0.2.1: the mouse and keyboard the
+things used to spoil it and are fixed in 0.2.2: the mouse and keyboard the
 receiver creates count as a configuration change on Android, which
 recreated the app's activity on its way back and left the old instance's
 connection alive (the host then refused the new one and the tablet
@@ -791,6 +825,9 @@ The laptop panel remains enabled. Windows on the removed output are managed by
 KDE's normal display-disconnection behavior.
 
 `--profile smooth|balanced|light` picks 120/60/30 fps with matching bitrate.
+`--light-picture on|off` (default off) inverts the brightness of what the
+tablet shows, hues kept — a light page for E-ink; `./tabs9 logs` reports
+`light_picture_frames` and the milliseconds it costs per frame.
 Resolution and frame rate are independent: use `--resolution WIDTHxHEIGHT` and
 `--fps 30|60|90|120`; explicit `--fps`/`--bitrate` override the profile. Native
 `2960x1848` remains the default; lower resolutions require an explicit choice.

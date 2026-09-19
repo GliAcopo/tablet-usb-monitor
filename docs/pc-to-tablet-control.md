@@ -136,7 +136,11 @@ not wake a sleeping tablet.
   evdev codes to Android keycodes with a table generated from Android 16's
   `Generic.kl`, injecting with `KeyCharacterMap.VIRTUAL_KEYBOARD`.
 * The greeting's third byte says which path is in use: `u` real devices,
-  `i` injection.
+  `i` injection. Both tested tablets take the real devices: the Tab S9
+  Ultra (Android 16) and the MatePad Paper (Android 10, where the whole
+  cycle — receiver pushed by the host, pointer handed over at the tablet's
+  outer edge, motion delivered, handed back, video back in under a second —
+  was verified on 2026-09-19).
 
 ## The banner
 
