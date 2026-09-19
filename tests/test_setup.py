@@ -45,21 +45,6 @@ class UsbClassification(unittest.TestCase):
         self.assertTrue(devices['6860']['android'] and not devices['6860']['adb'])
 
 
-class AdbStates(unittest.TestCase):
-    def test_parses_states_without_serials(self):
-        output = ('List of devices attached\n'
-                  'TGPYD22718200258       unauthorized usb:3-2 transport_id:1\n'
-                  'R52X1234ABC            device usb:3-4 product:gts9u model:SM_X916B device:gts9u transport_id:2\n')
-        states = setup.adb_states(output)
-        self.assertEqual([s[0] for s in states], ['unauthorized', 'device'])
-        self.assertNotIn('TGPYD22718200258', repr(states))
-        self.assertNotIn('R52X1234ABC', repr(states))
-        self.assertIn('model:SM_X916B', states[1][1])
-
-    def test_empty(self):
-        self.assertEqual(setup.adb_states('List of devices attached\n\n'), [])
-
-
 class InstallerButton(unittest.TestCase):
     DUMP = ('<?xml version="1.0"?><hierarchy>'
             '<node text="Avviso" resource-id="android:id/alertTitle" class="android.widget.TextView" '

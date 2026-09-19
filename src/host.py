@@ -44,6 +44,7 @@ try:
 except (ValueError, ImportError):
     GstAllocators = GstVideo = None
 from native_capture import NativeCapture, NativeCaptureError
+from tablets import TabletChoice, choose, list_tablets
 from websockets.asyncio.server import serve
 from touch_input import LiveKScreenTarget, PortalTouchInput, TouchInputError
 from eis_touch import EisTouch, EisError
@@ -188,8 +189,12 @@ def select_virtual_stream(streams, expected_logical, expected_pixels, virtual_x=
     return candidates[0]
 
 
+# `adb` arguments that address the chosen tablet; `-d` (the only USB device)
+# until --tablet is resolved in main.
+ADB_TARGET = ['-d']
+
 def adb(*args):
-    result = subprocess.run([str(ADB), '-d', *args], capture_output=True, timeout=30)
+    result = subprocess.run([str(ADB), *ADB_TARGET, *args], capture_output=True, timeout=30)
     if result.returncode:
         raise RuntimeError('USB device command failed; check cable and debugging authorization')
     return result.stdout
@@ -205,7 +210,7 @@ def tablet_panel_size():
     first. `wm size` answers in the panel's natural orientation; the app
     always runs in landscape."""
     try:
-        result = subprocess.run([str(ADB), '-d', 'shell', 'wm', 'size'], capture_output=True,
+        result = subprocess.run([str(ADB), *ADB_TARGET, 'shell', 'wm', 'size'], capture_output=True,
                                 text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return None
@@ -262,6 +267,88 @@ def _resolve_mode_size(output):
     if not isinstance(height, (int, float)) or isinstance(height, bool) or height <= 0:
         height = _FALLBACK_MODE_SIZE[1]
     return width, height
+
+
+def _nudge(value, scale):
+    """Smallest v >= value with v * scale a whole device pixel (see below)."""
+    if isinstance(scale, (int, float)) and not isinstance(scale, bool) and scale > 0:
+        for extra in range(4):
+            device = (value + extra) * scale
+            if abs(device - round(device)) < 1e-6:
+                return value + extra
+    return value
+
+
+def _logical_extent(outputs_, previous_names):
+    """(x0, y0, x1, y1, scale) around the enabled previously-known outputs.
+
+    ``scale`` is the scale of the first such output, used to keep a moved
+    output on whole device pixels. None when no usable output exists.
+    """
+    x0 = y0 = None
+    x1 = y1 = 0
+    first_scale = None
+    for o in outputs_:
+        if not isinstance(o, dict) or o.get('name') not in previous_names or not o.get('enabled', False):
+            continue
+        pos = o.get('pos') or {}
+        pos_x, pos_y = pos.get('x', 0), pos.get('y', 0)
+        if not isinstance(pos_x, (int, float)) or isinstance(pos_x, bool):
+            pos_x = 0
+        if not isinstance(pos_y, (int, float)) or isinstance(pos_y, bool):
+            pos_y = 0
+        o_scale = o.get('scale', 1.0) or 1.0
+        if not isinstance(o_scale, (int, float)) or isinstance(o_scale, bool) or o_scale <= 0:
+            o_scale = 1.0
+        if first_scale is None:
+            first_scale = o_scale
+        pixel_w, pixel_h = _resolve_mode_size(o)
+        if _is_rotated_90(o.get('rotation', 1)):
+            pixel_w, pixel_h = pixel_h, pixel_w
+        w, h = round(pixel_w / o_scale), round(pixel_h / o_scale)
+        x0 = pos_x if x0 is None else min(x0, pos_x)
+        y0 = pos_y if y0 is None else min(y0, pos_y)
+        x1, y1 = max(x1, pos_x + w), max(y1, pos_y + h)
+    if x0 is None:
+        return None
+    return (int(x0), int(y0), int(x1), int(y1), first_scale)
+
+
+def compute_layout(current_outputs, previous_names, side='right', gap=1, scale=1.0,
+                   width=0, height=0):
+    """Where the virtual output goes and which physical outputs move for it.
+
+    Returns ((x, y), moves): the virtual output's logical position and a
+    list of (name, x, y) for previously-known outputs that must move, since
+    KDE keeps the layout's top-left corner at (0, 0): a tablet on the LEFT
+    or on TOP sits at the origin and the laptop shifts right/down by the
+    tablet's logical size plus ``gap`` (nudged so the laptop stays on whole
+    device pixels at its own scale). RIGHT and BOTTOM move nothing; see
+    compute_virtual_position for the right-hand rule and the gap.
+    """
+    if side == 'right':
+        return compute_virtual_position(current_outputs, previous_names, gap=gap, scale=scale), []
+    extent = _logical_extent(current_outputs, previous_names)
+    if extent is None:
+        return (0, 0), []
+    x0, y0, x1, y1, laptop_scale = extent
+    gap = max(0, int(gap))
+    logical_w = max(1, round(width / scale)) if width else 0
+    logical_h = max(1, round(height / scale)) if height else 0
+    moves = []
+    if side == 'bottom':
+        y = _nudge(max(0, y1) + gap, scale) if gap else max(0, y1)
+        return (0, y), []
+    shift_x = _nudge(logical_w + gap, laptop_scale) if side == 'left' else 0
+    shift_y = _nudge(logical_h + gap, laptop_scale) if side == 'top' else 0
+    for o in current_outputs:
+        if not isinstance(o, dict) or o.get('name') not in previous_names or not o.get('enabled', False):
+            continue
+        pos = o.get('pos') or {}
+        px = pos.get('x', 0) if isinstance(pos.get('x', 0), (int, float)) else 0
+        py = pos.get('y', 0) if isinstance(pos.get('y', 0), (int, float)) else 0
+        moves.append((o['name'], int(px - x0 + shift_x), int(py - y0 + shift_y)))
+    return (0, 0), moves
 
 
 def compute_virtual_position(current_outputs, previous_names, gap=1, scale=None):
@@ -455,6 +542,7 @@ class Host:
         self.last_report = (time.monotonic(), 0, 0, 0)
         self.caps_reported = None
         self.previous = {o['name'] for o in outputs()}
+        self.moved_outputs = {}     # name -> (x, y) before the host moved it (--side left/top)
         self.virtual_name = None
         self.touch = None
         self.eis = None
@@ -463,10 +551,12 @@ class Host:
         self.reverse_ports = []
         self.ready = threading.Event()
         self.aio = asyncio.new_event_loop()
-        # Status reporting
-        self.status = StatusWriter(STATUS_FILE)
-        # Token persistence
-        self.tokens_file = TOKENS_FILE
+        # Status reporting and token persistence: per instance (one host per
+        # tablet), see the slot allocation in main.
+        self.status = StatusWriter(getattr(args, 'status_file', STATUS_FILE))
+        self.tokens_file = getattr(args, 'tokens_file', TOKENS_FILE)
+        self.port_base = getattr(args, 'port_base', 8890)
+        self.tablet_label = getattr(args, 'tablet_label', 'tablet')
         self._capture_token_used = False
         self._virtual_token_used = False
         self._wrong_source_attempts = 0
@@ -758,7 +848,7 @@ class Host:
         self.fallback_or_stop()
 
     def capture_status(self):
-        message = (f'Capture: {self.memory_mode}; {self.args.width}x{self.args.height}, '
+        message = (f'{getattr(self, "tablet_label", "tablet")} — Capture: {self.memory_mode}; {self.args.width}x{self.args.height}, '
                    f'target {self.args.fps} fps (not measured throughput).')
         if self.memory_mode != self.args.capture_memory:
             message += f' WARNING: fallback from {self.args.capture_memory}; performance may be reduced.'
@@ -1113,10 +1203,17 @@ class Host:
         def configure(*settings):
             subprocess.run(['kscreen-doctor', *settings], capture_output=True, check=True)
         configure(f'output.{name}.addCustomMode.{a.width}.{a.height}.{a.fps * 1000}.reduced')
-        # Place virtual output to the RIGHT of all existing physical outputs
-        x, y = compute_virtual_position(current, self.previous, gap=a.gap, scale=a.scale)
+        # Place the virtual output on the chosen side of the physical outputs;
+        # left/top move them, and the move is undone at exit (see run()).
+        (x, y), moves = compute_layout(current, self.previous, side=a.side, gap=a.gap,
+                                       scale=a.scale, width=a.width, height=a.height)
+        for o in current:
+            if any(o.get('name') == m[0] for m in moves) and o.get('name') not in self.moved_outputs:
+                pos = o.get('pos') or {}
+                self.moved_outputs[o['name']] = (int(pos.get('x', 0)), int(pos.get('y', 0)))
         configure(f'output.{name}.mode.{a.width}x{a.height}@{a.fps}',
-            f'output.{name}.scale.{a.scale}', f'output.{name}.position.{x},{y}', f'output.{name}.enable')
+            f'output.{name}.scale.{a.scale}', f'output.{name}.position.{x},{y}', f'output.{name}.enable',
+            *(f'output.{moved}.position.{mx},{my}' for moved, mx, my in moves))
         final = next(o for o in outputs() if o['name'] == name)
         mode = next(m for m in final['modes'] if m['id'] == final['currentModeId'])
         print('Extended output:', json.dumps({'size': mode['size'], 'Hz': mode['refreshRate'],
@@ -1644,7 +1741,7 @@ class Host:
     def build_remote(self):
         """The remote-control machinery, created on first use."""
         if self.remote_control is None:
-            injector = TabletInjector(adb, str(ADB), port=self.args.remote_port)
+            injector = TabletInjector(adb, [str(ADB), *ADB_TARGET], port=self.args.remote_port)
             capture = InputCapture(self.bus)
             self.remote_control = RemoteControl(injector, capture,
                 panel=self.tablet_panel or (self.args.width, self.args.height),
@@ -2020,8 +2117,8 @@ class Host:
         return False
 
     async def servers(self):
-        async with await asyncio.start_server(self.video, '127.0.0.1', 8890), \
-                   serve(self.control, '127.0.0.1', 8891, max_size=4096):
+        async with await asyncio.start_server(self.video, '127.0.0.1', self.port_base), \
+                   serve(self.control, '127.0.0.1', self.port_base + 1, max_size=4096):
             self.ready.set()
             await asyncio.Future()
 
@@ -2131,8 +2228,10 @@ class Host:
             # is the only signal that the tablet is connected and its input is
             # arriving over USB.
             self.report_timer = GLib.timeout_add_seconds(5, self.report)
-            for port in (8890, 8891):
-                adb('reverse', '--no-rebind', f'tcp:{port}', f'tcp:{port}')
+            # The app always dials 127.0.0.1:8890/8891 on the tablet; each host
+            # instance listens on its own pair here.
+            for offset, port in enumerate((8890, 8891)):
+                adb('reverse', '--no-rebind', f'tcp:{port}', f'tcp:{self.port_base + offset}')
                 self.reverse_ports.append(port)
             adb('shell', 'am', 'start', '-n', 'local.tabs9.usbdisplay/.MainActivity', '--es', 'token', self.token)
             self.create()
@@ -2197,6 +2296,13 @@ class Host:
             for port in self.reverse_ports:
                 with contextlib.suppress(Exception):
                     adb('reverse', '--remove', f'tcp:{port}')
+            if getattr(self, 'moved_outputs', None):
+                # The laptop was shifted to make room on its left/top: put it
+                # back where it was, so the desktop is as before the start.
+                with contextlib.suppress(Exception):
+                    subprocess.run(['kscreen-doctor', *(f'output.{n}.position.{x},{y}'
+                                    for n, (x, y) in self.moved_outputs.items())],
+                                   capture_output=True, timeout=10)
 
 # Presets for `--profile`; explicit --fps/--bitrate still win.  All of them
 # stay on the zero-copy VA path; they only change how much the compositor and
@@ -2216,6 +2322,12 @@ if __name__ == '__main__':
     parser.add_argument('--fps', type=int, choices=[30, 60, 90, 120])
     parser.add_argument('--bitrate', type=int)
     parser.add_argument('--scale', type=float, default=1.5)
+    parser.add_argument('--tablet', default=None, metavar='MODEL',
+                        help='which attached tablet, by model or product name (part of it is '
+                             'enough) when more than one is plugged in; the only one otherwise')
+    parser.add_argument('--side', choices=['left', 'right', 'top', 'bottom'], default='right',
+                        help="which side of this computer's screen the tablet extends (default "
+                             'right; left and top move the laptop screen over for the duration)')
     parser.add_argument('--gap', type=int, default=1, metavar='PX',
                         help='logical pixels left between the laptop and the virtual output '
                              '(default 1: stops windows on the shared edge from painting a '
@@ -2259,14 +2371,24 @@ if __name__ == '__main__':
                         help='tablet pixels per logical pixel of mouse movement while the tablet '
                              "has the input (default 1.0; the tablet's own pointer acceleration "
                              'applies on top)')
-    parser.add_argument('--remote-port', type=int, default=8892, metavar='PORT',
-                        help='local port forwarded to the tablet input receiver (default 8892)')
+    parser.add_argument('--remote-port', type=int, default=None, metavar='PORT',
+                        help='local port forwarded to the tablet input receiver (default: the '
+                             "instance's video port + 2, i.e. 8892 for the first host)")
+    parser.add_argument('--instance', default=None, metavar='NAME',
+                        help='name of this host instance for its status file and lock (default: '
+                             "the tablet's model slug, e.g. sm_x910); one instance per tablet")
     parser.add_argument('--rate-control', choices=['cbr', 'vbr', 'cqp'], default='cbr')
     parser.add_argument('--qp', type=int, default=24)
     args = parser.parse_args()
     # The input-capture and libei modules report through logging; the rest of
     # the host prints. Keep both on stdout, where the journal collects them.
     logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stdout)
+    try:
+        tablet = choose(args.tablet, list_tablets(ADB))
+    except TabletChoice as error:
+        parser.error(str(error))
+    ADB_TARGET[:] = tablet.target()
+    print(f'Tablet: {tablet.label}', flush=True)
     if args.resolution is None:
         args.resolution = tablet_panel_size() or '2960x1848'
         print(f'Resolution: {args.resolution} (from the tablet; --resolution overrides)', flush=True)
@@ -2297,16 +2419,41 @@ if __name__ == '__main__':
         parser.error('--air-threshold must be between 0.05 and 100')
     if not 0.1 <= args.remote_sensitivity <= 10:
         parser.error('--remote-sensitivity must be between 0.1 and 10')
-    if not 1024 <= args.remote_port <= 65535:
+    if args.remote_port is not None and not 1024 <= args.remote_port <= 65535:
         parser.error('--remote-port must be between 1024 and 65535')
     os.umask(0o077)
     state_dir = ROOT / '.local/state'
     state_dir.mkdir(parents=True, exist_ok=True)
-    lock = (state_dir / 'host.lock').open('w')
+    # One host per tablet: the instance lock says "this tablet already has a
+    # host"; the slot lock hands out the listening ports and the portal token
+    # file. Slot 1 keeps the historical names (host.status.json is not one of
+    # them: the status file follows the instance so `tabs9 status` can list
+    # every running tablet).
+    instance = args.instance or tablet.slug
+    args.tablet_label = tablet.label
+    args.status_file = state_dir / f'host-{instance}.status.json'
+    lock = (state_dir / f'host-{instance}.lock').open('w')
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        raise SystemExit('The USB display host is already running')
+        raise SystemExit(f'A host for {tablet.label} is already running')
+    slot_lock = None
+    for slot in range(1, 5):
+        candidate = (state_dir / f'slot-{slot}.lock').open('w')
+        try:
+            fcntl.flock(candidate, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            candidate.close()
+            continue
+        slot_lock = candidate
+        break
+    if slot_lock is None:
+        raise SystemExit('Four hosts are already running; stop one first')
+    args.port_base = 8890 + 4 * (slot - 1)
+    args.tokens_file = TOKENS_FILE if slot == 1 else state_dir / f'portal_tokens-{slot}.json'
+    if args.remote_port is None:
+        args.remote_port = args.port_base + 2
+    print(f'Instance {instance}: slot {slot}, ports {args.port_base}-{args.port_base + 2}', flush=True)
     DBusGMainLoop(set_as_default=True)
     Gst.init(None)
     Host(args).run()

@@ -47,6 +47,11 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL = ROOT / '.local'
+sys.path.insert(0, str(ROOT / 'src'))
+from tablets import Tablet, TabletChoice, choose, list_tablets  # noqa: E402
+
+# `adb` arguments addressing the tablet the tablet steps are working on.
+TARGET = ['-d']
 ADB = LOCAL / 'platform-tools/adb'
 APK = LOCAL / 'artifacts/tab-s9-usb-display-debug.apk'
 APK_NAME = 'tab-s9-usb-display-debug.apk'
@@ -141,7 +146,7 @@ REQUIREMENTS = [
     ('Python GObject bindings (gi)', _has_module('gi'), ['python3-gi'], True),
     ('GStreamer typelib (Gst)', _has_gi('Gst'), ['gir1.2-gstreamer-1.0'], True),
     ('GStreamer video typelib (GstVideo)', _has_typelib('GstVideo'),
-     ['gir1.2-gst-plugins-base-1.0'], True),
+     ['gir1.2-gst-plugins-base-1.0'], 'sysroot'),
     ('Python D-Bus (dbus)', _has_module('dbus'), ['python3-dbus'], True),
     ('Python websockets >= 13', _has_websockets_13, ['python3-websockets'], True),
     ('gst-inspect-1.0 / gst-launch-1.0', _has_command('gst-inspect-1.0'), ['gstreamer1.0-tools'], True),
@@ -325,6 +330,9 @@ def step_packages(c, use_sudo):
     for label, probe, packages, essential in REQUIREMENTS:
         if probe():
             c.ok(label)
+        elif essential == 'sysroot' and shutil.which('apt-get') and shutil.which('dpkg-deb'):
+            # Unpacked under .local/sysroot by the native-helper step, no sudo.
+            c.info(f'{label}: not installed; the native helper step unpacks it under .local/sysroot')
         elif essential:
             c.fail('packages', f'{label}: missing', f'package(s): {" or ".join(packages)}')
             missing_essential.append((label, packages))
@@ -517,21 +525,14 @@ def usb_devices(sysfs=Path('/sys/bus/usb/devices')):
     return devices
 
 
-def adb_states(output=None):
-    """[(state, transport-description)] for every device ADB knows; no serials."""
-    if output is None:
-        output = run([str(ADB), 'devices', '-l'], timeout=30).stdout
-    states = []
-    for line in output.splitlines()[1:]:
-        parts = line.split()
-        if len(parts) >= 2:
-            states.append((parts[1], ' '.join(p for p in parts[2:] if p.startswith(('model:', 'device:')))))
-    return states
+def adb_states():
+    """[(state, label)] for every USB device ADB knows; no serials."""
+    return [(t.state, t.label) for t in list_tablets(ADB) if t.usb]
 
 
 def adb_shell(*args, timeout=30, any_status=False):
     """stdout of a shell command on the tablet ('' on failure unless any_status)."""
-    result = run([str(ADB), '-d', 'shell', *args], timeout=timeout)
+    result = run([str(ADB), *TARGET, 'shell', *args], timeout=timeout)
     return result.stdout.strip() if any_status or result.returncode == 0 else ''
 
 
@@ -589,64 +590,65 @@ AUTHORIZE = [
 ]
 
 
-def step_tablet(c, use_sudo):
-    c.step('Tablet on USB')
+def step_tablet(c, use_sudo, selector=None):
+    """Bus-level checks, then authorization and facts for every attached tablet.
+
+    Returns [(Tablet, facts)] for the tablets that are ready for the app step.
+    """
+    c.step('Tablets on USB')
     if not ADB.is_file():
         c.fail('tablet', 'no ADB yet (step above)', 'Rerun after ADB is in place.')
-        return None
+        return []
 
     def bus_summary():
         return [d for d in usb_devices() if d['android']]
 
-    def adb_summary():
-        return adb_states()
-
     # 1. Is there a tablet on the bus at all?
-    def probe_bus():
-        return bus_summary() or None
-    tablets = probe_bus()
-    if not tablets:
-        tablets = c.wait_for('a tablet on the USB bus', probe_bus, [
-            'No tablet is connected.',
-            '  - Use a USB *data* cable straight into the computer (no hub for the first try).',
-            '    A charging-only cable shows nothing at all here.',
-            '  - Unlock the tablet.',
-            '  - If the tablet is connected and still not listed, try another port or cable.',
-        ])
-        if not tablets:
-            c.fail('tablet', 'no tablet on the USB bus', 'Data cable, direct port, tablet unlocked; then rerun.')
-            return None
-    for t in tablets:
+    tablets_on_bus = bus_summary() or c.wait_for('a tablet on the USB bus', lambda: bus_summary() or None, [
+        'No tablet is connected.',
+        '  - Use a USB *data* cable straight into the computer (no hub for the first try).',
+        '    A charging-only cable shows nothing at all here.',
+        '  - Unlock the tablet.',
+        '  - If the tablet is connected and still not listed, try another port or cable.',
+    ])
+    if not tablets_on_bus:
+        c.fail('tablet', 'no tablet on the USB bus', 'Data cable, direct port, tablet unlocked; then rerun.')
+        return []
+    for t in tablets_on_bus:
         vendor = ANDROID_VENDORS.get(t['vendor'], t['manufacturer'] or f'vendor {t["vendor"]}')
         c.ok(f'{vendor} device "{t["name"] or t["product"]}" at {t["speed"]} Mbit/s, '
              f'{"exposes ADB" if t["adb"] else "no ADB interface"}'
              f'{", MTP/file transfer" if t["mtp"] else ""}')
-        if t['speed'] and int(float(t['speed'])) < 480:
+        speed = int(float(t['speed'] or 0))
+        if 0 < speed < 480:
             c.warn('tablet', f'USB link is {t["speed"]} Mbit/s (USB 1.1)', 'Another cable or port; video needs 480 or more.')
-        elif t['speed'] and int(float(t['speed'])) == 480:
+        elif speed == 480:
             c.info('480 Mbit/s (USB 2): enough for the 30 fps / 15 Mbit profiles; a USB 3 cable and port give 5000.')
 
-    # 2. USB debugging on (ADB interface present)?
+    # 2. USB debugging on (ADB interface present) on at least one of them?
     def probe_adb_iface():
         return [d for d in bus_summary() if d['adb']] or None
-    if not probe_adb_iface():
-        if not c.wait_for('USB debugging enabled (ADB interface on the bus)', probe_adb_iface, DEVELOPER_OPTIONS):
-            c.fail('tablet', 'the tablet does not expose ADB: USB debugging is off or the USB mode is charge-only',
-                   '\n'.join(DEVELOPER_OPTIONS))
-            return None
+    if not probe_adb_iface() and not c.wait_for('USB debugging enabled (ADB interface on the bus)',
+                                                probe_adb_iface, DEVELOPER_OPTIONS):
+        c.fail('tablet', 'no tablet exposes ADB: USB debugging is off or the USB mode is charge-only',
+               '\n'.join(DEVELOPER_OPTIONS))
+        return []
+    without = [d for d in bus_summary() if not d['adb']]
+    if without:
+        c.warn('tablet', f'{len(without)} Android device(s) on the bus without an ADB interface',
+               'USB debugging off or charge-only mode on that one; the others are set up now.')
     c.ok('USB debugging is on (ADB interface present)')
 
-    # 3. Does ADB see it, with permission?
-    states = adb_summary()
-    if not states:
+    # 3. Does ADB see them, with permission?
+    tablets = [t for t in list_tablets(ADB) if t.usb]
+    if not tablets:
         # The kernel re-enumerated the device (suspend/resume, replug) and the
         # server missed it: a restart is enough, and costs nothing.
         run([str(ADB), 'kill-server'], timeout=30)
         run([str(ADB), 'start-server'], timeout=60)
         time.sleep(1)
-        states = adb_summary()
-    if any(s[0] == 'no' or 'no permissions' in s[0] for s in states) or \
-            any('no permissions' in line for line in run([str(ADB), 'devices'], timeout=30).stdout.splitlines()):
+        tablets = [t for t in list_tablets(ADB) if t.usb]
+    if any(t.state == 'no permissions' for t in tablets):
         vendors = sorted({d['vendor'] for d in bus_summary() if d['adb']})
         rule = '\n'.join(f'SUBSYSTEM=="usb", ATTR{{idVendor}}=="{v}", MODE="0660", TAG+="uaccess"' for v in vendors)
         fix = (f'Your user may not open the tablet\'s USB device. Add a udev rule:\n'
@@ -659,55 +661,68 @@ def step_tablet(c, use_sudo):
             subprocess.run(['sudo', 'udevadm', 'trigger'])
             run([str(ADB), 'kill-server'], timeout=30)
             c.info('Rule written. Unplug and replug the tablet.')
-            states = c.wait_for('ADB permission', lambda: [s for s in adb_summary() if 'no' not in s[0]] or None,
-                                ['Unplug and replug the tablet.']) or []
+            tablets = c.wait_for('ADB permission',
+                                 lambda: [t for t in list_tablets(ADB) if t.usb and t.state != 'no permissions'] or None,
+                                 ['Unplug and replug the tablet.']) or []
         else:
             c.fail('tablet', 'ADB has no permission to open the USB device', fix)
-            return None
-    if len(states) > 1:
-        c.fail('tablet', f'{len(states)} devices are attached to ADB; the host talks to exactly one',
-               'Unplug the others (or stop any emulator), then rerun.')
-        return None
+            return []
+    if selector:
+        try:
+            tablets = [choose(selector, tablets)]
+        except TabletChoice as error:
+            c.fail('tablet', str(error), 'Check --tablet against the models listed.')
+            return []
+    if not tablets:
+        c.fail('tablet', 'ADB sees no device although the bus does', 'Unplug and replug the cable, then rerun.')
+        return []
+    c.ok(f'{len(tablets)} tablet(s) attached: ' + ', '.join(t.label for t in tablets))
 
-    # 4. Authorized?
-    def probe_authorized():
-        s = adb_summary()
-        return s if s and s[0][0] == 'device' else None
-    if not probe_authorized():
-        state = states[0][0] if states else 'absent'
-        guidance = AUTHORIZE if state == 'unauthorized' else [
-            f'ADB reports the tablet as "{state}".',
-            '  offline: unplug and replug the cable; if it stays offline, toggle USB debugging off and on.',
-            '  absent: the ADB server sees no device although the bus does; replug the cable.',
-        ]
-        if not c.wait_for('USB debugging authorized', probe_authorized, guidance):
-            c.fail('tablet', f'ADB state is "{state}", not "device"', '\n'.join(guidance))
-            return None
-    c.ok('one tablet authorized for USB debugging')
-
-    # 5. What is it?
-    facts = tablet_facts()
-    if not facts.get('model'):
-        c.warn('tablet', 'the tablet answered ADB but not `getprop`', 'Odd; try replugging. The host may still work.')
-        return facts
-    c.ok(f'{facts["manufacturer"]} {facts["model"]}, Android {facts["android"]} (API {facts["sdk"]})')
-    if facts.get('sdk', 0) and facts['sdk'] < 27:
-        c.fail('tablet', 'Android 8.1 (API 27) or newer is required by the app', 'This tablet is too old for the client.')
-    if facts.get('panel'):
-        w, h = facts['panel']
-        c.ok(f'panel {w}x{h} (landscape), density {facts.get("density", "?")} dpi'
-             + (f', reports up to {facts["refresh"]:.0f} Hz' if facts.get('refresh') else ''))
-    else:
-        c.warn('tablet', '`wm size` gave no panel size', 'Pass --resolution WIDTHxHEIGHT to ./tabs9 start yourself.')
-    if facts['hevc_hw']:
-        c.ok(f'hardware HEVC decoder: {", ".join(facts["hevc_hw"])}')
-    elif facts['hevc_decoders']:
-        c.warn('tablet', f'only software HEVC decoders listed ({", ".join(facts["hevc_decoders"])})',
-               'Expect a low frame rate and a warm tablet; the picture should still appear.')
-    else:
-        c.warn('tablet', 'no HEVC decoder found in the tablet\'s media_codecs*.xml',
-               'The app needs one; if the picture never appears, this is why.')
-    return facts
+    # 4. Each one: authorized, then what it is.
+    ready = []
+    for tablet in tablets:
+        print(f'\n  -- {tablet.label} --')
+        def probe_authorized(serial=tablet.serial):
+            return next((t for t in list_tablets(ADB) if t.serial == serial and t.state == 'device'), None)
+        current = probe_authorized()
+        if current is None:
+            state = next((t.state for t in list_tablets(ADB) if t.serial == tablet.serial), 'absent')
+            guidance = AUTHORIZE if state == 'unauthorized' else [
+                f'ADB reports {tablet.label} as "{state}".',
+                '  offline: unplug and replug the cable; if it stays offline, toggle USB debugging off and on.',
+                '  absent: the ADB server sees no device although the bus does; replug the cable.',
+            ]
+            current = c.wait_for(f'{tablet.label} authorized for USB debugging', probe_authorized, guidance)
+            if current is None:
+                c.fail('tablet', f'{tablet.label}: ADB state is "{state}", not "device"', '\n'.join(guidance))
+                continue
+        c.ok(f'{tablet.label}: authorized for USB debugging')
+        TARGET[:] = tablet.target()
+        facts = tablet_facts()
+        if not facts.get('model'):
+            c.warn('tablet', f'{tablet.label} answered ADB but not `getprop`', 'Odd; try replugging. The host may still work.')
+            ready.append((tablet, facts))
+            continue
+        c.ok(f'{facts["manufacturer"]} {facts["model"]}, Android {facts["android"]} (API {facts["sdk"]})')
+        if facts.get('sdk', 0) and facts['sdk'] < 27:
+            c.fail('tablet', f'{tablet.label}: Android 8.1 (API 27) or newer is required by the app',
+                   'This tablet is too old for the client.')
+        if facts.get('panel'):
+            w, h = facts['panel']
+            c.ok(f'panel {w}x{h} (landscape), density {facts.get("density", "?")} dpi'
+                 + (f', reports up to {facts["refresh"]:.0f} Hz' if facts.get('refresh') else ''))
+        else:
+            c.warn('tablet', '`wm size` gave no panel size', 'Pass --resolution WIDTHxHEIGHT to ./tabs9 start yourself.')
+        if facts['hevc_hw']:
+            c.ok(f'hardware HEVC decoder: {", ".join(facts["hevc_hw"])}')
+        elif facts['hevc_decoders']:
+            c.warn('tablet', f'only software HEVC decoders listed ({", ".join(facts["hevc_decoders"])})',
+                   'Expect a low frame rate and a warm tablet; the picture should still appear.')
+        else:
+            c.warn('tablet', 'no HEVC decoder found in the tablet\'s media_codecs*.xml',
+                   'The app needs one; if the picture never appears, this is why.')
+        ready.append((tablet, facts))
+    return ready
 
 
 # --- the app -----------------------------------------------------------------
@@ -783,7 +798,7 @@ def install_apk(c, local_sha):
     and the positive button is tapped whenever the installer is in front,
     until the package on the tablet is this file.
     """
-    process = subprocess.Popen([str(ADB), '-d', 'install', '-r', str(APK)],
+    process = subprocess.Popen([str(ADB), *TARGET, 'install', '-r', str(APK)],
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     deadline = time.monotonic() + 300
     tapped = []
@@ -819,8 +834,8 @@ def install_apk(c, local_sha):
     return False
 
 
-def step_app(c, tablet_ready):
-    c.step('Client app on the tablet')
+def step_app(c, ready):
+    c.step('Client app on the tablet(s)')
     if APK.is_file():
         c.ok(f'{APK.relative_to(ROOT)} ({sha256_of(APK)[:12]}...)')
     elif not c.interactive:
@@ -839,25 +854,32 @@ def step_app(c, tablet_ready):
                 c.fail('app', f'download failed: {error}', 'Check the network, or build with scripts/build-android.sh.')
         else:
             c.fail('app', 'no client APK', 'scripts/build-android.sh, or download the release APK into .local/artifacts/.')
-    if not APK.is_file() or not tablet_ready:
-        if tablet_ready is None:
-            c.info('tablet not ready: install skipped')
+    if not APK.is_file() or not ready:
+        if not ready:
+            c.info('no tablet ready: install skipped')
         return
     local_sha = sha256_of(APK)
+    for tablet, _ in ready:
+        TARGET[:] = tablet.target()
+        install_on(c, tablet, local_sha)
+
+
+def install_on(c, tablet, local_sha):
     on_device = installed_apk_sha()
     if on_device == local_sha:
-        c.ok('the tablet runs exactly this APK')
+        c.ok(f'{tablet.label} runs exactly this APK')
         return
     what = 'not installed' if on_device is None else 'a different build is installed'
+    fix = f'./tabs9 setup --tablet {tablet.model or tablet.label} installs it (and answers the tablet\'s prompts).'
     if not c.interactive:
-        c.fail('app', f'client {what}', f'{ADB.relative_to(ROOT)} -d install -r {APK.relative_to(ROOT)}')
+        c.fail('app', f'{tablet.label}: client {what}', fix)
         return
-    if not c.ask(f'Client {what}. Install it over ADB now?'):
-        c.fail('app', f'client {what}', f'{ADB.relative_to(ROOT)} -d install -r {APK.relative_to(ROOT)}')
+    if not c.ask(f'{tablet.label}: client {what}. Install it over ADB now?'):
+        c.fail('app', f'{tablet.label}: client {what}', fix)
         return
     if not install_apk(c, local_sha):
         return
-    c.ok('client installed')
+    c.ok(f'{tablet.label}: client installed')
 
 
 def step_consent(c):
@@ -883,9 +905,11 @@ def step_consent(c):
     c.warn('consent', f'{"no" if not have else "one"} restore token stored yet', 'Answer the dialogs once at the first start.')
 
 
-def suggested_command(facts):
+def suggested_command(facts, tablet_label=None):
     """The ./tabs9 start line for this tablet, from what it told us."""
     parts = ['./tabs9', 'start']
+    if tablet_label:
+        parts += ['--tablet', tablet_label.split()[0]]
     refresh = facts.get('refresh') or 0
     if refresh and refresh < 55:
         parts += ['--profile', 'light']           # 30 fps: e-ink and 40 Hz panels
@@ -899,7 +923,7 @@ def suggested_command(facts):
     return ' '.join(parts)
 
 
-def summary(c, facts, start):
+def summary(c, ready, start):
     print('\n' + '=' * 64)
     if c.problems:
         print(f'NOT READY: {len(c.problems)} problem(s) block a start')
@@ -912,13 +936,16 @@ def summary(c, facts, start):
     print('READY' + (f' with {len(c.warnings)} warning(s)' if c.warnings else ''))
     for step, what, _ in c.warnings:
         print(f'  - [{step}] {what}')
-    command = suggested_command(facts or {})
+    commands = [suggested_command(facts, tablet.label if len(ready) > 1 else None) for tablet, facts in ready] \
+        or [suggested_command({})]
     print('\nStart the display with:\n')
-    print(f'    {command}\n')
-    print('Then ./tabs9 status, ./tabs9 logs, ./tabs9 stop. The app opens on the tablet by itself.')
+    for tablet_command in commands:
+        print(f'    {tablet_command}')
+    print('\nThen ./tabs9 status, ./tabs9 logs, ./tabs9 stop. The app opens on the tablet by itself;')
+    print('./tabs9 ui opens a control panel in your browser, where these settings are remembered per tablet.')
     if start and c.interactive:
         print()
-        return subprocess.run(command.split(), cwd=ROOT).returncode
+        return subprocess.run(commands[0].split(), cwd=ROOT).returncode
     return 0
 
 
@@ -941,7 +968,9 @@ def quick_check():
     check('Local ADB', ADB.is_file())
     if ADB.is_file():
         states = adb_states()
-        check('One authorized USB tablet', len(states) == 1 and states[0][0] == 'device')
+        authorized = [s for s in states if s[0] == 'device']
+        check('An authorized USB tablet' + (f' ({len(authorized)} attached: pick one with --tablet)'
+                                             if len(authorized) > 1 else ''), len(authorized) >= 1)
     wl_copy = shutil.which('wl-copy') or LOCAL / 'sysroot/usr/bin/wl-copy'
     print(f'wl-copy (tablet clipboard to PC, optional): '
           f'{"ready" if Path(wl_copy).is_file() else "missing: run scripts/setup-native.sh"}')
@@ -959,6 +988,7 @@ def main(argv=None):
     parser.add_argument('--yes', '-y', action='store_true', help='accept every fix without asking')
     parser.add_argument('--no-sudo', action='store_true', help='never call sudo; print the commands instead')
     parser.add_argument('--start', action='store_true', help='start the display when everything is ready')
+    parser.add_argument('--tablet', default=None, metavar='MODEL', help='only this attached tablet (model or part of it)')
     args = parser.parse_args(argv)
     if args.check:
         return quick_check()
@@ -974,10 +1004,10 @@ def main(argv=None):
     step_gpu(c, use_sudo)
     have_adb = step_adb(c)
     step_native_helper(c)
-    facts = step_tablet(c, use_sudo) if have_adb else None
-    step_app(c, facts if facts and facts.get('model') else (None if not facts else facts))
+    ready = step_tablet(c, use_sudo, args.tablet) if have_adb else []
+    step_app(c, ready)
     step_consent(c)
-    return summary(c, facts, args.start)
+    return summary(c, ready, args.start)
 
 
 if __name__ == '__main__':

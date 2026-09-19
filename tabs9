@@ -1,8 +1,54 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$(realpath "$0")")"
-unit=${TABS9_UNIT:-tab-s9-usb-display.service}
-status_file=${TABS9_STATUS_FILE:-.local/state/host.status.json}
+# One host, one systemd user unit and one status file per tablet:
+# tabs9-<slug>.service and .local/state/host-<slug>.status.json, where the
+# slug is the tablet's model (sm_x910, hmw_w09). TABS9_UNIT/TABS9_STATUS_FILE
+# pin a single unit instead (tests, and the pre-multi-tablet layout).
+unit=${TABS9_UNIT:-}
+status_file=${TABS9_STATUS_FILE:-}
+legacy_unit=tab-s9-usb-display.service
+
+# The value of --tablet in "$@" (or --tablet=X), else empty.
+tablet_arg() {
+  local previous=''
+  for word in "$@"; do
+    if [[ "$previous" == '--tablet' ]]; then printf '%s' "$word"; return; fi
+    if [[ "$word" == --tablet=* ]]; then printf '%s' "${word#--tablet=}"; return; fi
+    previous=$word
+  done
+}
+
+# Sets unit/status_file/label for the tablet named by --tablet (or the only
+# one attached). Prints the reason and exits 1 when that is not exactly one.
+pick_tablet() {
+  local line
+  selector=$(tablet_arg "$@")
+  if [[ -n "$unit" ]]; then
+    status_file=${status_file:-.local/state/host.status.json}
+    label=${TABS9_LABEL:-tablet}
+    return 0
+  fi
+  if ! line=$(python3 src/tablets.py choose ${selector:+--tablet "$selector"}); then
+    exit 1
+  fi
+  slug=${line%%$'\t'*}
+  label=${line#*$'\t'}
+  unit="tabs9-$slug.service"
+  status_file=".local/state/host-$slug.status.json"
+}
+
+# Every instance known to systemd or by a status file: "slug" per line.
+all_instances() {
+  {
+    systemctl --user list-units --all --plain --no-legend 'tabs9-*.service' 2>/dev/null \
+      | awk '{print $1}' | sed -e 's/^tabs9-//' -e 's/\.service$//'
+    for f in .local/state/host-*.status.json; do
+      [[ -f "$f" ]] || continue
+      f=${f##*/host-}; printf '%s\n' "${f%.status.json}"
+    done
+  } | sort -u
+}
 
 # Prints "phase<US>message<US>stale" for status_file, cross-checked against
 # the unit's MainPID (pass "" when the unit is not active) via
@@ -44,16 +90,23 @@ case "${1:-help}" in
   doctor) shift; exec python3 scripts/setup.py --doctor "$@" ;;
   start)
     shift
+    pick_tablet "$@"
     if systemctl --user is-active --quiet "$unit"; then
-      echo 'USB display is already running.'
+      echo "$label is already running."
       exit 0
     fi
     python3 scripts/setup.py --check
     # Clear stale status before starting
     rm -f "$status_file"
+    # Settings remembered for this tablet (./tabs9 ui) go first: what is typed
+    # here still wins, argparse keeps the last occurrence of an option.
+    saved=()
+    if [[ -z "${TABS9_UNIT:-}" ]]; then
+      while IFS= read -r word; do saved+=("$word"); done < <(python3 src/settings.py args ${selector:+--tablet "$selector"})
+    fi
     systemd-run --user --quiet --collect --unit="$unit" \
       --property=Type=exec --property=TimeoutStopSec=10 --property=KillMode=mixed \
-      --working-directory="$PWD" /usr/bin/python3 -u "$PWD/src/host.py" "$@"
+      --working-directory="$PWD" /usr/bin/python3 -u "$PWD/src/host.py" "${saved[@]}" "$@"
     # Wait for the host to report its actual state (bounded timeout)
     echo 'Waiting for host to initialize...'
     timeout=60
@@ -65,7 +118,7 @@ case "${1:-help}" in
       if ! systemctl --user is-active --quiet "$unit" 2>/dev/null; then
         IFS=$'\x1f' read -r phase msg _ < <(status_line "")
         if [[ "$phase" == "failed" ]]; then
-          echo "✗ USB display failed: $msg"
+          echo "✗ $label failed: $msg"
         elif [[ "$phase" == "stopped" ]]; then
           echo "✗ USB display stopped: $msg"
         else
@@ -83,7 +136,7 @@ case "${1:-help}" in
           # Re-check liveness immediately before declaring success, closing
           # the window between the read above and this line.
           if systemctl --user is-active --quiet "$unit" 2>/dev/null; then
-            echo '✓ USB display is streaming.'
+            echo "✓ $label is streaming."
             if [[ -n "$msg" ]]; then
               echo "  $msg"
             fi
@@ -91,7 +144,7 @@ case "${1:-help}" in
           fi
           ;;
         failed)
-          echo "✗ USB display failed to start: $msg"
+          echo "✗ $label failed to start: $msg"
           exit 1
           ;;
         stopped)
@@ -127,12 +180,41 @@ case "${1:-help}" in
     exit 2
     ;;
   stop)
-    if systemctl --user is-active --quiet "$unit"; then
-      systemctl --user stop "$unit"
+    shift
+    if [[ -n "$unit" || -n "$(tablet_arg "$@")" ]]; then
+      pick_tablet "$@"
+      units=("$unit")
+    else
+      units=("$legacy_unit")
+      while read -r slug; do [[ -n "$slug" ]] && units+=("tabs9-$slug.service"); done < <(all_instances)
     fi
-    echo 'USB display stopped.'
+    stopped=0
+    for u in "${units[@]}"; do
+      if systemctl --user is-active --quiet "$u"; then
+        systemctl --user stop "$u"
+        echo "stopped ${u#tabs9-}" | sed 's/\.service$//'
+        stopped=1
+      fi
+    done
+    (( stopped )) || echo 'No tablet display was running.'
     ;;
   status)
+    if [[ -z "$unit" ]]; then
+      shift
+      found=0
+      while read -r slug; do
+        [[ -n "$slug" ]] || continue
+        found=1
+        TABS9_UNIT="tabs9-$slug.service" TABS9_STATUS_FILE=".local/state/host-$slug.status.json" \
+          TABS9_LABEL="$slug" "$0" status | sed "s/^USB display service/$slug/"
+      done < <(all_instances)
+      if systemctl --user is-active --quiet "$legacy_unit"; then
+        found=1
+        TABS9_UNIT="$legacy_unit" TABS9_STATUS_FILE=.local/state/host.status.json "$0" status
+      fi
+      (( found )) || echo 'No tablet display is running (nothing started yet).'
+      exit 0
+    fi
     if systemctl --user is-active --quiet "$unit"; then
       pid=$(unit_main_pid)
       IFS=$'\x1f' read -r phase msg stale < <(status_line "$pid")
@@ -157,7 +239,15 @@ case "${1:-help}" in
       fi
     fi
     ;;
-  logs) journalctl --user -u "$unit" --no-pager -n 30 -o cat ;;
+  logs)
+    shift
+    if [[ -n "$unit" || -n "$(tablet_arg "$@")" ]]; then
+      pick_tablet "$@"
+      journalctl --user -u "$unit" --no-pager -n 30 -o cat
+    else
+      journalctl --user -u 'tabs9-*' -u "$legacy_unit" --no-pager -n 40 -o cat
+    fi
+    ;;
   pin-desktop)
     # Keep windows on the tablet output visible on every virtual desktop.
     case "${2:-}" in
@@ -196,17 +286,21 @@ case "${1:-help}" in
       *) echo 'Usage: ./tabs9 pin-desktop on|off|status'; exit 1 ;;
     esac
     ;;
+  ui) shift; exec python3 src/ui.py --open "$@" ;;
   pen-actions) shift; exec python3 scripts/kde-actions.py "$@" ;;
   shortcuts) shift; exec python3 scripts/kde-actions.py --list "$@" ;;
   test-motion) shift; exec python3 scripts/motion-test.py "$@" ;;
   bench-capture) shift; exec python3 scripts/capture_ab.py "$@" ;;
   *)
-    echo 'Usage: ./tabs9 {setup [--yes] [--no-sudo] [--start]|doctor|start [options]|stop|status|logs|pin-desktop on|off}'
+    echo 'Usage: ./tabs9 {setup [--yes] [--no-sudo] [--start]|doctor|start [options]|stop|status|logs|ui|pin-desktop on|off}'
+    echo '  One host per tablet: start/stop/logs take --tablet MODEL when more than one is attached;'
+    echo '  status and stop without it cover every tablet. ui opens the control panel in the browser.'
     echo '  setup walks through every requirement and fixes what it can (asks before sudo);'
     echo '  doctor runs the same checks read-only and prints the fix for each failure.'
     echo '              {pen-actions [gesture target]|shortcuts [component]}'
     echo '              {test-motion [--seconds N]|bench-capture [--seconds N]}'
-    echo '  start options: --profile smooth|balanced|light (120/60/30 fps)'
+    echo '  start options: --tablet MODEL  --side left|right|top|bottom'
+    echo '                 --profile smooth|balanced|light (120/60/30 fps)'
     echo '                 --resolution 2960x1848  --fps 30|60|90|120'
     echo '                 --bitrate 40000  --scale 1.5  --gap 1  --capture-memory va|system|gl'
     echo '                 --scroll natural|standard|off  --scroll-gain 0.2  --gestures on|off'

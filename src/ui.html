@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tabs9</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --card: #ffffff; --text: #1c1f26; --muted: #6b7280; --line: #e3e6eb;
+    --accent: #2f6fed; --accent-text: #ffffff; --ok: #1f9d55; --warn: #d97706; --bad: #dc2626;
+    --pill: #eef1f6; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14161b; --card: #1d2027; --text: #e8eaf0; --muted: #9aa3b2; --line: #2b3040;
+            --accent: #5b8cff; --pill: #262a35; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, sans-serif; }
+  header { display: flex; align-items: center; gap: 14px; padding: 18px 24px; border-bottom: 1px solid var(--line);
+           background: var(--card); position: sticky; top: 0; z-index: 2; }
+  header h1 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: .2px; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  header .spacer { flex: 1; }
+  main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 60px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 18px; }
+  @media (max-width: 480px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px; }
+  .card h2 { margin: 0; font-size: 17px; font-weight: 650; }
+  .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+          background: var(--pill); font-size: 12.5px; font-weight: 600; color: var(--muted); }
+  .pill::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+  .pill.ok { color: var(--ok); } .pill.warn { color: var(--warn); } .pill.bad { color: var(--bad); }
+  .pill.busy::before { animation: blink 1s infinite; }
+  @keyframes blink { 50% { opacity: .2; } }
+  button { font: inherit; border-radius: 10px; border: 1px solid var(--line); background: var(--card);
+           color: var(--text); padding: 8px 14px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: transparent; font-weight: 600;
+                   padding: 10px 20px; font-size: 15px; }
+  button.danger { color: var(--bad); }
+  button:disabled { opacity: .5; cursor: default; }
+  .facts { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px 14px; margin: 14px 0 4px; }
+  .fact .k { color: var(--muted); font-size: 12px; } .fact .v { font-weight: 600; font-size: 14px; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 10px; margin-top: 12px; }
+  .stat { background: var(--pill); border-radius: 10px; padding: 8px 10px; }
+  .stat .k { color: var(--muted); font-size: 11.5px; } .stat .v { font-size: 18px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  fieldset { border: 0; padding: 0; margin: 16px 0 0; }
+  legend { font-weight: 650; font-size: 14px; margin-bottom: 8px; padding: 0; }
+  .field { display: grid; grid-template-columns: 170px 1fr; align-items: center; gap: 8px; margin: 6px 0; }
+  .field label { color: var(--muted); font-size: 13px; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .seg button { border: 0; border-radius: 0; padding: 6px 12px; background: transparent; white-space: nowrap; }
+  .seg button.on { background: var(--accent); color: var(--accent-text); }
+  select, input[type=text], input[type=number] { font: inherit; padding: 6px 8px; border-radius: 8px;
+      border: 1px solid var(--line); background: var(--bg); color: var(--text); max-width: 220px; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-top: 10px; }
+  pre { background: var(--pill); border-radius: 10px; padding: 12px; font: 12.5px/1.4 var(--mono);
+        overflow: auto; max-height: 340px; white-space: pre-wrap; }
+  .note { color: var(--muted); font-size: 13px; }
+  .empty { text-align: center; padding: 40px 20px; }
+  .empty ol { text-align: left; display: inline-block; }
+  .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg);
+           padding: 10px 16px; border-radius: 10px; font-size: 13.5px; opacity: 0; transition: opacity .2s; pointer-events: none; }
+  .toast.show { opacity: 1; }
+  .hint { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>tabs9</h1>
+    <div class="sub">Your tablet as a second screen, over USB</div>
+  </div>
+  <div class="spacer"></div>
+  <span id="panel-state" class="pill">connecting…</span>
+  <button id="doctor-btn" title="Check this computer and the tablets, read-only">Run doctor</button>
+</header>
+<main>
+  <div id="tablets" class="grid"></div>
+  <section id="doctor" class="card" style="display:none; margin-top:18px">
+    <div class="row"><h2>Doctor</h2><div class="spacer" style="flex:1"></div>
+      <button onclick="document.getElementById('doctor').style.display='none'">Close</button></div>
+    <p class="note">The same checks as <code>./tabs9 doctor</code>: what is missing and the fix for each item.
+      To install or repair, run <code>./tabs9 setup</code> in a terminal (it asks before using sudo).</p>
+    <pre id="doctor-out">…</pre>
+  </section>
+  <p class="note" style="margin-top:28px">Settings are saved per tablet in <code>.local/state/settings.json</code>
+    and used by <code>./tabs9 start</code> too. This page is served to this computer only.</p>
+</main>
+<div id="toast" class="toast"></div>
+
+<script>
+const $ = (sel, el = document) => el.querySelector(sel);
+const state = { data: null, editing: {}, logsOpen: {}, busy: {} };
+
+const PHASE = {
+  stopped:  ['Stopped', ''],
+  starting: ['Starting…', 'warn busy'],
+  waiting_virtual_consent: ['Waiting for the KDE dialog', 'warn busy'],
+  waiting_capture_consent: ['Waiting for the KDE dialog', 'warn busy'],
+  streaming: ['Streaming', 'ok'],
+  failed:   ['Failed', 'bad'],
+};
+
+async function api(path, body) {
+  const opts = body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'tabs9' }, body: JSON.stringify(body) };
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
+  return r.headers.get('content-type')?.includes('json') ? r.json() : r.text();
+}
+
+function toast(text) {
+  const t = $('#toast'); t.textContent = text; t.classList.add('show');
+  clearTimeout(toast.h); toast.h = setTimeout(() => t.classList.remove('show'), 2600);
+}
+
+function fmt(v, digits = 0, suffix = '') {
+  if (v === null || v === undefined || Number.isNaN(v)) return '—';
+  return (typeof v === 'number' ? v.toFixed(digits) : v) + suffix;
+}
+
+function title(t) {
+  const f = t.facts || {};
+  if (f.manufacturer && f.model) {
+    const m = f.manufacturer.toLowerCase();
+    return m.charAt(0).toUpperCase() + m.slice(1) + ' ' + f.model;
+  }
+  return t.label;
+}
+
+function pill(phase, tabletState) {
+  if (tabletState !== 'device') return `<span class="pill warn">${tabletState === 'unauthorized' ? 'Allow USB debugging on the tablet' : tabletState}</span>`;
+  const [text, cls] = PHASE[phase] || [phase || 'Stopped', ''];
+  return `<span class="pill ${cls}">${text}</span>`;
+}
+
+function seg(slug, key, values, current, labels) {
+  return `<span class="seg">${values.map(v =>
+    `<button class="${String(current) === String(v) ? 'on' : ''}" onclick="setField('${slug}','${key}','${v}')">${labels ? labels[v] : v}</button>`).join('')}</span>`;
+}
+
+function settingsForm(t) {
+  const s = Object.assign({}, t.settings, state.editing[t.slug] || {});
+  const facts = t.facts || {};
+  const panel = facts.panel ? `${facts.panel[0]}x${facts.panel[1]}` : '';
+  return `
+  <fieldset>
+    <legend>Settings for this tablet</legend>
+    <div class="field"><label>Side of the laptop screen</label>${seg(t.slug, 'side', ['left','right','top','bottom'], s.side || 'right', {left:'Left',right:'Right',top:'Above',bottom:'Below'})}</div>
+    <div class="field"><label>Profile</label>${seg(t.slug, 'profile', ['light','balanced','smooth'], s.profile || (facts.refresh && facts.refresh < 55 ? 'light' : 'balanced'), {light:'Light · 30 fps',balanced:'Balanced · 60 fps',smooth:'Smooth · 120 fps'})}
+      <div></div><div class="hint">${facts.refresh && facts.refresh < 55 ? 'This panel reports ' + fmt(facts.refresh) + ' Hz (E-ink or similar): Light is right.' : 'Balanced is the measured usable mode; Smooth needs a 120 Hz panel.'}</div></div>
+    <div class="field"><label>Text size (scale)</label>${seg(t.slug, 'scale', ['1','1.25','1.5','2'], s.scale || 1.5)}</div>
+    <div class="field"><label>Resolution</label><div class="row">
+      <input type="text" placeholder="${panel || 'WIDTHxHEIGHT'}" value="${s.resolution || ''}" onchange="setField('${t.slug}','resolution',this.value)" style="width:150px">
+      <span class="hint">empty = the tablet's own panel${panel ? ' (' + panel + ')' : ''}</span></div></div>
+    <details><summary>Advanced</summary>
+      <div class="field"><label>Frame rate</label>${seg(t.slug, 'fps', ['', '30','60','90','120'], s.fps || '', {'':'profile',30:'30',60:'60',90:'90',120:'120'})}</div>
+      <div class="field"><label>Bitrate (kbit/s)</label><input type="number" min="1000" max="150000" step="1000" value="${s.bitrate || ''}" placeholder="profile" onchange="setField('${t.slug}','bitrate',this.value)"></div>
+      <div class="field"><label>Gap next to the laptop (px)</label><input type="number" min="0" max="64" value="${s.gap ?? ''}" placeholder="1" onchange="setField('${t.slug}','gap',this.value)"></div>
+      <div class="field"><label>Three/four-finger swipes</label>${seg(t.slug, 'gestures', ['on','off'], s.gestures || 'on')}</div>
+      <div class="field"><label>Two-finger scrolling</label>${seg(t.slug, 'scroll', ['natural','standard','off'], s.scroll || 'natural')}</div>
+      <div class="field"><label>Two-finger tap</label>${seg(t.slug, 'two_finger_tap', ['right-click','off'], s.two_finger_tap || 'right-click', {'right-click':'right click', off:'off'})}</div>
+      <div class="field"><label>S Pen button (Samsung)</label>${seg(t.slug, 'pen_button', ['actions','launcher','off'], s.pen_button || (facts.manufacturer && facts.manufacturer.toLowerCase() === 'samsung' ? 'actions' : 'off'))}</div>
+      <div class="field"><label>Remote-control shortcuts</label>${seg(t.slug, 'remote', ['on','off'], s.remote || 'on')}</div>
+      <div class="field"><label>Capture path</label>${seg(t.slug, 'capture_memory', ['native','va','system'], s.capture_memory || 'native')}</div>
+    </details>
+    <div class="row" style="margin-top:12px">
+      <button class="primary" onclick="saveSettings('${t.slug}')">Save</button>
+      ${t.running ? `<button onclick="saveSettings('${t.slug}', true)">Save and restart</button>` : ''}
+      <span class="hint">${state.editing[t.slug] ? 'unsaved changes' : 'saved'}</span>
+    </div>
+  </fieldset>`;
+}
+
+function card(t) {
+  const f = t.facts || {};
+  const st = t.stats || {};
+  const tab = st.tablet || {};
+  const streaming = t.phase === 'streaming';
+  const canStart = t.state === 'device' && !t.running && !state.busy[t.slug];
+  return `<article class="card" id="card-${t.slug}">
+    <div class="row">
+      <h2>${title(t)}</h2>
+      ${pill(t.phase, t.state)}
+      <div style="flex:1"></div>
+      ${t.running
+        ? `<button class="danger" onclick="stopTablet('${t.slug}')">Stop</button>`
+        : `<button class="primary" ${canStart ? '' : 'disabled'} onclick="startTablet('${t.slug}')">Start</button>`}
+    </div>
+    ${t.message && t.phase !== 'streaming' ? `<div class="hint" style="margin-top:8px">${t.message}</div>` : ''}
+    ${t.phase && t.phase.startsWith('waiting') ? `<div class="hint" style="margin-top:8px">Two KDE dialogs appear the first time: "Share virtual screen" → Share, then the remote-control approval → Allow. Keep "Allow restoring on future sessions" ticked and they never come back.</div>` : ''}
+    <div class="facts">
+      <div class="fact"><div class="k">Panel</div><div class="v">${f.panel ? f.panel[0] + ' × ' + f.panel[1] : '—'}${f.refresh ? ' · ' + fmt(f.refresh) + ' Hz' : ''}</div></div>
+      <div class="fact"><div class="k">Android</div><div class="v">${f.android ? f.android + ' (API ' + f.sdk + ')' : '—'}</div></div>
+      <div class="fact"><div class="k">Video decoder</div><div class="v">${f.hevc_hw && f.hevc_hw.length ? 'HEVC, hardware' : (f.hevc_hw ? 'software only' : '—')}</div></div>
+      <div class="fact"><div class="k">Density</div><div class="v">${f.density ? f.density + ' dpi' : '—'}</div></div>
+    </div>
+    ${streaming ? `<div class="stats">
+      <div class="stat"><div class="k">Frames / s</div><div class="v">${fmt(st.encoded_fps, 1)}</div></div>
+      <div class="stat"><div class="k">Shown on tablet / s</div><div class="v">${fmt(st.tablet_ack_fps, 1)}</div></div>
+      <div class="stat"><div class="k">Latency p50</div><div class="v">${fmt(st.capture_to_ack_ms_p50, 0, ' ms')}</div></div>
+      <div class="stat"><div class="k">Received</div><div class="v">${fmt(tab.received_mbps, 1, ' Mb/s')}</div></div>
+      <div class="stat"><div class="k">Touches</div><div class="v">${fmt(st.tablet_input_messages)}</div></div>
+      <div class="stat"><div class="k">Capture</div><div class="v">${st.capture_memory || '—'}</div></div>
+    </div>
+    <div class="hint" style="margin-top:6px">Frames only flow while something changes on that screen; ${fmt(st.heartbeats_sent)} idle heartbeats sent, ${fmt(st.video_disconnects)} reconnects.</div>` : ''}
+    ${settingsForm(t)}
+    <details ${state.logsOpen[t.slug] ? 'open' : ''} ontoggle="state.logsOpen['${t.slug}']=this.open; if(this.open) loadLogs('${t.slug}')">
+      <summary>Host log</summary><pre id="log-${t.slug}">…</pre></details>
+  </article>`;
+}
+
+function emptyCard(data) {
+  return `<article class="card empty" style="grid-column:1/-1">
+    <h2>No tablet attached</h2>
+    <p class="note">Plug the tablet in with a <b>data</b> cable, unlock it, and:</p>
+    <ol class="note">
+      <li>Settings → About tablet → tap <b>Build number</b> 7 times (Developer options appear).</li>
+      <li>Developer options → <b>USB debugging</b> on.</li>
+      <li>USB notification → <b>File transfer</b> (not "charge only").</li>
+      <li>On the tablet, tick <b>Always allow from this computer</b> and tap Allow.</li>
+    </ol>
+    <p class="note">${data.adb ? '' : 'ADB is not downloaded yet: run <code>./tabs9 setup</code> in a terminal.'}
+      This page refreshes by itself.</p>
+  </article>`;
+}
+
+function render() {
+  const d = state.data;
+  if (!d) return;
+  const box = $('#tablets');
+  const focused = document.activeElement && document.activeElement.tagName === 'INPUT';
+  if (focused) return;               // do not wipe a value being typed
+  box.innerHTML = d.tablets.length ? d.tablets.map(card).join('') : emptyCard(d);
+  const streaming = d.tablets.filter(t => t.phase === 'streaming').length;
+  const starting = d.tablets.filter(t => t.running && t.phase !== 'streaming').length;
+  const p = $('#panel-state');
+  p.className = 'pill ' + (streaming ? 'ok' : starting ? 'warn busy' : '');
+  p.textContent = d.tablets.length
+    ? `${d.tablets.length} tablet${d.tablets.length > 1 ? 's' : ''} · ${streaming} streaming${starting ? ' · ' + starting + ' starting' : ''}`
+    : 'no tablet';
+  for (const t of d.tablets) if (state.logsOpen[t.slug]) loadLogs(t.slug);
+}
+
+async function refresh() {
+  try { state.data = await api('/api/state'); render(); }
+  catch (e) { $('#panel-state').className = 'pill bad'; $('#panel-state').textContent = 'panel not running (./tabs9 ui)'; }
+}
+
+function setField(slug, key, value) {
+  state.editing[slug] = Object.assign({}, state.editing[slug] || {}, { [key]: value });
+  render();
+}
+
+async function saveSettings(slug, restart = false) {
+  const t = state.data.tablets.find(x => x.slug === slug);
+  const merged = Object.assign({}, t.settings, state.editing[slug] || {});
+  for (const k of Object.keys(merged)) if (merged[k] === '' || merged[k] === null) delete merged[k];
+  try {
+    const r = await api('/api/settings', { slug, settings: merged });
+    delete state.editing[slug];
+    t.settings = r.settings;
+    toast('Settings saved');
+    if (restart) { await api('/api/stop', { slug }); await new Promise(r => setTimeout(r, 1500)); await startTablet(slug); }
+    else render();
+  } catch (e) { toast('Could not save: ' + e.message); }
+}
+
+async function startTablet(slug) {
+  state.busy[slug] = true; render();
+  try { await api('/api/start', { slug }); toast('Starting… the app opens on the tablet by itself'); }
+  catch (e) { toast('Start refused: ' + e.message); }
+  setTimeout(() => { delete state.busy[slug]; refresh(); }, 2500);
+}
+
+async function stopTablet(slug) {
+  try { await api('/api/stop', { slug }); toast('Stopped'); } catch (e) { toast(e.message); }
+  setTimeout(refresh, 800);
+}
+
+async function loadLogs(slug) {
+  const el = $('#log-' + slug); if (!el) return;
+  try { el.textContent = (await api('/api/logs?slug=' + slug)) || '(nothing logged yet)'; } catch (e) { el.textContent = e.message; }
+}
+
+$('#doctor-btn').onclick = async () => {
+  const sec = $('#doctor'), out = $('#doctor-out');
+  sec.style.display = ''; out.textContent = 'Checking… (a few seconds)';
+  sec.scrollIntoView({ behavior: 'smooth' });
+  try { const r = await api('/api/doctor', {}); out.textContent = r.report; }
+  catch (e) { out.textContent = 'Doctor failed: ' + e.message; }
+};
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

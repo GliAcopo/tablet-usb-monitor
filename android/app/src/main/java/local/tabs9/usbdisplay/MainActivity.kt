@@ -642,7 +642,7 @@ fun UScreenMain(
                     .padding(16.dp)
             ) {
                 Column {
-                    Text("Tablet USB monitor is working.", fontSize = 15.sp, color = Color.White, fontWeight = FontWeight.Bold)
+                    Text("tabs9 is working.", fontSize = 15.sp, color = Color.White, fontWeight = FontWeight.Bold)
                     Text(
                         "If it replaced a second monitor for you, a star on GitHub or a report of " +
                             "your tablet model helps other Linux users find it. This note appears only once.",
@@ -750,13 +750,13 @@ private fun ConnectionScreen() {
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Text(
-                text = "Tab S9 USB Display",
+                text = "tabs9",
                 fontSize = 42.sp,
                 fontWeight = FontWeight.Bold,
                 color = Color.White
             )
             Text(
-                text = "USB second display",
+                text = "Your tablet as a second screen, over USB",
                 fontSize = 15.sp,
                 color = AccentSoft
             )

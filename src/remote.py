@@ -120,7 +120,8 @@ class TabletInjector:
                  port: int = 8892, dex: str = '/data/local/tmp/tabs9-remote.dex',
                  socket_name: str = 'tabs9-remote'):
         self.adb = adb
-        self.adb_path = adb_path
+        # A bare path, or [path, '-s', serial] to address one of several tablets.
+        self.adb_command = [adb_path] if isinstance(adb_path, str) else list(adb_path)
         self.port = port
         self.dex = dex
         self.socket_name = socket_name
@@ -150,7 +151,7 @@ class TabletInjector:
         # Its output goes to logcat (adb logcat -s UScreenRemote); a pipe here
         # would have nobody reading it and would eventually block the receiver.
         self.process = subprocess.Popen(
-            [self.adb_path, 'shell', f'CLASSPATH={self.dex} app_process / Remote {self.socket_name}'],
+            [*self.adb_command, 'shell', f'CLASSPATH={self.dex} app_process / Remote {self.socket_name}'],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True)
         if self._connect(5):

@@ -35,7 +35,7 @@ class StreamingService : Service() {
         )
 
         val notification = Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("Tablet USB monitor")
+            .setContentTitle("tabs9")
             .setContentText("Showing the computer's extra screen on this tablet")
             .setSmallIcon(android.R.drawable.ic_menu_view)
             .setContentIntent(pendingIntent)
@@ -127,7 +127,7 @@ class StreamingService : Service() {
     private fun createNotificationChannel() {
         val channel = NotificationChannel(
             CHANNEL_ID,
-            "Tablet USB monitor",
+            "tabs9",
             NotificationManager.IMPORTANCE_LOW
         ).apply {
             description = "Keeps the display client alive while streaming"
