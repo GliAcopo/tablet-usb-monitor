@@ -43,6 +43,28 @@ pick_tablet() {
   status_file=".local/state/host-$slug.status.json"
 }
 
+# xdg-desktop-portal takes the app id from the unit name only when a
+# matching desktop entry exists (it loads "<appid>.desktop"): a hidden one
+# per tablet under ~/.local/share/applications, nothing else. It also names
+# the host in KDE's dialogs. Removed by `./tabs9 forget`.
+ensure_desktop_entry() {
+  local dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+  local file="$dir/tabs9.$slug.desktop"
+  [[ -f "$file" ]] && return 0
+  mkdir -p "$dir"
+  cat > "$file" <<EOF_DESKTOP
+[Desktop Entry]
+Type=Application
+Name=tabs9 ($label)
+Comment=$label as a second screen over USB
+Exec=$PWD/tabs9 start --tablet $slug
+Icon=video-display
+NoDisplay=true
+Terminal=true
+Categories=Utility;
+EOF_DESKTOP
+}
+
 # Every instance known to systemd or by a status file: "slug" per line.
 all_instances() {
   {
@@ -101,6 +123,7 @@ case "${1:-help}" in
       exit 0
     fi
     python3 scripts/setup.py --check
+    [[ -n "${TABS9_UNIT:-}" ]] || ensure_desktop_entry
     # Clear stale status before starting
     rm -f "$status_file"
     # Settings remembered for this tablet (./tabs9 ui) go first: what is typed
@@ -292,12 +315,17 @@ case "${1:-help}" in
     esac
     ;;
   ui) shift; exec python3 src/ui.py --open "$@" ;;
+  forget)
+    # Everything tabs9 put outside this directory: the desktop entries.
+    rm -f "${XDG_DATA_HOME:-$HOME/.local/share}"/applications/tabs9.*.desktop
+    echo 'Removed the tabs9 desktop entries; nothing else lives outside this directory.'
+    ;;
   pen-actions) shift; exec python3 scripts/kde-actions.py "$@" ;;
   shortcuts) shift; exec python3 scripts/kde-actions.py --list "$@" ;;
   test-motion) shift; exec python3 scripts/motion-test.py "$@" ;;
   bench-capture) shift; exec python3 scripts/capture_ab.py "$@" ;;
   *)
-    echo 'Usage: ./tabs9 {setup [--yes] [--no-sudo] [--start]|doctor|start [options]|stop|status|logs|ui|pin-desktop on|off}'
+    echo 'Usage: ./tabs9 {setup [--yes] [--no-sudo] [--start]|doctor|start [options]|stop|status|logs|ui|forget|pin-desktop on|off}'
     echo '  One host per tablet: start/stop/logs take --tablet MODEL when more than one is attached;'
     echo '  status and stop without it cover every tablet. ui opens the control panel in the browser.'
     echo '  setup walks through every requirement and fixes what it can (asks before sudo);'

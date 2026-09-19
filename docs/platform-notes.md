@@ -352,8 +352,11 @@ are `plasmashell` (`caption` empty). Useful fields: `w.output.name`,
   (from the binary's strings; `_xdp_app_info_host_parse_app_id_from_unit_name`).
   `systemd-run --unit=app-tabs9.sm_x910.service` therefore yields the app id
   `tabs9.sm_x910` and the output `Virtual-virtual-xdp-kde-tabs9.sm_x910`.
-  Restore tokens are keyed by app id, so a token issued to the empty id is
-  not accepted by `tabs9.sm_x910`: one more round of the two dialogs.
+  The id is used only if `g_desktop_app_info_new("<id>.desktop")` finds a
+  desktop entry (`xdp-app-info-host.c`, `get_app_from_pid`), hence the hidden
+  `~/.local/share/applications/tabs9.<slug>.desktop` the launcher writes.
+  Observed: the tokens stored under the empty app id were still accepted
+  after the switch to `tabs9.sm_x910` — no dialog reappeared.
 - **Custom modes accumulate.** `kscreen-doctor output.N.addCustomMode` adds
   a mode every start and nothing removes it; after a day of testing a
   virtual output lists hundreds of 2960x1848 modes, and every virtual

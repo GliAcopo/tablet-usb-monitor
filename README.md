@@ -116,7 +116,9 @@ prints the fix next to every failure; paste its output in bug reports.
 
 `setup` never loads kernel modules, changes the firewall, enables autostart
 or sends power/lock keys to the tablet. Its only privileged actions are the
-package install and the udev rule, each after a yes. The Android toolchain
+package install and the udev rule, each after a yes. Outside this directory
+tabs9 only ever writes the per-tablet desktop entries described under
+[Two tablets at once](#two-tablets-at-once) (`./tabs9 forget` removes them). The Android toolchain
 (JDK, SDK, Gradle caches) for `scripts/build-android.sh` lives under
 `.local/android-toolchain`. The motion test additionally needs PyQt6. The
 control protocol between host and client is described in
@@ -235,7 +237,11 @@ tablet's output as well (observed: the Tab S9's 2960×1848 output switched
 to 1872×1404 and its capture stream died with "no more input formats").
 With per-host app ids the outputs are `Virtual-virtual-xdp-kde-tabs9.sm_x910`
 and `…hmw_w09`, the host tracks them by KScreen id, and portal restore
-tokens are per app id, hence per tablet.
+tokens are per app id, hence per tablet. The portal accepts a unit-derived
+app id only when a desktop entry of that name exists, so `./tabs9 start`
+writes a hidden one per tablet to `~/.local/share/applications/tabs9.<model>.desktop`
+(it also names the host in KDE's dialogs). That is the only thing tabs9
+puts outside its own directory; `./tabs9 forget` removes them.
 
 ## Measured results (2026-09-12, commit 3243ed3, one machine)
 
