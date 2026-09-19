@@ -56,7 +56,7 @@ import java.util.Set;
  * generated at build time (see build-and-push.sh).
  */
 public class Remote {
-    static final String TAG = "UScreenRemote";
+    static final String TAG = "tabs9Remote";
 
     /** Everything goes to logcat: adb-shell stdout has nobody reading it. */
     private static void log(String message) {

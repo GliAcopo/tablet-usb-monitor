@@ -34,10 +34,13 @@
         android:usesCleartextTraffic="true"
         android:hardwareAccelerated="true">
 
+        <!-- keyboard|navigation: the host's remote control plugs a real (UHID)
+             mouse and keyboard into the tablet; without these the activity was
+             recreated on the next resume and its old connections lived on. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation"
             android:windowSoftInputMode="adjustResize"
             android:screenOrientation="sensorLandscape"
             android:launchMode="singleTask"

@@ -55,7 +55,7 @@ class Banner(QWidget):
                             | Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-        self.setWindowTitle('Tab S9 USB display status')
+        self.setWindowTitle('tabs9 status')
         self.place(screen)
 
     def place(self, screen):

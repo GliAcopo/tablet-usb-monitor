@@ -240,7 +240,10 @@ class HostTouchIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(value.touch.releases, 0)
         self.assertIsNone(value.control_owner)
 
-    async def test_second_authenticated_controller_is_rejected_without_cleanup(self):
+    async def test_a_second_authenticated_controller_replaces_the_first(self):
+        """The newcomer is the live app instance; the old socket is a ghost
+        (Android recreated the activity and the old connection lived on).
+        Rejecting the newcomer left the tablet reconnecting every 2 s."""
         value = bare_host()
         first = FakeWebSocket(value.token)
         first_task = asyncio.create_task(value.control(first))
@@ -250,19 +253,29 @@ class HostTouchIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(value.touch.releases, 1)
 
         second = FakeWebSocket(value.token)
-        second.stop()
-        await value.control(second)
+        second_task = asyncio.create_task(value.control(second))
+        await self._settle()
         self.glib.drain()
 
-        self.assertIs(value.control_owner, first)
-        self.assertIsNotNone(second.closed)
-        self.assertEqual(second.closed[1].get("code"), 1008)
-        self.assertEqual(value.touch.releases, 1)
+        self.assertIs(value.control_owner, second)
+        self.assertIsNotNone(first.closed)
+        self.assertEqual(first.closed[1].get("code"), 1000)
+        self.assertIsNone(second.closed)
+        self.assertEqual(len(second.sent), 1)                  # greeted like any owner
+        self.assertEqual(value.touch.releases, 2)              # clean slate for the newcomer
 
+        # The ghost going away must not release the newcomer's ownership.
         first.stop()
         await first_task
         self.glib.drain()
+        self.assertIs(value.control_owner, second)
         self.assertEqual(value.touch.releases, 2)
+
+        second.stop()
+        await second_task
+        self.glib.drain()
+        self.assertIsNone(value.control_owner)
+        self.assertEqual(value.touch.releases, 3)
 
     async def test_disconnected_generation_cannot_inject_queued_touch(self):
         value = bare_host()

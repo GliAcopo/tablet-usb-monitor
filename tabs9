@@ -361,6 +361,7 @@ EOF_DESKTOP
           "${XDG_DATA_HOME:-$HOME/.local/share}"/applications/tabs9.desktop
     echo 'Removed the tabs9 desktop entries; nothing else lives outside this directory.'
     ;;
+  target) shift; exec python3 src/remote_target.py "$@" ;;
   pen-actions) shift; exec python3 scripts/kde-actions.py "$@" ;;
   shortcuts) shift; exec python3 scripts/kde-actions.py --list "$@" ;;
   test-motion) shift; exec python3 scripts/motion-test.py "$@" ;;
@@ -371,7 +372,9 @@ EOF_DESKTOP
     echo '  status and stop without it cover every tablet. ui opens the control panel in the browser.'
     echo '  setup walks through every requirement and fixes what it can (asks before sudo);'
     echo '  doctor runs the same checks read-only and prints the fix for each failure.'
-    echo '              {pen-actions [gesture target]|shortcuts [component]}'
+    echo '              {target [MODEL|--auto]|pen-actions [gesture target]|shortcuts [component]}'
+    echo '  target: which tablet Meta+Shift+T drives when two are running (Meta+Shift+D puts every'
+    echo '  tablet back to being a screen).'
     echo '              {test-motion [--seconds N]|bench-capture [--seconds N]}'
     echo '  start options: --tablet MODEL  --side left|right|top|bottom'
     echo '                 --profile smooth|balanced|light (120/60/30 fps)'

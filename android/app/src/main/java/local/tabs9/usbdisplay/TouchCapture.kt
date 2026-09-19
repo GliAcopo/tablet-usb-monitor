@@ -37,6 +37,14 @@ class TouchCapture {
 
     private var webSocket: WebSocket? = null
     @Volatile private var isConnected = false
+    /**
+     * True between connect() and disconnect(). A socket closed on purpose
+     * still reports onClosed, which used to schedule a reconnect: the tablet
+     * then reconnected from the background two seconds after the activity
+     * stopped, and that ghost socket kept the host's control channel for as
+     * long as the process lived.
+     */
+    @Volatile private var wanted = false
     private var reconnectJob: Job? = null
     private var surfaceView: SurfaceView? = null
 
@@ -259,6 +267,7 @@ class TouchCapture {
         // Idempotent: a second connect() must not leave the first socket
         // alive with its listener still flipping isConnected. onStart and a
         // token delivered through onNewIntent can both call this.
+        wanted = true
         if (isConnected) return
         // A reconnect already scheduled by onClosed would open a second
         // socket next to this one; this call supersedes it.
@@ -278,9 +287,10 @@ class TouchCapture {
 
     private fun scheduleReconnect() {
         reconnectJob?.cancel()
+        if (!wanted) return
         reconnectJob = scope.launch {
             delay(RECONNECT_DELAY_MS)
-            if (!isConnected) {
+            if (wanted && !isConnected) {
                 connectWebSocket()
             }
         }
@@ -810,6 +820,7 @@ class TouchCapture {
     fun isControlConnected(): Boolean = isConnected
 
     fun disconnect() {
+        wanted = false
         reconnectJob?.cancel()
         webSocket?.close(1000, "Client closing")
         webSocket = null

@@ -439,6 +439,10 @@ class MainActivity : ComponentActivity() {
         drillHook = null
         penDrillHook = null
         spenButton?.disconnect()
+        // A recreated activity gets new connections; the old ones must not
+        // outlive this instance (they did, and the host kept talking to them).
+        videoReceiver?.stop()
+        touchCapture?.disconnect()
         super.onDestroy()
         stopService(Intent(this, StreamingService::class.java))
     }

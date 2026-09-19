@@ -50,6 +50,7 @@ from touch_input import LiveKScreenTarget, PortalTouchInput, TouchInputError
 from eis_touch import EisTouch, EisError
 from gestures import GestureFilter
 from air import AirGestures, GESTURES
+from remote_target import Instances
 from shortcuts import KdeShortcuts
 from remote import InputCapture, RemoteControl, RemoteError, TabletInjector
 
@@ -88,7 +89,7 @@ DEFAULT_PEN_ACTIONS = {
     'counterclockwise': 'kwin:Walk Through Windows (Reverse)',
 }
 # The host's own actions, in KDE's shortcut list (System Settings ->
-# Shortcuts -> Tab S9 USB display), where they can be rebound like any other.
+# Shortcuts -> tabs9), where they can be rebound like any other.
 HOST_SHORTCUTS = [
     ('remote-control', 'Tablet: own desktop, then send mouse and keyboard', 'Meta+Shift+T'),
     ('tablet-screen', "Tablet: back to being the computer's screen", 'Meta+Shift+D'),
@@ -133,7 +134,7 @@ def load_pen_actions(mode='actions'):
 def notify(summary, body, urgency='normal'):
     """Best-effort desktop notification; the terminal is hidden behind the portal dialog."""
     with contextlib.suppress(Exception):
-        subprocess.run(['notify-send', '-a', 'Tab S9 USB display', '-u', urgency, '-t', '15000', summary, body],
+        subprocess.run(['notify-send', '-a', 'tabs9', '-u', urgency, '-t', '15000', summary, body],
             capture_output=True, timeout=5)
 
 
@@ -513,6 +514,7 @@ class Host:
                     if getattr(args, 'two_finger_tap', 'right-click') == 'right-click' else None)
         self.resyncs = 0
         self.replays = 0            # last frame fed again: keyframe or decoder flush on an idle desktop
+        self.keyframes = 0          # IDR frames handed to the clients
         self.last_acked_seq = None  # newest packet seq the tablet reported rendered
         self.nudge_pending = False  # an idle-nudge timer is armed
         # Video-socket liveness (see video()): features the tablet advertised
@@ -566,6 +568,11 @@ class Host:
         self.tokens_file = getattr(args, 'tokens_file', TOKENS_FILE)
         self.port_base = getattr(args, 'port_base', 8890)
         self.tablet_label = getattr(args, 'tablet_label', 'tablet')
+        # The running hosts and which of them the KDE shortcuts drive
+        # (src/remote_target.py): with two tablets a press must reach one.
+        self.instances = Instances(self.status.path.parent)
+        self.instance = getattr(args, 'instance_name', 'host')
+        self.slot = getattr(args, 'slot', 1)
         self._capture_token_used = False
         self._virtual_token_used = False
         self._wrong_source_attempts = 0
@@ -1329,6 +1336,8 @@ class Host:
         data = buf.extract_dup(0, buf.get_size())
         keyframe = not buf.has_flags(Gst.BufferFlags.DELTA_UNIT)
         self.frames += 1
+        if keyframe:
+            self.keyframes += 1
         seq = self.frames & 0xffffffff
         # Only aggregate timing metadata is retained, never screen data on disk.
         payload = b'\x01' + struct.pack('!I', seq) + data
@@ -1361,6 +1370,27 @@ class Host:
                 # The IDR is a frame the decoder may hold as well.
                 self.nudge_pending = True
                 GLib.timeout_add(self.IDLE_NUDGE_MS, self.idle_nudge, self.native_last_seq, None, 0)
+        # Whether or not a frame looked imminent, make sure an IDR actually
+        # goes out: a frame that was already in the encoder when the request
+        # arrived comes out as a P-frame, and if the desktop then goes quiet
+        # the client waits for a keyframe that never comes (the tablet came
+        # back from its own desktop to a "waiting" screen exactly this way).
+        GLib.timeout_add(self.KEYFRAME_CHECK_MS, self.ensure_keyframe, self.keyframes, 0)
+        return False
+
+    KEYFRAME_CHECK_MS = 250
+    KEYFRAME_CHECKS_MAX = 4
+
+    def ensure_keyframe(self, seen, attempt):
+        """Main loop: replay the last frame until a keyframe has gone out."""
+        if self.closing or self.pipeline is None or not self.clients:
+            return False
+        if self.keyframes > seen:
+            return False                      # the request was honoured
+        if self.native is None or self.native_last_encoded is None or attempt >= self.KEYFRAME_CHECKS_MAX:
+            return False                      # nothing to feed again
+        self.replay_last_frame()
+        GLib.timeout_add(self.KEYFRAME_CHECK_MS, self.ensure_keyframe, seen, attempt + 1)
         return False
 
     def replay_last_frame(self):
@@ -1487,8 +1517,20 @@ class Host:
             if auth.get('type') != 'auth' or not hmac.compare_digest(str(auth.get('token', '')), self.token):
                 await ws.close(); return
             if self.control_owner is not None:
-                await ws.close(code=1008, reason='A tablet controller is already connected')
-                return
+                # The newcomer wins. Only one app instance can be live on the
+                # tablet, so a second authenticated connection means the old
+                # one is a ghost: Android relaunches the activity on a
+                # configuration change (a keyboard appearing, say -- which is
+                # exactly what the remote-control receiver creates) and the
+                # old instance's socket stays open in the same process.
+                # Refusing the new one left the tablet reconnecting every two
+                # seconds for as long as the ghost lived.
+                stale = self.control_owner
+                self.control_owner = None
+                print('A newer tablet connection replaces the previous one.', flush=True)
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(
+                        stale.close(code=1000, reason='replaced by a newer connection'), 2)
             self.control_owner = ws
             owns_control = True
             self.client_features = set()   # re-learned from this client's config
@@ -1672,8 +1714,12 @@ class Host:
             self.shortcuts = None
             print(f'KDE shortcuts unavailable ({error}); remote control is off.', flush=True)
             return
-        print('Shortcuts (System Settings -> Shortcuts -> Tab S9 USB display): '
+        print('Shortcuts (System Settings -> Shortcuts -> tabs9): '
               + '; '.join(bound), flush=True)
+        with contextlib.suppress(Exception):
+            routing = self.instances.describe(self.instance)
+            if routing:
+                print(routing, flush=True)
         if any(entry.startswith('none = ') for entry in bound):
             print('A shortcut shows as "none" because another application already owns the '
                   'key the host proposes; pick one in System Settings -> Shortcuts.', flush=True)
@@ -1681,14 +1727,31 @@ class Host:
               '("Disable Active Input Capture") always gives it back.', flush=True)
 
     def on_shortcut(self, action):
+        # Every running host hears the press; only the target acts on it.
+        # The way back (tablet-screen) is obeyed by any host that is not in
+        # screen mode, quietly, so one press puts every tablet back.
+        try:
+            target = self.instances.target()
+        except Exception:
+            target = None
+        mine = target is None or target.get('slug') == self.instance
+        if not mine and (action != 'tablet-screen' or self.tablet_mode == 'screen'):
+            print(f'Shortcut {action} ignored: it drives {target.get("label")} '
+                  '(./tabs9 target MODEL changes that).', flush=True)
+            return False
         print(f'Shortcut {action}: the tablet is showing '
               f'{"the computer" if self.tablet_mode == "screen" else "its own desktop"}'
               f'{" and has the input" if self.tablet_mode == "control" else ""}.', flush=True)
         if action == 'remote-control':
             self.cycle_tablet_mode()
         elif action == 'tablet-screen':
-            self.tablet_as_screen()
+            self.tablet_as_screen(quiet=not mine)
         return False
+
+    def publish_instance(self):
+        """Tell the other hosts (and ./tabs9 target) about this one."""
+        self.instances.publish(self.instance, slot=self.slot, label=self.tablet_label,
+                               mode=self.tablet_mode)
 
     def tablet_app(self, front):
         """Bring the display app to the front, or put the tablet's own desktop there."""
@@ -1715,7 +1778,7 @@ class Host:
             notify('Could not send the input to the tablet', str(error), 'critical')
         return False
 
-    def tablet_as_screen(self):
+    def tablet_as_screen(self, quiet=False):
         """The other shortcut: the tablet goes back to being the computer's screen."""
         with contextlib.suppress(Exception):
             if self.remote_control is not None:
@@ -1724,7 +1787,8 @@ class Host:
         self.show_state()
         with contextlib.suppress(Exception):
             self.tablet_app(front=True)
-        notify("Tablet is the computer's screen again", '')
+        if not quiet:
+            notify("Tablet is the computer's screen again", '')
         return False
 
     def start_remote(self):
@@ -1781,6 +1845,8 @@ class Host:
 
     def show_state(self):
         """Put the state on every screen (and take it away in screen mode)."""
+        with contextlib.suppress(Exception):
+            self.publish_instance()
         title, hint, colour = self.banner_text()
         message = {'state': self.tablet_mode, 'title': title, 'hint': hint, 'colour': colour}
         try:
@@ -2186,7 +2252,7 @@ class Host:
             'remote_sessions': self.remote_control.sessions if self.remote_control is not None else 0,
             'remote_events': self.remote_control.events if self.remote_control is not None else 0,
             'client_resyncs': self.resyncs,
-            'keyframe_replays': self.replays,
+            'keyframe_replays': self.replays, 'keyframes': self.keyframes,
             'video_clients': len(self.clients), 'video_connects': self.video_connects,
             'video_disconnects': self.video_disconnects, 'last_video_disconnect': self.last_video_disconnect,
             'heartbeats_sent': self.heartbeats_sent,
@@ -2226,6 +2292,8 @@ class Host:
         # nothing to leak, but the host should still try to run.
         with contextlib.suppress(Exception):
             self.status.write('starting')
+        with contextlib.suppress(Exception):
+            self.publish_instance()
         def worker():
             asyncio.set_event_loop(self.aio)
             self.aio.run_until_complete(self.servers())
@@ -2279,7 +2347,12 @@ class Host:
                     self.remote_control.close()
             if getattr(self, 'shortcuts', None) is not None:
                 with contextlib.suppress(Exception):
-                    self.shortcuts.release()
+                    # Another host still answers the same actions: leave them
+                    # active in KDE's list, just stop listening here.
+                    others = [i for i in self.instances.running() if i.get('slug') != self.instance]
+                    self.shortcuts.release(keep_active=bool(others))
+            with contextlib.suppress(Exception):
+                self.instances.retire(self.instance)
             with contextlib.suppress(Exception):
                 self.close_banner()
             if getattr(self, 'eis', None) is not None:
@@ -2462,6 +2535,8 @@ if __name__ == '__main__':
     if slot_lock is None:
         raise SystemExit('Four hosts are already running; stop one first')
     args.port_base = 8890 + 4 * (slot - 1)
+    args.slot = slot
+    args.instance_name = instance
     if args.remote_port is None:
         args.remote_port = args.port_base + 2
     print(f'Instance {instance}: slot {slot}, ports {args.port_base}-{args.port_base + 2}', flush=True)

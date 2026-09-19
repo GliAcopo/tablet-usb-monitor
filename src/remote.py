@@ -37,6 +37,7 @@ import logging
 import os
 import socket
 import struct
+from pathlib import Path
 import subprocess
 import time
 from typing import Callable
@@ -59,6 +60,9 @@ TYPE_MOVE, TYPE_BUTTON, TYPE_SCROLL, TYPE_KEY, TYPE_RESET = 1, 2, 3, 4, 5
 # anything listens on the device, so the greeting is the only way to tell a
 # running receiver from a missing one.
 HELLO = b'T9'
+
+# The compiled receiver, pushed to the tablet on first use.
+DEX_SOURCE = Path(__file__).resolve().parents[1] / 'scripts/tabs9-remote/tabs9-remote.dex'
 
 # Portal capability bits, as KWin's addInputCapture takes them.
 CAP_KEYBOARD, CAP_POINTER, CAP_TOUCH = 1, 2, 4
@@ -118,12 +122,13 @@ class TabletInjector:
 
     def __init__(self, adb: Callable[..., subprocess.CompletedProcess], adb_path: str, *,
                  port: int = 8892, dex: str = '/data/local/tmp/tabs9-remote.dex',
-                 socket_name: str = 'tabs9-remote'):
+                 socket_name: str = 'tabs9-remote', dex_source: str | Path | None = None):
         self.adb = adb
         # A bare path, or [path, '-s', serial] to address one of several tablets.
         self.adb_command = [adb_path] if isinstance(adb_path, str) else list(adb_path)
         self.port = port
         self.dex = dex
+        self.dex_source = Path(dex_source) if dex_source else DEX_SOURCE
         self.socket_name = socket_name
         self.process: subprocess.Popen | None = None
         self.sock: socket.socket | None = None
@@ -148,7 +153,8 @@ class TabletInjector:
         self.adb('forward', f'tcp:{self.port}', f'localabstract:{self.socket_name}')
         if self._connect(0.5):
             return
-        # Its output goes to logcat (adb logcat -s UScreenRemote); a pipe here
+        self.ensure_pushed()
+        # Its output goes to logcat (adb logcat -s tabs9Remote); a pipe here
         # would have nobody reading it and would eventually block the receiver.
         self.process = subprocess.Popen(
             [*self.adb_command, 'shell', f'CLASSPATH={self.dex} app_process / Remote {self.socket_name}'],
@@ -157,9 +163,31 @@ class TabletInjector:
         if self._connect(5):
             return
         self.stop()
-        raise RemoteError(f'no input receiver answered on port {self.port}; push it with '
-                          'scripts/tabs9-remote/build-and-push.sh and check '
-                          '`adb logcat -s UScreenRemote`')
+        raise RemoteError(f'no input receiver answered on port {self.port}; check '
+                          '`adb logcat -s tabs9Remote` on the tablet (scripts/tabs9-remote/'
+                          'build-and-push.sh rebuilds and pushes the receiver)')
+
+    def ensure_pushed(self) -> None:
+        """Put the receiver on the tablet if it is not there.
+
+        The compiled receiver ships with the host (scripts/tabs9-remote/
+        tabs9-remote.dex, 16 KB), so remote control needs no toolchain and
+        no manual push -- and a second tablet gets it the first time the
+        shortcut is used there. A tablet that already has one keeps it.
+        """
+        check = subprocess.run([*self.adb_command, 'shell', f'ls {self.dex} >/dev/null 2>&1 && echo present'],
+                               capture_output=True, text=True, timeout=15)
+        if 'present' in check.stdout:
+            return
+        if not self.dex_source.is_file():
+            log.warning('the input receiver is neither on the tablet nor at %s', self.dex_source)
+            return
+        push = subprocess.run([*self.adb_command, 'push', str(self.dex_source), self.dex],
+                              capture_output=True, text=True, timeout=60)
+        if push.returncode:
+            log.warning('could not push the input receiver to the tablet: %s', push.stderr.strip())
+        else:
+            log.info('input receiver pushed to the tablet (%s)', self.dex)
 
     def _connect(self, seconds: float) -> bool:
         deadline = time.monotonic() + seconds

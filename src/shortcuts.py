@@ -100,7 +100,7 @@ class KdeShortcuts:
     """The host's own component in kglobalaccel, and what others registered."""
 
     def __init__(self, bus, component: str = 'tabs9',
-                 friendly: str = 'Tab S9 USB display'):
+                 friendly: str = 'tabs9'):
         self.bus = bus
         self.component = component
         self.friendly = friendly
@@ -131,11 +131,13 @@ class KdeShortcuts:
             pressed, signal_name='globalShortcutPressed', dbus_interface=COMPONENT_IFACE,
             path=f'/component/{self.component}')
 
-    def release(self) -> None:
-        """Mark our actions inactive (the user's key bindings are kept)."""
-        for name, label in self.actions.items():
-            with contextlib.suppress(dbus.DBusException):
-                self.accel.setInactive(self._action_id(name, label))
+    def release(self, keep_active: bool = False) -> None:
+        """Stop listening; mark our actions inactive unless another host of
+        ours still answers them (the user's key bindings are kept either way)."""
+        if not keep_active:
+            for name, label in self.actions.items():
+                with contextlib.suppress(dbus.DBusException):
+                    self.accel.setInactive(self._action_id(name, label))
         if self._match is not None:
             with contextlib.suppress(Exception):
                 self._match.remove()

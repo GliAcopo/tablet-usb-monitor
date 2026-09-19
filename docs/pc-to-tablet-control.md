@@ -94,7 +94,11 @@ outputs move (a host restart puts the tablet on the right until
 
 `Remote.java` runs as the shell user (`app_process`, the UI Automator
 route) and listens on the abstract socket `tabs9-remote`, which the host
-reaches through `adb forward tcp:8892 localabstract:tabs9-remote`. The
+reaches through `adb forward tcp:PORT localabstract:tabs9-remote` (PORT is
+the instance's third port: 8892 for the first host, 8896 for the second).
+The compiled receiver, `tabs9-remote.dex`, is kept next to the sources and
+the host pushes it to `/data/local/tmp` the first time a tablet needs it;
+`build-and-push.sh [--tablet MODEL]` rebuilds it after a change. The
 protocol is twelve bytes per event: `u8 type, u8 flags, u16 code, i32 a,
 i32 b` — move (relative, in tablet pixels), button (evdev code), scroll
 (thousandths of a wheel notch), key (evdev code), reset.
@@ -121,7 +125,7 @@ not wake a sleeping tablet.
   is already running (from an earlier session, or by hand) the new
   `app_process` exits because the abstract socket is taken, and that is
   fine.
-* Its output goes to logcat (`adb logcat -s UScreenRemote`); a pipe from
+* Its output goes to logcat (`adb logcat -s tabs9Remote`); a pipe from
   `adb shell` would have nobody reading it and would eventually block.
 * Pointer position is kept on the host, in tablet pixels, and sent as
   absolute moves: Android's mouse pointer in desktop mode follows

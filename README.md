@@ -177,8 +177,9 @@ somebody an afternoon.
 Touch works out of the box: the app reads touches on its own surface and
 sends them to the host; no accessibility service, no *USB debugging (Security
 settings)* and no root are needed. Remote control of the tablet from the PC's
-mouse and keyboard (a separate, optional feature, Samsung-tested only) is the
-one thing that needs the extra `scripts/tabs9-remote/build-and-push.sh`.
+mouse and keyboard (a separate, optional feature, Samsung-tested only) needs
+nothing extra either: the host puts its small receiver on the tablet the
+first time the shortcut is used.
 
 ### First start
 
@@ -242,6 +243,14 @@ on the tablet and `adb reverse` maps them) and portal tokens. `./tabs9
 status`, `./tabs9 stop` and `./tabs9 logs` cover every instance; add
 `--tablet` for one. `./tabs9 setup` prepares every attached tablet in one
 run.
+
+The remote-control shortcuts are one pair of keys for the whole computer,
+so with two tablets they drive **one** of them: the one chosen with
+`./tabs9 target MODEL`, otherwise the one started first. `./tabs9 target`
+alone shows which; the host log says so at start too. `Meta+Shift+D`
+("back to being the computer's screen") is obeyed by every tablet that is
+not one, so one press always restores everything. Before this, both hosts
+answered every press and both tablets dropped to their own desktop.
 
 Two things had to change for this to work on KDE, both invisible in normal
 use: every adb call names its device (`adb -s`, never `-d`), and the unit
@@ -596,9 +605,23 @@ computer's mouse and keyboard:
 
 `Meta+Shift+D` brings the display app back: the tablet is the computer's
 screen again. Both shortcuts are registered in KDE's own list (System
-Settings → Shortcuts → *Tab S9 USB display*), so they can be rebound like
+Settings → Shortcuts → *tabs9*), so they can be rebound like
 any other; the host prints what they are bound to when it starts, and says
-so if another application already owns the key it proposes.
+so if another application already owns the key it proposes. With two
+tablets the keys drive one of them (see [Two tablets at once](#two-tablets-at-once)
+and `./tabs9 target`).
+
+Coming back is instant: the picture is on the tablet within a third of a
+second of `Meta+Shift+D`, even on a desktop where nothing is moving. Two
+things used to spoil it and are fixed in 0.2.1: the mouse and keyboard the
+receiver creates count as a configuration change on Android, which
+recreated the app's activity on its way back and left the old instance's
+connection alive (the host then refused the new one and the tablet
+reconnected every two seconds); and a frame already inside the encoder when
+the app asked for a keyframe came out as a P-frame, after which a quiet
+desktop gave the app nothing to start from. The host now replaces an old
+connection with the new one and feeds the last picture again until an IDR
+has actually gone out.
 
 **A banner on every screen says which of the three you are in**, and which
 key changes it — there is no guessing, and no state you can be in without
@@ -631,9 +654,10 @@ processes can reach it. Going through the portal instead would be the
 portable path and would ask for permission every time a session is set up;
 it is not implemented.
 
-**On the tablet**, a small receiver (`scripts/tabs9-remote`, pushed by its
-`build-and-push.sh`) runs over ADB as the shell user and creates a **real
-mouse and keyboard** through `/dev/uhid`. That is what makes the pointer
+**On the tablet**, a small receiver (`scripts/tabs9-remote`; the compiled
+`tabs9-remote.dex` ships with the host and is pushed to the tablet on first
+use, `build-and-push.sh` only rebuilds it) runs over ADB as the shell user
+and creates a **real mouse and keyboard** through `/dev/uhid`. That is what makes the pointer
 *visible*: Android draws a cursor only for a device its input reader knows
 about, and a UHID device is one — it appears as `CURSOR | EXTERNAL`, gets
 the tablet's own pointer acceleration and keyboard layout, and works in
