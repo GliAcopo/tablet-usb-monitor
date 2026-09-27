@@ -109,12 +109,17 @@ def set_for_tablet(slug: str, values: dict) -> dict:
     return tablets[slug]
 
 
-def start_args(slug: str) -> list[str]:
+# Sized for the USB link: over Wi-Fi the host picks its own (60 fps, 20
+# Mbit/s) unless they are typed on the command line.
+USB_ONLY = ('profile', 'fps', 'bitrate')
+
+
+def start_args(slug: str, wifi: bool = False) -> list[str]:
     """`--flag value` pairs for host.py from the saved settings of one tablet."""
     saved = for_tablet(slug)
     args = []
     for key in OPTIONS:                 # declaration order, so the line is stable
-        if key in saved:
+        if key in saved and not (wifi and key in USB_ONLY):
             args += [f'--{key.replace("_", "-")}', str(saved[key])]
     return args
 
@@ -127,10 +132,15 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('command', choices=['args'])
     parser.add_argument('--tablet', default=None)
+    parser.add_argument('--wifi', action='store_true', help='a paired tablet, no cable')
     ns = parser.parse_args()
     try:
-        tablet = choose(ns.tablet, list_tablets())
-    except TabletChoice:
+        if ns.wifi:
+            import wifi
+            slug = wifi.choose(ns.tablet, wifi.paired())['slug']
+        else:
+            slug = choose(ns.tablet, list_tablets()).slug
+    except (TabletChoice, LookupError):
         sys.exit(0)          # no saved settings without a tablet; the host will complain itself
-    for arg in start_args(tablet.slug):
+    for arg in start_args(slug, wifi=ns.wifi):
         print(arg)

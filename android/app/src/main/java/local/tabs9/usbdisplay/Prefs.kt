@@ -78,6 +78,33 @@ class Prefs(context: Context) {
         get() = sp.getString("host_token", null)
         set(v) = sp.edit().putString("host_token", v).apply()
 
+    /**
+     * Wi-Fi pairing, from `./tabs9 pair` over USB (Link.kt, src/wifi.py): the
+     * tablet's secret, the computer certificate's SHA-256, the computer's name
+     * and its addresses at pairing time. One computer at a time; pairing again
+     * replaces it.
+     */
+    var wifiSecret: String?
+        get() = sp.getString("wifi_secret", null)
+        set(v) = sp.edit().putString("wifi_secret", v).apply()
+
+    var wifiPin: String?
+        get() = sp.getString("wifi_pin", null)
+        set(v) = sp.edit().putString("wifi_pin", v).apply()
+
+    var wifiName: String?
+        get() = sp.getString("wifi_name", null)
+        set(v) = sp.edit().putString("wifi_name", v).apply()
+
+    var wifiHosts: List<String>
+        get() = sp.getString("wifi_hosts", "")!!.split(",").filter { it.isNotBlank() }
+        set(v) = sp.edit().putString("wifi_hosts", v.joinToString(",")).apply()
+
+    /** "address:videoPort:controlPort" of the last Wi-Fi connection that worked. */
+    var wifiLast: String?
+        get() = sp.getString("wifi_last", null)
+        set(v) = sp.edit().putString("wifi_last", v).apply()
+
     /** "auto", "light" or "dark" (MainActivity.THEME_*); light is for E-ink. */
     var theme: String
         get() = sp.getString("theme", "auto") ?: "auto"

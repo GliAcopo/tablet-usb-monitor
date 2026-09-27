@@ -985,8 +985,9 @@ def summary(c, ready, start):
     return 0
 
 
-def quick_check():
-    """The gate `tabs9 start` runs: essential host pieces and one authorized tablet.
+def quick_check(wifi=False):
+    """The gate `tabs9 start` runs: essential host pieces and one authorized tablet
+    (with --wifi: a paired one, which the start itself picks; no adb needed).
 
     Same wording as before (`name: ready|missing / unavailable`), no
     downloads, no waiting.
@@ -1001,8 +1002,12 @@ def quick_check():
     for label, probe, _, essential in REQUIREMENTS:
         if essential:
             check(label, probe())
-    check('Local ADB', ADB.is_file())
-    if ADB.is_file():
+    if wifi:
+        check('Avahi (mDNS, finds the computer from the tablet)', shutil.which('avahi-daemon') is not None
+              or Path('/usr/sbin/avahi-daemon').is_file())
+    else:
+        check('Local ADB', ADB.is_file())
+    if ADB.is_file() and not wifi:
         states = adb_states()
         authorized = [s for s in states if s[0] == 'device']
         check('An authorized USB tablet' + (f' ({len(authorized)} attached: pick one with --tablet)'
@@ -1021,13 +1026,14 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--doctor', action='store_true', help='report only; change nothing, wait for nothing')
     parser.add_argument('--check', action='store_true', help='quiet gate used by `tabs9 start`')
+    parser.add_argument('--wifi', action='store_true', help='with --check: the Wi-Fi start (no USB tablet needed)')
     parser.add_argument('--yes', '-y', action='store_true', help='accept every fix without asking')
     parser.add_argument('--no-sudo', action='store_true', help='never call sudo; print the commands instead')
     parser.add_argument('--start', action='store_true', help='start the display when everything is ready')
     parser.add_argument('--tablet', default=None, metavar='MODEL', help='only this attached tablet (model or part of it)')
     args = parser.parse_args(argv)
     if args.check:
-        return quick_check()
+        return quick_check(wifi=args.wifi)
     interactive = not args.doctor
     c = Console(interactive=interactive, assume_yes=args.yes)
     use_sudo = not args.no_sudo

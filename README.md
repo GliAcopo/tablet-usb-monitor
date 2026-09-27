@@ -1,12 +1,13 @@
-# tabs9 — your tablet as a second screen, over USB
+# tabs9 — your tablet as a second screen, over USB or Wi-Fi
 
 **tabs9** turns an Android tablet into a **real extended monitor** for a Linux
 laptop over a USB cable — or two tablets into two monitors. The host creates a KDE virtual output, captures it through PipeWire
 as a DMA-BUF, converts and compresses it on the same Intel GPU with VA-API HEVC
 (zero copies, no readback) and sends it through authenticated loopback sockets
-forwarded by ADB. Touch and pen come back through KDE's RemoteDesktop portal
+forwarded by ADB — or, once the tablet is paired, over Wi-Fi with TLS
+([below](#over-wi-fi)). Touch and pen come back through KDE's RemoteDesktop portal
 and are delivered to the desktop with libei. No root, no kernel module, no
-Wi-Fi, no system-wide installation: everything the tools download lives under
+system-wide installation: everything the tools download lives under
 `.local/` in this directory.
 
 **Tested hardware — the only combinations that have ever run this.** One
@@ -307,6 +308,67 @@ writes a hidden one per tablet to `~/.local/share/applications/tabs9.<model>.des
 (it also names the host in KDE's dialogs). That is the only thing tabs9
 puts outside its own directory; `./tabs9 forget` removes them.
 
+### Over Wi-Fi
+
+Pair the tablet once, with the cable in:
+
+```sh
+./tabs9 pair --tablet SM          # opens the app; it says "Paired with <computer> for Wi-Fi"
+```
+
+From then on no cable is needed. On the computer:
+
+```sh
+./tabs9 start --wifi --tablet SM
+```
+
+and open tabs9 on the tablet (same network). It finds the computer by itself
+and the picture appears within a second; restart the host and it reconnects
+on its own. `./tabs9 stop`, `status` and `logs` work as usual; `./tabs9
+unpair --tablet SM` forgets the pairing on the computer.
+
+How it works (`src/wifi.py`, `android/.../Link.kt`):
+
+- **Security.** Pairing creates a per-tablet secret and, once per computer, a
+  self-signed P-256 certificate (`.local/state/wifi/`, owner-only). Both go
+  to the app over the USB cable. On Wi-Fi every connection is TLS and the
+  app accepts only that certificate (by its SHA-256 fingerprint), so nobody
+  else on the network can read the desktop picture or pose as the computer;
+  the secret then authenticates the tablet inside TLS. Pairing again
+  replaces the secret, so the old one stops working.
+- **Discovery.** The host announces `_tabs9._tcp` through Avahi (mDNS). The
+  advert carries a hash of the tablet's secret instead of any name, so
+  each tablet finds the host running for it — two paired tablets work
+  side by side as over USB. If the network drops mDNS the app falls back to
+  the last address that worked and the computer's addresses at pairing
+  time. It listens on ports 8890–8891 (+4 per extra tablet) on every
+  interface; if you run a firewall, allow those from your LAN.
+- **Transport choice.** A USB start (`am start` with a session token) always
+  wins; a tablet opened by hand tries Wi-Fi first when it is paired. The
+  video socket follows whichever address the control channel authenticated on.
+- **Defaults.** Without `--profile/--fps/--bitrate` on the command line a
+  Wi-Fi start uses 60 fps at 20 Mbit/s, and the control panel's saved
+  profile/fps/bitrate (chosen for the cable) are left out. Settings applied
+  in the tablet's own settings sheet still win, as over USB.
+- **Not over Wi-Fi:** remote control (showing the tablet its own desktop and
+  driving it with this computer's mouse) needs adb, so `--wifi` turns it off.
+
+Measured 2026-09-27 on the Tab S9 Ultra, laptop and tablet on the same
+home Wi-Fi (ping to the tablet 12–120 ms while idle), `./tabs9
+test-motion`, 5-s windows after warm-up:
+
+| Setting | Tablet fps | capture→ack p50 | p95 |
+|---|---|---|---|
+| USB, 60 fps / 30 Mbit (for comparison, [performance.md](docs/performance.md)) | 59 | — | ≤ 28 ms |
+| Wi-Fi, 60 fps / 20 Mbit (`--wifi` default) | 52 | 38–42 ms | 52–53 ms |
+| Wi-Fi, 120 fps / 30 Mbit (the motion pattern needs ~15) | 59 | 31–36 ms | 50–56 ms, one window 118 ms |
+| Wi-Fi, 120 fps / 60 Mbit | 53–57 | 105–156 ms | 410–470 ms |
+
+So: fine for documents and the desktop, noticeably laggier than the cable
+for drawing, and do not push the bitrate — once the radio link saturates the
+latency climbs by hundreds of milliseconds. Only the Tab S9 Ultra has been
+tried over Wi-Fi.
+
 ## Measured results (2026-09-12, commit 3243ed3, one machine)
 
 All of the following were measured on the Tab S9 Ultra with the synthetic OpenGL
@@ -410,6 +472,8 @@ easy on Windows and impossible on macOS — is worked out in
 - Video is compressed HEVC; perfect pixel preservation is not promised. The
   tablet's USB port does not become a DisplayPort input.
 - The APK is debug-signed and not on any store.
+- **Wi-Fi** adds 10–25 ms and more jitter than the cable, depends entirely on
+  the network, and has no remote control; see [Over Wi-Fi](#over-wi-fi).
 
 ## Gaming on the tablet (read before trying)
 
@@ -904,10 +968,12 @@ formats, not desktop pixels, touch coordinates, clipboard data or device
 identifiers. Runtime tokens, downloads and signing keys belong in ignored
 `.local/` paths. Never commit those files or captured desktop images.
 
-Only authenticated clients can read the video stream or submit input. The
-servers bind `127.0.0.1`, using ports 8890 and 8891. The host uses `adb -d`, so a
-wireless ADB device is not silently substituted for the USB tablet. It never
-calls `adb tcpip`, opens a LAN listening port, or copies the clipboard.
+Only authenticated clients can read the video stream or submit input. Over
+USB the servers bind `127.0.0.1`, using ports 8890 and 8891, and every adb
+call names the USB device, so a wireless ADB device is not silently
+substituted for it. The host never calls `adb tcpip`. It opens a LAN
+listening port only with `--wifi`, and then only with TLS and a certificate
+the paired tablet pins (see [Over Wi-Fi](#over-wi-fi)).
 
 The host and client are still undergoing live integration checks. See the
 performance report for the distinction between configured refresh rate,

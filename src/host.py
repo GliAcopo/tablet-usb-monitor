@@ -62,6 +62,7 @@ from remote import InputCapture, RemoteControl, RemoteError, TabletInjector
 DEFAULT_SCROLL_GAIN = 0.2
 from status import StatusWriter
 from tokens import load_tokens, save_token, discard_token
+import wifi
 
 ROOT = Path(__file__).resolve().parents[1]
 ADB = ROOT / '.local/platform-tools/adb'
@@ -432,7 +433,11 @@ TRACE_CAPTURE = bool(os.environ.get('TABS9_TRACE_CAPTURE'))  # diagnostics: raw 
 class Host:
     def __init__(self, args):
         self.args = args
-        self.token = secrets.token_hex(32)
+        # Over USB a fresh token per run, handed over with `am start`; over
+        # Wi-Fi the tablet's pairing secret (wifi.py), sent inside TLS.
+        self.wifi = getattr(args, 'wifi_record', None)
+        self.token = self.wifi['secret'] if self.wifi else secrets.token_hex(32)
+        self.advert = None
         self.loop = GLib.MainLoop()
         self.bus = dbus.SessionBus()
         self.portal = dbus.Interface(self.bus.get_object('org.freedesktop.portal.Desktop',
@@ -2261,10 +2266,28 @@ class Host:
         return False
 
     async def servers(self):
-        async with await asyncio.start_server(self.video, '127.0.0.1', self.port_base), \
-                   serve(self.control, '127.0.0.1', self.port_base + 1, max_size=4096):
+        # USB: loopback only, `adb reverse` carries it. Wi-Fi: every interface,
+        # TLS with the certificate the tablet pinned when it was paired.
+        address, tls = ('0.0.0.0', wifi.server_context()) if self.wifi else ('127.0.0.1', None)
+        async with await asyncio.start_server(self.video, address, self.port_base, ssl=tls), \
+                   serve(self.control, address, self.port_base + 1, max_size=4096, ssl=tls):
             self.ready.set()
             await asyncio.Future()
+
+    def advertise(self):
+        """Wi-Fi: say on the LAN where this tablet's host listens (Avahi)."""
+        txt = {'v': wifi.ADVERT_VERSION, 'id': wifi.tablet_id(self.token), 'ctl': str(self.port_base + 1)}
+        try:
+            self.advert = wifi.Advert(dbus.SystemBus(), wifi.advert_name(self.tablet_label), self.port_base, txt)
+        except dbus.DBusException as error:
+            # Not fatal: the app also dials the address it last connected to.
+            print(f'mDNS advert unavailable ({error.get_dbus_name()}); is avahi-daemon running?', flush=True)
+            return
+        addresses = ', '.join(wifi.local_addresses()) or 'this computer'
+        print(f'Wi-Fi: listening on {addresses}, ports {self.port_base}-{self.port_base + 1} (TLS); '
+              'open tabs9 on the tablet.', flush=True)
+        notify(f'tabs9: open the app on {self.tablet_label}',
+               'The computer is waiting for it on Wi-Fi.')
 
     def drop_video_clients(self):
         print(f'Dropping {len(self.clients)} video client(s) on request (recovery drill).', flush=True)
@@ -2375,12 +2398,17 @@ class Host:
             # is the only signal that the tablet is connected and its input is
             # arriving over USB.
             self.report_timer = GLib.timeout_add_seconds(5, self.report)
-            # The app always dials 127.0.0.1:8890/8891 on the tablet; each host
-            # instance listens on its own pair here.
-            for offset, port in enumerate((8890, 8891)):
-                adb('reverse', '--no-rebind', f'tcp:{port}', f'tcp:{self.port_base + offset}')
-                self.reverse_ports.append(port)
-            adb('shell', 'am', 'start', '-n', 'local.tabs9.usbdisplay/.MainActivity', '--es', 'token', self.token)
+            if getattr(self, 'wifi', None):
+                # No adb: the tablet finds us through the advert and the user
+                # opens the app (it connects by itself once it is open).
+                self.advertise()
+            else:
+                # The app always dials 127.0.0.1:8890/8891 on the tablet; each
+                # host instance listens on its own pair here.
+                for offset, port in enumerate((8890, 8891)):
+                    adb('reverse', '--no-rebind', f'tcp:{port}', f'tcp:{self.port_base + offset}')
+                    self.reverse_ports.append(port)
+                adb('shell', 'am', 'start', '-n', 'local.tabs9.usbdisplay/.MainActivity', '--es', 'token', self.token)
             self.create()
             for sig in (signal.SIGINT, signal.SIGTERM):
                 GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, sig, lambda: self.loop.quit() or False)
@@ -2448,6 +2476,9 @@ class Host:
             for port in self.reverse_ports:
                 with contextlib.suppress(Exception):
                     adb('reverse', '--remove', f'tcp:{port}')
+            if getattr(self, 'advert', None) is not None:
+                with contextlib.suppress(Exception):
+                    self.advert.close()
             if getattr(self, 'moved_outputs', None):
                 # The laptop was shifted to make room on its left/top: put it
                 # back where it was, so the desktop is as before the start.
@@ -2455,6 +2486,12 @@ class Host:
                     subprocess.run(['kscreen-doctor', *(f'output.{n}.position.{x},{y}'
                                     for n, (x, y) in self.moved_outputs.items())],
                                    capture_output=True, timeout=10)
+
+class WifiTablet:
+    """The parts of tablets.Tablet the host uses, for a tablet known from its pairing."""
+    def __init__(self, slug, label):
+        self.slug, self.label = slug, label
+
 
 # Presets for `--profile`; explicit --fps/--bitrate still win.  All of them
 # stay on the zero-copy VA path; they only change how much the compositor and
@@ -2533,6 +2570,9 @@ def build_parser():
     parser.add_argument('--instance', default=None, metavar='NAME',
                         help='name of this host instance for its status file and lock (default: '
                              "the tablet's model slug, e.g. sm_x910); one instance per tablet")
+    parser.add_argument('--wifi', action='store_true',
+                        help='stream over Wi-Fi to a tablet paired with `./tabs9 pair` (TLS, found '
+                             'through mDNS); no USB cable or adb needed. Remote control stays USB-only')
     parser.add_argument('--rate-control', choices=['cbr', 'vbr', 'cqp'], default='cbr')
     parser.add_argument('--qp', type=int, default=24)
     return parser
@@ -2544,15 +2584,36 @@ if __name__ == '__main__':
     # The input-capture and libei modules report through logging; the rest of
     # the host prints. Keep both on stdout, where the journal collects them.
     logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stdout)
-    try:
-        tablet = choose(args.tablet, list_tablets(ADB))
-    except TabletChoice as error:
-        parser.error(str(error))
-    ADB_TARGET[:] = tablet.target()
-    print(f'Tablet: {tablet.label}', flush=True)
-    if args.resolution is None:
-        args.resolution = tablet_panel_size() or '2960x1848'
-        print(f'Resolution: {args.resolution} (from the tablet; --resolution overrides)', flush=True)
+    if args.wifi:
+        try:
+            record = wifi.choose(args.tablet, wifi.paired())
+        except LookupError as error:
+            parser.error(str(error))
+        args.wifi_record = record
+        tablet = WifiTablet(record['slug'], record.get('label') or record['slug'])
+        # Showing the tablet its own desktop and driving it with this
+        # computer's mouse both go through adb.
+        args.remote = 'off'
+        # Unless asked otherwise, 60 fps at half the USB bitrate: a shared
+        # radio link, not a dedicated cable.
+        if not any(a.split('=', 1)[0] in ('--profile', '--fps', '--bitrate') for a in sys.argv[1:]):
+            args.profile = 'balanced'
+            args.bitrate = args.bitrate or 20000
+        print(f'Tablet: {tablet.label} (Wi-Fi)', flush=True)
+        if args.resolution is None:
+            args.resolution = record.get('resolution') or '2960x1848'
+            print(f'Resolution: {args.resolution} (remembered when it was paired; --resolution overrides)',
+                  flush=True)
+    else:
+        try:
+            tablet = choose(args.tablet, list_tablets(ADB))
+        except TabletChoice as error:
+            parser.error(str(error))
+        ADB_TARGET[:] = tablet.target()
+        print(f'Tablet: {tablet.label}', flush=True)
+        if args.resolution is None:
+            args.resolution = tablet_panel_size() or '2960x1848'
+            print(f'Resolution: {args.resolution} (from the tablet; --resolution overrides)', flush=True)
     try:
         args.width, args.height = (int(part) for part in args.resolution.lower().split('x', 1))
     except (TypeError, ValueError):

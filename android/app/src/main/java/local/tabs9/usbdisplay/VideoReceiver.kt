@@ -18,14 +18,13 @@ import java.util.concurrent.atomic.AtomicReference
 
 class VideoReceiver {
     companion object {
-        const val HOST = "127.0.0.1"
-        const val PORT = 8890
         const val MIME_TYPE = "video/avc"
         const val MIME_TYPE_HEVC = "video/hevc"
         const val TAG = "tabs9Video"
         const val MAX_FRAME_SIZE = 8 * 1024 * 1024
         const val FRAME_HEADER_SIZE = StreamFramer.FRAME_HEADER_SIZE
 
+        const val CONNECT_TIMEOUT_MS = 5_000
         /**
          * Transport deadline. Refreshed by every complete packet, heartbeats
          * included; with a heartbeat-capable host its expiry is a real fault.
@@ -117,9 +116,10 @@ class VideoReceiver {
     /// codec they are, so guessing wrong means a decoder that never outputs.
     @Volatile var mimeType: String = MIME_TYPE_HEVC
 
-    /// Session token; written as the first 64 bytes on the socket. The host
-    /// sends nothing until it has seen it.
-    @Volatile var token: String? = null
+    /// Where the control channel reached the host; the video socket goes to the
+    /// same place and writes the same token as its first 64 bytes. The host
+    /// closes a socket without it unanswered.
+    var link: Link? = null
 
     private var frameCallbackThread: HandlerThread? = null
     private val renderedCount = AtomicLong(0)
@@ -592,26 +592,36 @@ class VideoReceiver {
                     continue
                 }
 
+                // The control channel finds (and authenticates) the host first.
+                val endpoint = link?.active
+                if (endpoint == null) {
+                    delay(200)
+                    continue
+                }
                 val generation = connectionCounter.incrementAndGet()
-                Log.i(TAG, "Video connection $generation: connecting to $HOST:$PORT...")
-                val socket = Socket(HOST, PORT).apply {
+                Log.i(TAG, "Video connection $generation: connecting over ${endpoint.label}...")
+                val plain = Socket().apply {
                     tcpNoDelay = true
                     soTimeout = READ_TIMEOUT_MS
                     // Small on purpose. A 1 MB receive buffer let the host run
                     // ahead and park whole frames here, where they are pure
                     // delay that neither side can see or skip past. Keeping it
                     // shallow pushes backpressure back to the host, which does
-                    // know how to drop stale frames.
+                    // know how to drop stale frames. Set before connecting, so
+                    // the TCP window is negotiated with it.
                     receiveBufferSize = 128 * 1024
+                    connect(java.net.InetSocketAddress(endpoint.host, endpoint.videoPort), CONNECT_TIMEOUT_MS)
                 }
+                val socket = endpoint.pin?.let { pin ->
+                    try { PinnedTrust(pin).wrap(plain, endpoint.host, endpoint.videoPort) }
+                    catch (e: Exception) { plain.close(); throw e }
+                } ?: plain
                 connection = Connection(generation, socket)
                 if (!isRunning) { socket.close(); return }
                 current = connection
-                token?.let { t ->
-                    socket.getOutputStream().apply {
-                        write(t.toByteArray(Charsets.US_ASCII))
-                        flush()
-                    }
+                socket.getOutputStream().apply {
+                    write(endpoint.token.toByteArray(Charsets.US_ASCII))
+                    flush()
                 }
                 // Every connection starts at an IDR: whatever the decoder held
                 // belongs to a stream it will never see the rest of.

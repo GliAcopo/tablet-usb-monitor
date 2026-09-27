@@ -28,7 +28,6 @@ class TouchCapture {
         const val PROTOCOL = 2
         /** Optional capabilities this client implements; the host enables each only when named here. */
         val FEATURES = listOf("video_heartbeat")
-        const val WS_URL = "ws://127.0.0.1:8891"
         /** Clip bytes per control message: base64 of 2400 is 3200 characters, inside the host's 4 KiB frame limit. */
         private const val CLIP_CHUNK = 2400
         private const val TOOL_TYPE_PALM = 6
@@ -76,10 +75,12 @@ class TouchCapture {
     @Volatile var hostStreamConfig = HostStreamConfig()
         private set
 
-    /// Session token from the host, delivered as an intent extra when the
-    /// daemon launches us over adb. Must be the first thing sent on the
-    /// socket; without it the host closes the connection unanswered.
-    @Volatile var token: String? = null
+    /// Where the host is and how to prove ourselves to it (USB token or Wi-Fi
+    /// pairing). The token must be the first thing sent on the socket;
+    /// without it the host closes the connection unanswered.
+    var link: Link? = null
+    /** The endpoint the current socket dialled. */
+    @Volatile private var dialing: Endpoint? = null
 
     /** Settings to (re)send to the host whenever the control channel connects */
     @Volatile private var pendingConfig: JSONObject? = null
@@ -106,6 +107,24 @@ class TouchCapture {
         .readTimeout(0, TimeUnit.SECONDS)
         .connectTimeout(5, TimeUnit.SECONDS)
         .build()
+    /** Wi-Fi: TLS that trusts only the paired computer (the pin replaces the host name check). */
+    private var tlsClient: Pair<String, OkHttpClient>? = null
+
+    private fun clientFor(endpoint: Endpoint): OkHttpClient {
+        val pin = endpoint.pin ?: return client
+        tlsClient?.let { (p, c) -> if (p == pin) return c }
+        val trust = PinnedTrust(pin)
+        return client.newBuilder()
+            .sslSocketFactory(trust.socketFactory, trust)
+            .hostnameVerifier { _, _ -> true }
+            // A lost Wi-Fi link otherwise shows only when TCP gives up, minutes later.
+            .pingInterval(5, TimeUnit.SECONDS)
+            // On a LAN a live host answers in milliseconds; a stale fallback
+            // address should not hold up the next candidate for long.
+            .connectTimeout(3, TimeUnit.SECONDS)
+            .build()
+            .also { tlsClient = pin to it }
+    }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -116,7 +135,7 @@ class TouchCapture {
             // Authenticate before anything else. If we have no token yet the
             // host will drop us and relaunch the app with one, and the
             // reconnect logic takes it from there.
-            token?.let { t ->
+            dialing?.token?.let { t ->
                 webSocket.send(JSONObject().apply {
                     put("type", "auth")
                     put("token", t)
@@ -163,6 +182,10 @@ class TouchCapture {
                     finishClip(o.optInt("id", -1),
                         if (o.optBoolean("ok", false)) null else o.optString("error", "The host refused the clip"))
                     return
+                }
+                if (o.has("features") || o.has("status")) {
+                    // A greeting: the host accepted our token on this endpoint.
+                    dialing?.let { link?.confirmed(it) }
                 }
                 if (o.has("features")) {
                     val list = o.optJSONArray("features")
@@ -220,14 +243,19 @@ class TouchCapture {
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            // A socket already replaced (redial, reconnect) must not tear down its successor.
+            if (webSocket !== this@TouchCapture.webSocket) return
             isConnected = false
+            dialing?.let { link?.failed(it) }
             failClips("The connection to the host closed")
             scheduleReconnect()
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            if (webSocket !== this@TouchCapture.webSocket) return
             isConnected = false
-            Log.w(TAG, "Connection failed: ${t.message}")
+            Log.w(TAG, "Connection over ${dialing?.label} failed: ${t.message}")
+            dialing?.let { link?.failed(it) }
             failClips("The connection to the host failed")
             scheduleReconnect()
         }
@@ -279,10 +307,25 @@ class TouchCapture {
 
     private fun connectWebSocket() {
         webSocket?.cancel()
+        webSocket = null
+        val endpoint = link?.next()
+        if (endpoint == null) {
+            Log.w(TAG, "No host to dial yet (no USB token, no Wi-Fi pairing)")
+            scheduleReconnect()
+            return
+        }
+        dialing = endpoint
         val request = Request.Builder()
-            .url(WS_URL)
+            .url(endpoint.controlUrl)
             .build()
-        webSocket = client.newWebSocket(request, wsListener)
+        webSocket = clientFor(endpoint).newWebSocket(request, wsListener)
+    }
+
+    /** Dial now instead of at the next retry (the paired computer just appeared on Wi-Fi). */
+    fun redial() {
+        if (!wanted || isConnected) return
+        reconnectJob?.cancel()
+        connectWebSocket()
     }
 
     private fun scheduleReconnect() {

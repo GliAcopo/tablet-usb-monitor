@@ -63,6 +63,9 @@ class MainActivity : ComponentActivity() {
     private var videoState by mutableStateOf(VideoReceiver.VideoState.DISCONNECTED)
     private var videoReceiver: VideoReceiver? = null
     private var touchCapture: TouchCapture? = null
+    private var link: Link? = null
+    /** Name of the computer this tablet is paired with for Wi-Fi, for the waiting screen. */
+    private var pairedWith by mutableStateOf<String?>(null)
     private var spenButton: SpenButton? = null
     /** What the S Pen Remote connection is doing, for the settings sheet. */
     private var penStatus by mutableStateOf("Not connected")
@@ -82,6 +85,11 @@ class MainActivity : ComponentActivity() {
         themeChoice = prefs.theme
         videoReceiver = VideoReceiver()
         touchCapture = TouchCapture()
+        link = Link(this, prefs).also { l ->
+            videoReceiver?.link = l
+            touchCapture?.link = l
+            l.onWifiHostFound = { touchCapture?.redial() }
+        }
         applyToken(intent, restart = false)
 
         // Close the host's latency measurement loop: every acknowledged frame
@@ -193,6 +201,7 @@ class MainActivity : ComponentActivity() {
                     onDismissThanks = { showThanks = false },
                     hostProtocol = hostProtocol,
                     hostClipboard = hostClipboard,
+                    pairedWith = pairedWith,
                     penStatus = penStatus,
                     onSendClipboard = { sendClip { ClipSource.fromClipboard(this) } },
                     onSendScreenshot = { sendScreenshot() },
@@ -335,12 +344,28 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun applyToken(intent: android.content.Intent, restart: Boolean) {
+        val pairSecret = intent.getStringExtra("pair_secret")
+        val pairPin = intent.getStringExtra("pair_pin")
+        if (pairSecret != null && pairPin != null &&
+            Regex("[0-9a-f]{64}").matches(pairSecret) && Regex("[0-9a-f]{64}").matches(pairPin)) {
+            // `./tabs9 pair`, over USB: from now on the computer can be found on Wi-Fi.
+            prefs.wifiSecret = pairSecret
+            prefs.wifiPin = pairPin
+            prefs.wifiName = intent.getStringExtra("pair_name")
+            prefs.wifiHosts = intent.getStringExtra("pair_hosts")?.split(",")
+                ?.filter { Regex("[0-9.]{7,15}").matches(it) } ?: emptyList()
+            prefs.wifiLast = null
+            link?.startDiscovery()
+            toast("Paired with ${prefs.wifiName ?: "this computer"} for Wi-Fi")
+        }
+        pairedWith = if (link?.paired == true) prefs.wifiName ?: "your computer" else null
         val fromIntent = intent.getStringExtra("token")
-        if (fromIntent != null) prefs.hostToken = fromIntent
-        val token = prefs.hostToken ?: return
-        val changed = touchCapture?.token != token
-        touchCapture?.token = token
-        videoReceiver?.token = token
+        if (fromIntent != null) {
+            prefs.hostToken = fromIntent
+            link?.usbLaunched = true
+        }
+        val changed = fromIntent != null && link?.active?.token != fromIntent
+        if (changed) link?.reset()
         // Only rebuild live connections. If we are in the background, onStart
         // will connect with the new token anyway; reconnecting here as well
         // would leave a second socket behind.
@@ -410,6 +435,7 @@ class MainActivity : ComponentActivity() {
         // The video receiver is started only once the host says it is actually
         // sending a display. In pen-only mode there is nothing to receive and
         // spinning up a decoder would waste power for no picture.
+        link?.startDiscovery()
         touchCapture?.connect()
         // Only re-assert settings the user actually chose here. Pushing the
         // tablet's defaults on every start would silently overwrite whatever
@@ -435,6 +461,7 @@ class MainActivity : ComponentActivity() {
         super.onStop()
         videoReceiver?.stop()
         touchCapture?.disconnect()
+        link?.stopDiscovery()
     }
 
     override fun onDestroy() {
@@ -532,6 +559,7 @@ fun Tabs9Main(
     onDismissThanks: () -> Unit = {},
     hostProtocol: Int = 0,
     hostClipboard: Boolean = false,
+    pairedWith: String? = null,
     penStatus: String = "",
     onSendClipboard: () -> Unit = {},
     onSendScreenshot: () -> Unit = {},
@@ -610,7 +638,7 @@ fun Tabs9Main(
             exit = fadeOut(),
             modifier = Modifier.fillMaxSize()
         ) {
-            ConnectionScreen()
+            ConnectionScreen(pairedWith)
         }
 
         AnimatedVisibility(
@@ -808,7 +836,7 @@ private fun PenOnlyScreen() {
 }
 
 @Composable
-private fun ConnectionScreen() {
+private fun ConnectionScreen(pairedWith: String?) {
     val P = LocalPalette.current
     Box(
         modifier = Modifier
@@ -828,7 +856,8 @@ private fun ConnectionScreen() {
                 color = P.text
             )
             Text(
-                text = "Your tablet as a second screen, over USB",
+                text = if (pairedWith == null) "Your tablet as a second screen, over USB"
+                    else "Your tablet as a second screen, over USB or Wi-Fi",
                 fontSize = 15.sp,
                 color = P.accentSoft
             )
@@ -855,9 +884,12 @@ private fun ConnectionScreen() {
                     )
                     Spacer(modifier = Modifier.height(10.dp))
                     Text(
-                        text = "1. Connect the USB cable\n" +
+                        text = if (pairedWith == null) "1. Connect the USB cable\n" +
                             "2. Allow USB debugging if asked\n" +
-                            "3. Make sure tabs9 is running on your computer",
+                            "3. Make sure tabs9 is running on your computer"
+                        else "USB: connect the cable and start tabs9 on the computer\n" +
+                            "Wi-Fi: on $pairedWith, run ./tabs9 start --wifi\n" +
+                            "(same network; this tablet finds it by itself)",
                         fontSize = 13.sp,
                         lineHeight = 22.sp,
                         color = P.muted2,
