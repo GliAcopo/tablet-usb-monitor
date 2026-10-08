@@ -667,6 +667,11 @@ class VideoReceiver {
                         StreamFramer.TYPE_HEARTBEAT -> {
                             // Liveness only: not a frame, not decoded, not counted.
                         }
+                        StreamFramer.TYPE_AUDIO -> if (isRunning) {
+                            val player = audio ?: AudioPlayer().also { audio = it }
+                            player.feed(packet.buffer, StreamFramer.AUDIO_HEADER_SIZE,
+                                packet.size - StreamFramer.AUDIO_HEADER_SIZE)
+                        }
                         StreamFramer.TYPE_CONFIG -> {
                             val payloadSize = packet.size - 1
                             Log.i(TAG, "Received codec config: ${payloadSize}B")
@@ -835,6 +840,9 @@ class VideoReceiver {
         }
     }
 
+    /** The computer's sound, created with the first audio packet (only a host with `audio` sends any). */
+    @Volatile private var audio: AudioPlayer? = null
+
     fun getFps(): Float = currentFps
     fun getMbps(): Float = currentMbps
 
@@ -855,6 +863,8 @@ class VideoReceiver {
         scope = null
 
         releaseCodec()
+        audio?.release()
+        audio = null
 
         // The surface is deliberately left alone. It belongs to the
         // SurfaceView, which outlives any single streaming session — it stays

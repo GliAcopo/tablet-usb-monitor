@@ -74,6 +74,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // The volume keys set the level of the computer's sound (AudioPlayer).
+        volumeControlStream = android.media.AudioManager.STREAM_MUSIC
 
         // Keep screen on while streaming
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)

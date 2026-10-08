@@ -99,4 +99,20 @@ class StreamFramerTest {
             StreamFramer(ByteArrayInputStream(packet(2, byteArrayOf(0, 0, 0))), 1 shl 20).next()
         }
     }
+
+    @Test
+    fun audioPacketsCarryPcmAfterTheirSequence() {
+        val pcm = ByteArray(1920) { (it * 7).toByte() }
+        val audio = packet(3, byteArrayOf(0, 0, 1, 2) + pcm)
+        val framer = StreamFramer(Trickle(frame(1, ByteArray(10)) + audio + heartbeat(1)), 1 shl 20)
+        assertEquals(StreamFramer.TYPE_FRAME, framer.next().type)
+        val sound = framer.next()
+        assertEquals(StreamFramer.TYPE_AUDIO, sound.type)
+        assertEquals(258, sound.seq())
+        assertTrue(sound.buffer.copyOfRange(StreamFramer.AUDIO_HEADER_SIZE, sound.size).contentEquals(pcm))
+        assertEquals(StreamFramer.TYPE_HEARTBEAT, framer.next().type)
+        assertThrows(FramingException::class.java) {
+            StreamFramer(ByteArrayInputStream(packet(3, byteArrayOf(0, 0, 0, 1))), 1 shl 20).next()
+        }
+    }
 }

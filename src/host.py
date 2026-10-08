@@ -51,6 +51,7 @@ from eis_touch import EisTouch, EisError
 from gestures import GestureFilter
 from air import AirGestures, GESTURES
 from picture import LightPicture
+from audio import TabletSpeaker, audio_packet
 from remote_target import Instances
 from shortcuts import KdeShortcuts
 from remote import InputCapture, RemoteControl, RemoteError, TabletInjector
@@ -532,6 +533,13 @@ class Host:
         self.video_disconnects = 0
         self.last_video_disconnect = None
         self.heartbeats_sent = 0
+        # The tablet as a sound output (audio.py): the open video sockets
+        # its packets go to, and what became of them.
+        self.speaker = None
+        self.audio_writers = set()
+        self.audio_seq = 0
+        self.audio_sent = 0
+        self.audio_dropped = 0
         self.tablet_panel = None
         self.panel_mismatch_reported = False
         self.sent = collections.OrderedDict()
@@ -1486,6 +1494,8 @@ class Host:
             generation = self.video_generation
             print(f'Video client {generation} connected; requesting a keyframe.', flush=True)
             self.clients.add(queue)
+            audio_writers = getattr(self, 'audio_writers', set())
+            audio_writers.add(writer)
             # A fresh connection starts at an IDR (`waiting` below); ask for one
             # now instead of leaving the client to wait for the periodic one.
             GLib.idle_add(self.request_keyframe)
@@ -1527,6 +1537,8 @@ class Host:
         finally:
             self.clients.discard(queue)
             if generation is not None:
+                audio_writers.discard(writer)
+            if generation is not None:
                 self.video_disconnects += 1
                 self.last_video_disconnect = reason
                 print(f'Video client {generation} disconnected: {reason}.', flush=True)
@@ -1537,6 +1549,63 @@ class Host:
             writer.close()
             with contextlib.suppress(ConnectionError):
                 await writer.wait_closed()
+
+    # Sound for the tablet shares the video socket: each packet goes out in
+    # one write() on this loop, so it can never land inside a video packet.
+    # A socket that is this far behind drops sound rather than queueing it
+    # (stale sound is worse than a gap; the tablet bridges gaps itself).
+    AUDIO_BACKLOG_BYTES = 256 * 1024
+
+    def deliver_audio(self, pcm):
+        """GStreamer thread: one chunk from the tablet's sound output."""
+        self.audio_seq += 1
+        packet = audio_packet(self.audio_seq, pcm)
+        self.aio.call_soon_threadsafe(self.distribute_audio, packet)
+
+    def distribute_audio(self, packet):
+        if 'audio' not in self.client_features:
+            return                      # an app from before sound, or not connected
+        for writer in tuple(self.audio_writers):
+            if writer.is_closing():
+                continue
+            if writer.transport.get_write_buffer_size() > self.AUDIO_BACKLOG_BYTES:
+                self.audio_dropped += 1
+                continue
+            writer.write(packet)
+            self.audio_sent += 1
+
+    def start_speaker(self):
+        mode = getattr(self.args, 'audio', 'on')
+        if mode == 'off':
+            return
+        speaker = TabletSpeaker(Gst, self.instance, self.tablet_label, self.deliver_audio,
+                                make_default=mode == 'default')
+        try:
+            speaker.start()
+        except (RuntimeError, GLib.Error) as error:
+            # Not fatal: the screen works without it.
+            print(f'No sound output for the tablet: {error}', flush=True)
+            return
+        self.speaker = speaker
+        print(f'Sound: "tabs9 {self.tablet_label}" is an output device on this computer '
+              f'while the tablet streams{" (now the default)" if speaker.make_default else ""}.',
+              flush=True)
+        if speaker.make_default:
+            GLib.timeout_add(200, self.speaker_default, 0)
+
+    def speaker_default(self, attempt):
+        """Main loop: once the sound server lists the sink, make it the default."""
+        if self.closing or self.speaker is None:
+            return False
+        if self.speaker.present():
+            if not self.speaker.take_default():
+                print('Could not make the tablet the default sound output.', flush=True)
+            return False
+        if attempt >= 25:
+            print('The tablet sound output did not appear; the default output is unchanged.', flush=True)
+            return False
+        GLib.timeout_add(200, self.speaker_default, attempt + 1)
+        return False
 
     async def control(self, ws):
         owns_control = False
@@ -2224,7 +2293,8 @@ class Host:
         return {'status': 'connected', 'protocol': self.PROTOCOL, 'width': self.args.width,
                 'height': self.args.height, 'codec': 'hevc', 'pen_only': False,
                 'fps': self.args.fps, 'bitrate': self.args.bitrate,
-                'features': ['keyframe_request', 'render_ns', 'video_heartbeat', 'clipboard']}
+                'features': ['keyframe_request', 'render_ns', 'video_heartbeat', 'clipboard',
+                             *(['audio'] if getattr(self, 'speaker', None) is not None else [])]}
 
     async def broadcast_settings(self):
         payload = json.dumps(self.settings())
@@ -2349,6 +2419,8 @@ class Host:
             'video_clients': len(self.clients), 'video_connects': self.video_connects,
             'video_disconnects': self.video_disconnects, 'last_video_disconnect': self.last_video_disconnect,
             'heartbeats_sent': self.heartbeats_sent,
+            **({'audio_sent': self.audio_sent, 'audio_dropped': self.audio_dropped,
+                **self.speaker.stats()} if getattr(self, 'speaker', None) is not None else {}),
             'native_dropped': self.native_dropped if self.native is not None else None,
             'native_pending': len(self.native_pushed) if self.native is not None else None,
             'native_seq_gaps': self.native_seq_gaps if self.native is not None else None,
@@ -2409,6 +2481,7 @@ class Host:
                     adb('reverse', '--no-rebind', f'tcp:{port}', f'tcp:{self.port_base + offset}')
                     self.reverse_ports.append(port)
                 adb('shell', 'am', 'start', '-n', 'local.tabs9.usbdisplay/.MainActivity', '--es', 'token', self.token)
+            self.start_speaker()
             self.create()
             for sig in (signal.SIGINT, signal.SIGTERM):
                 GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, sig, lambda: self.loop.quit() or False)
@@ -2453,6 +2526,9 @@ class Host:
                 self.instances.retire(self.instance)
             with contextlib.suppress(Exception):
                 self.close_banner()
+            if getattr(self, 'speaker', None) is not None:
+                with contextlib.suppress(Exception):
+                    self.speaker.close()
             if getattr(self, 'eis', None) is not None:
                 with contextlib.suppress(Exception):
                     self.eis.close()
@@ -2553,6 +2629,11 @@ def build_parser():
     parser.add_argument('--light-picture', choices=['on', 'off'], default='off',
                         help='invert the brightness of what the tablet shows, so a dark desktop '
                              'reads as a light page on E-ink; colours keep their hue (default off)')
+    parser.add_argument('--audio', choices=['on', 'default', 'off'], default='on',
+                        help='the tablet as a sound output: on adds a "tabs9 <tablet>" output '
+                             "device to this computer (default; pick it in the volume applet), "
+                             "default also makes it the computer's output while the host runs, "
+                             'off adds nothing')
     parser.add_argument('--remote', choices=['on', 'off'], default='on',
                         help='register the KDE shortcuts that show the tablet its own desktop '
                              "and send it this computer's mouse and keyboard (default on)")

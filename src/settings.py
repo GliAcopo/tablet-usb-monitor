@@ -23,6 +23,7 @@ OPTIONS = {
     'side': (['left', 'right', 'top', 'bottom'], 'Which side of the laptop screen'),
     'profile': (['smooth', 'balanced', 'light'], 'Profile (120 / 60 / 30 fps)'),
     'light_picture': (['off', 'on'], 'Light picture (E-ink): brightness inverted, hues kept'),
+    'audio': (['on', 'default', 'off'], 'Sound on the tablet'),
     'fps': ([30, 60, 90, 120], 'Frame rate'),
     'bitrate': ((1000, 150000), 'Bitrate, kbit/s'),
     'resolution': ('resolution', 'Resolution WIDTHxHEIGHT (empty: the tablet\'s own)'),
@@ -42,7 +43,7 @@ OPTIONS = {
 # defaults; tests/test_ui.py checks they match). The panel shows these as
 # the selected value so an untouched form reads the way the host will run.
 DEFAULTS = {
-    'side': 'right', 'profile': 'smooth', 'light_picture': 'off', 'scale': 1.5, 'gap': 1, 'gestures': 'on',
+    'side': 'right', 'profile': 'smooth', 'light_picture': 'off', 'audio': 'on', 'scale': 1.5, 'gap': 1, 'gestures': 'on',
     'scroll': 'natural', 'scroll_gain': 0.2, 'two_finger_tap': 'right-click',
     'pen_button': 'actions', 'remote': 'on', 'remote_edge': 'none', 'capture_memory': 'native',
 }

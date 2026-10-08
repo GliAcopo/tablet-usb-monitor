@@ -27,7 +27,7 @@ class TouchCapture {
         /** Control-channel contract this client implements (see host.py PROTOCOL). */
         const val PROTOCOL = 2
         /** Optional capabilities this client implements; the host enables each only when named here. */
-        val FEATURES = listOf("video_heartbeat")
+        val FEATURES = listOf("video_heartbeat", "audio")
         /** Clip bytes per control message: base64 of 2400 is 3200 characters, inside the host's 4 KiB frame limit. */
         private const val CLIP_CHUNK = 2400
         private const val TOOL_TYPE_PALM = 6

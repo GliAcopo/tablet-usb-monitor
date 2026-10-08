@@ -17,8 +17,8 @@ recommended mode. Two tablets:
 
 | Tablet | Panel | What was verified | Notes |
 |---|---|---|---|
-| **Samsung Galaxy Tab S9 Ultra** | 2960 × 1848, 120 Hz | Everything in this file: 60/120 Hz numbers, touch, pen, gestures, remote control | Every number in [docs/performance.md](docs/performance.md) comes from this pair |
-| **Huawei MatePad Paper** HMW-W09 (HarmonyOS 2.1 = Android 10, Kirin 820E), **E-ink** | 1872 × 1404, 40 Hz | Mirroring, touch, remote control (mouse and keyboard handed over and back), the light picture, 2026-09-19; both tablets streaming at the same time as two extra monitors | `--profile light` (30 fps, held at 28–30 fps with `--light-picture on`); frame rate is irrelevant on E-ink and was not measured further. Its HEVC decoder holds frames until the next one arrives (see [Limitations](#limitations)); the host works around it. Not Samsung, so no S Pen button/air gestures |
+| **Samsung Galaxy Tab S9 Ultra** | 2960 × 1848, 120 Hz | Everything in this file except sound (added 2026-10-08, not yet tried on it): 60/120 Hz numbers, touch, pen, gestures, remote control | Every number in [docs/performance.md](docs/performance.md) comes from this pair |
+| **Huawei MatePad Paper** HMW-W09 (HarmonyOS 2.1 = Android 10, Kirin 820E), **E-ink** | 1872 × 1404, 40 Hz | Mirroring, touch, remote control (mouse and keyboard handed over and back), the light picture, 2026-09-19; sound on the tablet (a 30 s test tone with no underrun, then music from Chrome), 2026-10-08; both tablets streaming at the same time as two extra monitors | `--profile light` (30 fps, held at 28–30 fps with `--light-picture on`); frame rate is irrelevant on E-ink and was not measured further. Its HEVC decoder holds frames until the next one arrives (see [Limitations](#limitations)); the host works around it. Not Samsung, so no S Pen button/air gestures |
 
 ## What it looks like
 
@@ -788,6 +788,36 @@ captured keyboard searched for *kde* in the tablet's Settings, and
 against the armed edge did the same. What the pen and the finger do on the
 tablet is untouched while it is being driven: the host stops forwarding the
 tablet's own touches so they cannot come back as pointer events.
+
+### Sound on the tablet
+
+While a host runs, the computer has one more sound output, **tabs9 <tablet>**
+(for example *tabs9 HMW W09*), in the volume applet and in every app's
+output menu. Whatever plays there comes out of the tablet's speakers or
+headphones: pick it for the whole computer, or move a single app to it (in
+the applet's *Applications* tab, or `pactl move-sink-input <id>
+tabs9.<slug>`). The tablet's volume keys and the device's slider on the
+computer both set the level. `--audio default` (the panel's *Sound on the
+tablet: Default output*) switches the computer's default output to the
+tablet for as long as the host runs and back afterwards; `--audio off` adds
+no device. Works over USB and Wi-Fi.
+
+How it works: the host loads PipeWire's null sink (`module-null-sink`
+through pipewire-pulse, never chosen as the default by itself) and records
+its monitor; 48 kHz stereo 16-bit PCM (1.5 Mbit/s, digital silence not sent)
+goes to the app over the video socket, where it plays through an
+`AudioTrack` with a small jitter cushion (details in
+[android/README.md](android/README.md#video-socket)). The device goes away
+when the host stops; one left behind by a host that was killed is removed at
+the next start. Sound needs app 0.4.0; an older app simply gets none.
+Latency is roughly 100-150 ms (cushion, track buffer, the tablet's mixer), so
+it suits music and video calls better than games. It plays while the tabs9
+app is on the tablet's screen.
+
+Verified on the Huawei MatePad Paper (2026-10-08): a 30-second test tone
+played with 0 underruns and 4 chunks dropped at the start, then Chrome's
+music moved to the device played on the tablet. The Tab S9 Ultra has not run
+it yet.
 
 ### Tablet clipboard and screenshots to the PC
 

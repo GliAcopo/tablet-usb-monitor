@@ -99,6 +99,7 @@ first byte is the type:
 | `0` | codec configuration | optional; headers are normally in-band with each IDR |
 | `1` | four-byte big-endian sequence number + one Annex-B HEVC access unit | a frame |
 | `2` | four-byte big-endian counter (payload is exactly 5 bytes) | heartbeat |
+| `3` | four-byte big-endian sequence number + 48 kHz stereo signed 16-bit little-endian PCM | the computer's sound (only to a client that lists `audio` in its features) |
 
 The compositor sends no frame while the desktop is static, so without the
 heartbeat a client cannot tell "nothing changed" from "the host is gone".
@@ -111,6 +112,15 @@ fault and the client reconnects; with a legacy host, silence keeps the
 connection and the last picture. A deadline expiring *inside* a packet, an
 impossible length or an unknown type is a framing failure and always
 reconnects.
+
+Sound shares this socket. The host writes each audio packet whole, on the
+same event loop as the frames, so one never lands inside another; a socket
+more than 256 KB behind drops sound instead of queueing it, and digital
+silence is not sent at all. The client queues the chunks in front of a small
+`AudioTrack` written with blocking writes (the tablet's clock sets the pace),
+keeps a 50 ms cushion that grows by 20 ms whenever the queue runs dry in
+mid-stream (up to 250 ms), and drops a chunk when the queue is more than
+40 ms over the cushion, which absorbs the drift between the two sound clocks.
 
 Every video connection starts at an IDR: the host asks its encoder for one
 when a client connects, and the client discards dependent frames until it

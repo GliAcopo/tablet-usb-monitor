@@ -25,9 +25,12 @@ class StreamFramer(private val input: InputStream, private val maxPayload: Int) 
         const val TYPE_FRAME = 1
         /** type byte + 4-byte counter; carries no video, keeps the socket alive while idle. */
         const val TYPE_HEARTBEAT = 2
+        /** type byte + 4-byte sequence number, then 48 kHz stereo 16-bit PCM (src/audio.py). */
+        const val TYPE_AUDIO = 3
         /** type byte + 4-byte big-endian sequence number, then the access unit. */
         const val FRAME_HEADER_SIZE = 5
         const val HEARTBEAT_SIZE = 5
+        const val AUDIO_HEADER_SIZE = 5
     }
 
     /** Payload of the last packet; [Packet.size] bytes of it are valid. Reused across packets. */
@@ -57,6 +60,7 @@ class StreamFramer(private val input: InputStream, private val maxPayload: Int) 
             TYPE_CONFIG -> {}
             TYPE_FRAME -> if (size <= FRAME_HEADER_SIZE) throw FramingException("frame packet of $size bytes")
             TYPE_HEARTBEAT -> if (size != HEARTBEAT_SIZE) throw FramingException("heartbeat of $size bytes")
+            TYPE_AUDIO -> if (size <= AUDIO_HEADER_SIZE) throw FramingException("audio packet of $size bytes")
             else -> throw FramingException("packet type $type")
         }
         return Packet(type, payload, size)
