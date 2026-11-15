@@ -985,6 +985,41 @@ def summary(c, ready, start):
     return 0
 
 
+def wifi_notes():
+    """What stands between a paired tablet and this computer on Wi-Fi, as
+    lines to print. None of it stops a start: the app also comes in over
+    Tailscale, and the host knocks on the tablet."""
+    sys.path.insert(0, str(ROOT / 'src'))
+    import wifi as link
+    notes = []
+    status = link.tailscale_status()
+    if link.tailscale_addresses(status):
+        notes.append('Tailscale (the way in when the local network is in the way): ready')
+    else:
+        notes.append('Tailscale (optional): not running here; the tablet must be on the same network')
+    if link.hears_broadcasts() is False:
+        notes.append('Network card: it has received no broadcast, so the tablet cannot find this computer '
+                     'by itself.\n  The host knocks on the tablet instead (needs its address: pair on the '
+                     'cable, or connect once over Tailscale).\n  Seen with Intel Wi-Fi 7 on a multi-link '
+                     'connection; reconnecting the Wi-Fi sometimes cures it.')
+    if link.firewall_blocks_lan():
+        try:
+            route = subprocess.run(['ip', '-4', '-o', 'route', 'show', 'scope', 'link'], capture_output=True,
+                                   text=True, timeout=5).stdout
+            default = subprocess.run(['ip', '-4', 'route', 'get', '1.1.1.1'], capture_output=True,
+                                     text=True, timeout=5).stdout
+            device = re.search(r'\bdev (\S+)', default).group(1)
+            subnet = re.search(rf'^(\S+/\d+) dev {re.escape(device)}\b', route, re.M).group(1)
+            where = f'in on {device} from {subnet} '
+        except (OSError, subprocess.SubprocessError, AttributeError):
+            where = ''
+        notes.append('Firewall: ufw is on. Without a rule for the streaming ports the tablet gets through '
+                     'over Tailscale only.\n  To allow the local network (your decision; it opens these '
+                     'ports to that network):\n'
+                     f'    sudo ufw allow {where}to any port 8890:8905 proto tcp comment tabs9')
+    return notes
+
+
 def quick_check(wifi=False):
     """The gate `tabs9 start` runs: essential host pieces and one authorized tablet
     (with --wifi: a paired one, which the start itself picks; no adb needed).
@@ -1005,6 +1040,8 @@ def quick_check(wifi=False):
     if wifi:
         check('Avahi (mDNS, finds the computer from the tablet)', shutil.which('avahi-daemon') is not None
               or Path('/usr/sbin/avahi-daemon').is_file())
+        for line in wifi_notes():
+            print(line)
     else:
         check('Local ADB', ADB.is_file())
     if ADB.is_file() and not wifi:

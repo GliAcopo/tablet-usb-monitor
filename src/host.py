@@ -439,6 +439,15 @@ class Host:
         self.wifi = getattr(args, 'wifi_record', None)
         self.token = self.wifi['secret'] if self.wifi else secrets.token_hex(32)
         self.advert = None
+        # Wi-Fi: where the app may dial this computer (sent in the greeting),
+        # where the tablet was last seen (knocked on while nobody is
+        # connected), and how the connected tablet reaches us.
+        self.host_addresses = []
+        self.tablet_addresses = list(self.wifi.get('addresses', [])) if self.wifi else []
+        self.knock_stop = threading.Event()
+        self.knocks_sent = 0
+        self.tablet_link = None
+        self.full_bitrate = None
         self.loop = GLib.MainLoop()
         self.bus = dbus.SessionBus()
         self.portal = dbus.Interface(self.bus.get_object('org.freedesktop.portal.Desktop',
@@ -1630,6 +1639,8 @@ class Host:
                         stale.close(code=1000, reason='replaced by a newer connection'), 2)
             self.control_owner = ws
             owns_control = True
+            if getattr(self, 'wifi', None):
+                self.note_tablet_link(ws)
             self.client_features = set()   # re-learned from this client's config
             self.control_generation += 1
             generation = self.control_generation
@@ -1663,6 +1674,9 @@ class Host:
                     if reply is not None:
                         await ws.send(json.dumps(reply))
                 elif msg.get('type') == 'config':
+                    if getattr(self, 'wifi', None) and isinstance(msg.get('addresses'), list):
+                        # Where the tablet is on its networks: the next start knocks there.
+                        self.remember_tablet(msg['addresses'][:8])
                     features = msg.get('features')
                     if isinstance(features, list):
                         self.client_features = {f for f in features if isinstance(f, str) and len(f) <= 32}
@@ -1698,6 +1712,7 @@ class Host:
             self.controls.discard(ws)
             if owns_control and self.control_owner is ws:
                 self.control_owner = None
+                self.tablet_link = None
                 self.control_generation += 1
                 GLib.idle_add(self.release_control, self.control_generation)
 
@@ -2294,7 +2309,10 @@ class Host:
                 'height': self.args.height, 'codec': 'hevc', 'pen_only': False,
                 'fps': self.args.fps, 'bitrate': self.args.bitrate,
                 'features': ['keyframe_request', 'render_ns', 'video_heartbeat', 'clipboard',
-                             *(['audio'] if getattr(self, 'speaker', None) is not None else [])]}
+                             *(['audio'] if getattr(self, 'speaker', None) is not None else [])],
+                # Wi-Fi: this computer's addresses now, so the app's list
+                # follows a new DHCP lease or network without pairing again.
+                **({'hosts': list(self.host_addresses)} if getattr(self, 'host_addresses', None) else {})}
 
     async def broadcast_settings(self):
         payload = json.dumps(self.settings())
@@ -2345,19 +2363,115 @@ class Host:
             await asyncio.Future()
 
     def advertise(self):
-        """Wi-Fi: say on the LAN where this tablet's host listens (Avahi)."""
+        """Wi-Fi: say where this tablet's host listens: the mDNS advert
+        (Avahi) and, because that alone often is not enough, the knock."""
+        status = wifi.tailscale_status()
+        self.host_addresses = wifi.host_candidates(status)
+        addresses = ', '.join(self.host_addresses) or 'this computer'
+        print(f'Wi-Fi: listening on {addresses}, ports {self.port_base}-{self.port_base + 1} (TLS); '
+              'open tabs9 on the tablet.', flush=True)
+        if not wifi.tailscale_addresses(status):
+            print('Tailscale is not running here: the tablet can only reach this computer on the same '
+                  'network.', flush=True)
+        if wifi.hears_broadcasts() is False:
+            print('This network card has received no broadcast at all: the tablet cannot find this '
+                  'computer by itself (mDNS, ARP). The host knocks on the tablet instead'
+                  + ('.' if self.tablet_addresses else ', but its address is not known yet: connect once '
+                     'over Tailscale or run ./tabs9 pair on the cable.'), flush=True)
+        if wifi.firewall_blocks_lan():
+            print(f'The firewall (ufw) is on: unless a rule allows TCP {self.port_base}-{self.port_base + 1} '
+                  'from the local network, the tablet only gets through over Tailscale '
+                  '(./tabs9 doctor --wifi prints the rule).', flush=True)
+        threading.Thread(target=self.knock_loop, name='tabs9-knock', daemon=True).start()
+        notify(f'tabs9: open the app on {self.tablet_label}',
+               'The computer is waiting for it on Wi-Fi.')
         txt = {'v': wifi.ADVERT_VERSION, 'id': wifi.tablet_id(self.token), 'ctl': str(self.port_base + 1)}
         try:
             self.advert = wifi.Advert(dbus.SystemBus(), wifi.advert_name(self.tablet_label), self.port_base, txt)
         except dbus.DBusException as error:
-            # Not fatal: the app also dials the address it last connected to.
+            # Not fatal: the knock and the app's remembered addresses remain.
             print(f'mDNS advert unavailable ({error.get_dbus_name()}); is avahi-daemon running?', flush=True)
+
+    # Knock every 2 s for the first minute (the user has just started the
+    # host and is opening the app), then every 5 s; never while a tablet is
+    # connected. One refused connection per address costs nothing.
+    KNOCK_FAST_S, KNOCK_SLOW_S, KNOCK_FAST_FOR_S = 2.0, 5.0, 60.0
+    ADDRESS_REFRESH_S = 30.0
+
+    def knock_loop(self):
+        ident = wifi.tablet_id(self.token)
+        started = refreshed = time.monotonic()
+        idle_since = started
+        while not self.knock_stop.is_set():
+            now = time.monotonic()
+            if now - refreshed >= self.ADDRESS_REFRESH_S:
+                refreshed = now
+                with contextlib.suppress(Exception):
+                    self.host_addresses = wifi.host_candidates(wifi.tailscale_status()) or self.host_addresses
+            if self.control_owner is None:
+                for address in tuple(self.tablet_addresses):
+                    if self.knock_stop.is_set() or self.control_owner is not None:
+                        break
+                    if wifi.knock(address, ident, self.port_base, self.port_base + 1):
+                        self.knocks_sent += 1
+            else:
+                idle_since = now
+            fast = now - max(started, idle_since) < self.KNOCK_FAST_FOR_S
+            self.knock_stop.wait(self.KNOCK_FAST_S if fast else self.KNOCK_SLOW_S)
+
+    def remember_tablet(self, addresses):
+        """Keep the tablet's addresses, newest first, here and in its pairing record."""
+        fresh = [a for a in dict.fromkeys(addresses) if wifi.valid_ipv4(a)]
+        if not fresh:
             return
-        addresses = ', '.join(wifi.local_addresses()) or 'this computer'
-        print(f'Wi-Fi: listening on {addresses}, ports {self.port_base}-{self.port_base + 1} (TLS); '
-              'open tabs9 on the tablet.', flush=True)
-        notify(f'tabs9: open the app on {self.tablet_label}',
-               'The computer is waiting for it on Wi-Fi.')
+        self.tablet_addresses = (fresh + [a for a in self.tablet_addresses if a not in fresh])[
+            :wifi.MAX_TABLET_ADDRESSES]
+        with contextlib.suppress(Exception):
+            wifi.remember_addresses(self.wifi['slug'], fresh)
+
+    # Through a Tailscale relay (DERP) every packet crosses the internet and
+    # the relay throttles: a few Mbit/s is what arrives in time.
+    RELAY_BITRATE = 4000
+
+    def note_tablet_link(self, ws):
+        """The tablet's control channel just authenticated: where from, and over what."""
+        try:
+            peer = ws.remote_address[0]
+        except Exception:
+            return
+        if not wifi.valid_ipv4(peer):
+            return
+        self.remember_tablet([peer])
+        generation = self.control_generation + 1   # the one this connection is about to take
+        def classify():
+            path = 'lan'
+            if wifi.is_tailnet(peer):
+                path = 'tailscale-' + (wifi.tailscale_path(wifi.tailscale_status(), peer) or 'direct')
+            GLib.idle_add(self.apply_tablet_link, peer, path, generation)
+        threading.Thread(target=classify, name='tabs9-link', daemon=True).start()
+
+    def apply_tablet_link(self, peer, path, generation):
+        if generation != self.control_generation or self.control_owner is None:
+            return False
+        self.tablet_link = path
+        words = {'lan': 'the local network', 'tailscale-direct': 'Tailscale (direct)',
+                 'tailscale-relay': 'a Tailscale relay'}[path]
+        print(f'Tablet connected from {peer} over {words}.', flush=True)
+        wanted = None
+        if path == 'tailscale-relay' and self.args.bitrate > self.RELAY_BITRATE:
+            self.full_bitrate = self.full_bitrate or self.args.bitrate
+            wanted = self.RELAY_BITRATE
+            print(f'A relay is slow: {wanted} kbps instead of {self.full_bitrate} while it lasts. Same '
+                  'network or a direct Tailscale path gives the full picture.', flush=True)
+        elif path != 'tailscale-relay' and self.full_bitrate:
+            wanted, self.full_bitrate = self.full_bitrate, None
+        if wanted is not None:
+            self.args.bitrate = wanted
+            with contextlib.suppress(Exception):
+                if self.pipeline:
+                    self.pipeline.get_by_name('encoder').set_property('bitrate', wanted)
+            self.aio.call_soon_threadsafe(lambda: asyncio.create_task(self.broadcast_settings()))
+        return False
 
     def drop_video_clients(self):
         print(f'Dropping {len(self.clients)} video client(s) on request (recovery drill).', flush=True)
@@ -2419,6 +2533,7 @@ class Host:
             'video_clients': len(self.clients), 'video_connects': self.video_connects,
             'video_disconnects': self.video_disconnects, 'last_video_disconnect': self.last_video_disconnect,
             'heartbeats_sent': self.heartbeats_sent,
+            'tablet_link': getattr(self, 'tablet_link', None), 'knocks_sent': getattr(self, 'knocks_sent', 0),
             **({'audio_sent': self.audio_sent, 'audio_dropped': self.audio_dropped,
                 **self.speaker.stats()} if getattr(self, 'speaker', None) is not None else {}),
             'native_dropped': self.native_dropped if self.native is not None else None,
@@ -2552,6 +2667,8 @@ class Host:
             for port in self.reverse_ports:
                 with contextlib.suppress(Exception):
                     adb('reverse', '--remove', f'tcp:{port}')
+            if getattr(self, 'knock_stop', None) is not None:
+                self.knock_stop.set()
             if getattr(self, 'advert', None) is not None:
                 with contextlib.suppress(Exception):
                     self.advert.close()

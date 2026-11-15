@@ -355,9 +355,10 @@ class MainActivity : ComponentActivity() {
             prefs.wifiPin = pairPin
             prefs.wifiName = intent.getStringExtra("pair_name")
             prefs.wifiHosts = intent.getStringExtra("pair_hosts")?.split(",")
-                ?.filter { Regex("[0-9.]{7,15}").matches(it) } ?: emptyList()
+                ?.map { it.trim() }?.filter { Link.validHost(it) } ?: emptyList()
             prefs.wifiLast = null
             link?.startDiscovery()
+            link?.startKnockListener()
             toast("Paired with ${prefs.wifiName ?: "this computer"} for Wi-Fi")
         }
         pairedWith = if (link?.paired == true) prefs.wifiName ?: "your computer" else null
@@ -438,6 +439,7 @@ class MainActivity : ComponentActivity() {
         // sending a display. In pen-only mode there is nothing to receive and
         // spinning up a decoder would waste power for no picture.
         link?.startDiscovery()
+        link?.startKnockListener()
         touchCapture?.connect()
         // Only re-assert settings the user actually chose here. Pushing the
         // tablet's defaults on every start would silently overwrite whatever
@@ -464,6 +466,7 @@ class MainActivity : ComponentActivity() {
         videoReceiver?.stop()
         touchCapture?.disconnect()
         link?.stopDiscovery()
+        link?.stopKnockListener()
     }
 
     override fun onDestroy() {

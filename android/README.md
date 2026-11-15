@@ -57,6 +57,16 @@ UScreen:
 {"type":"config","protocol":2,"features":["video_heartbeat"],"fps":120,"bitrate":60000}
 ```
 
+Over Wi-Fi the two sides also tell each other where they are. The greeting
+carries `"hosts":["192.168.1.81","100.104.68.62","pc.tail1234.ts.net"]`, the
+computer's current LAN and Tailscale addresses, which the app adds to the
+addresses it dials next time; the client's first `config` carries
+`"addresses":["192.168.1.248","100.79.238.84"]`, its own IPv4 addresses,
+which the host keeps in the pairing record and knocks on (one JSON line,
+`{"tabs9": 1, "id": "<16 hex>", "video": 8890, "control": 8891}`, to TCP
+8889) while no tablet is connected. Both fields are optional; an older peer
+ignores them.
+
 Once per second while video is decoding, the client sends measured tablet
 state independently of whether the local overlay is visible:
 

@@ -4,7 +4,19 @@ import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.util.Log
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import java.net.Inet4Address
+import java.net.InetSocketAddress
+import java.net.NetworkInterface
+import java.net.ServerSocket
 import java.net.Socket
+import java.util.concurrent.atomic.AtomicInteger
 import java.security.MessageDigest
 import java.security.cert.CertificateException
 import java.security.cert.X509Certificate
@@ -21,6 +33,10 @@ import javax.net.ssl.X509TrustManager
  * put in the launch intent. Wi-Fi: the address the host announced on the LAN
  * (`_tabs9._tcp`), TLS with the host certificate pinned at pairing time, and
  * the pairing secret as the token. The host side is src/wifi.py.
+ *
+ * On Wi-Fi the host may be at several addresses (the LAN, Tailscale) and
+ * any of them may be unreachable from here, so they are all dialled at once
+ * ([Link.race]) and the first that answers is used.
  */
 data class Endpoint(
     val host: String,
@@ -78,6 +94,56 @@ class Link(context: Context, private val prefs: Prefs) {
         const val USB_HOST = "127.0.0.1"
         const val USB_VIDEO_PORT = 8890
         const val USB_CONTROL_PORT = 8891
+        /** Where the host knocks while this app is open and paired (src/wifi.py KNOCK_PORT). */
+        const val KNOCK_PORT = 8889
+        /** How long one address gets to accept a TCP connection in a race. */
+        const val RACE_CONNECT_MS = 3000
+        /** Head start of each address over the next one in a race, in list order. */
+        const val RACE_STAGGER_MS = 120L
+        private const val MAX_HOSTS = 8
+
+        private val IPV4 = Regex("""\d{1,3}(\.\d{1,3}){3}""")
+        private val DNS_NAME = Regex("""[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?""")
+
+        /** An address or name worth dialling: IPv4 or a dotted DNS name (Tailscale's MagicDNS). */
+        fun validHost(host: String): Boolean {
+            if (IPV4.matches(host)) return host.split(".").all { it.toInt() in 0..255 } &&
+                !host.startsWith("127.") && !host.startsWith("0.") && host != "255.255.255.255"
+            return DNS_NAME.matches(host) && host.contains('.') && !host.all { it.isDigit() || it == '.' }
+        }
+
+        /** Tailscale's address range, 100.64.0.0/10. */
+        fun isTailnet(host: String): Boolean {
+            if (!IPV4.matches(host)) return host.endsWith(".ts.net")
+            val (a, b) = host.split(".").map { it.toInt() }
+            return a == 100 && b in 64..127
+        }
+
+        data class Knock(val id: String, val video: Int, val control: Int)
+
+        /** The host's knock line: {"tabs9": 1, "id": "...", "video": 8890, "control": 8891}. */
+        fun parseKnock(line: String): Knock? {
+            if (line.length > 512 || !Regex(""""tabs9"\s*:\s*1\b""").containsMatchIn(line)) return null
+            val id = Regex(""""id"\s*:\s*"([0-9a-f]{16})"""").find(line)?.groupValues?.get(1) ?: return null
+            fun port(name: String) = Regex(""""$name"\s*:\s*(\d{1,5})\b""").find(line)
+                ?.groupValues?.get(1)?.toInt()?.takeIf { it in 1024..65535 }
+            return Knock(id, port("video") ?: return null, port("control") ?: return null)
+        }
+
+        /** Same network first (a few milliseconds away), then Tailscale; otherwise as listed. */
+        fun raceOrder(endpoints: List<Endpoint>): List<Endpoint> =
+            endpoints.sortedBy { if (isTailnet(it.host)) 1 else 0 }
+
+        /** This tablet's own IPv4 addresses, told to the host so it can knock. */
+        fun ownAddresses(): List<String> = try {
+            NetworkInterface.getNetworkInterfaces().toList()
+                .filter { it.isUp && !it.isLoopback }
+                .flatMap { it.inetAddresses.toList() }
+                .filterIsInstance<Inet4Address>()
+                .filter { !it.isLinkLocalAddress && !it.isLoopbackAddress }
+                .mapNotNull { it.hostAddress }
+                .distinct()
+        } catch (_: Exception) { emptyList() }
     }
 
     /** True when the USB host launched us in this process: it is certainly there. */
@@ -90,6 +156,11 @@ class Link(context: Context, private val prefs: Prefs) {
     @Volatile private var announced: Endpoint? = null
     /** Its DNS-SD instance name: a lost *other* tablet's host must not clear it. */
     @Volatile private var announcedName: String? = null
+    /** The last knock from the paired host: it is up at the sender's address. */
+    @Volatile private var knocked: Endpoint? = null
+    private var lastKnockNotice = 0L
+    private var knockServer: ServerSocket? = null
+    private val io = CoroutineScope(Dispatchers.IO + SupervisorJob())
     /** Called when the paired computer shows up on the network (or moves). */
     var onWifiHostFound: (() -> Unit)? = null
 
@@ -107,13 +178,20 @@ class Link(context: Context, private val prefs: Prefs) {
         val pin = prefs.wifiPin
         if (secret != null && pin != null) {
             announced?.let { wifi.add(it) }
+            knocked?.let { wifi.add(it) }
             // Fallbacks for a network that drops mDNS: the last address that
-            // worked, then the computer's addresses at pairing time.
+            // worked, then every address the computer has told us about (at
+            // pairing, and in each greeting since), on the ports it last used.
+            var ports = USB_VIDEO_PORT to USB_CONTROL_PORT
+            (announced ?: knocked)?.let { ports = it.videoPort to it.controlPort }
             prefs.wifiLast?.split(":")?.takeIf { it.size == 3 }?.let { (h, v, c) ->
                 val vp = v.toIntOrNull(); val cp = c.toIntOrNull()
-                if (vp != null && cp != null) wifi.add(Endpoint(h, vp, cp, secret, pin))
+                if (vp != null && cp != null) {
+                    wifi.add(Endpoint(h, vp, cp, secret, pin))
+                    if (announced == null && knocked == null) ports = vp to cp
+                }
             }
-            prefs.wifiHosts.forEach { wifi.add(Endpoint(it, USB_VIDEO_PORT, USB_CONTROL_PORT, secret, pin)) }
+            prefs.wifiHosts.forEach { wifi.add(Endpoint(it, ports.first, ports.second, secret, pin)) }
         }
         val distinctWifi = wifi.distinctBy { Triple(it.host, it.videoPort, it.controlPort) }
         // A USB start hands us a token right now; otherwise a paired tablet
@@ -140,10 +218,108 @@ class Link(context: Context, private val prefs: Prefs) {
         if (active == endpoint) active = null else failures++
     }
 
+    /** The Wi-Fi candidates, for [race]. */
+    fun wifiCandidates(): List<Endpoint> = candidates().filter { it.wifi }
+
+    /**
+     * Dial every Wi-Fi candidate at once (plain TCP to the control port, the
+     * nearer ones a little earlier) and return the first that accepts, or
+     * null when none does within [RACE_CONNECT_MS]. Trying them one after
+     * the other cost a connect timeout per dead address, and a dead address
+     * is the usual case: an old DHCP lease, a LAN this tablet is not on, a
+     * firewall. The losers are closed as they finish.
+     */
+    suspend fun race(): Endpoint? {
+        val endpoints = raceOrder(wifiCandidates())
+        if (endpoints.isEmpty()) return null
+        if (endpoints.size == 1) return endpoints[0]
+        val winner = CompletableDeferred<Endpoint?>()
+        val left = AtomicInteger(endpoints.size)
+        val jobs = endpoints.mapIndexed { i, endpoint ->
+            io.launch {
+                delay(i * RACE_STAGGER_MS)
+                if (winner.isCompleted) return@launch
+                val ok = try {
+                    Socket().use { it.connect(InetSocketAddress(endpoint.host, endpoint.controlPort), RACE_CONNECT_MS); true }
+                } catch (_: Exception) { false }
+                if (ok && winner.complete(endpoint)) Log.i(TAG, "Reached the computer at ${endpoint.host}")
+                if (left.decrementAndGet() == 0) winner.complete(null)
+            }
+        }
+        val result = withTimeoutOrNull(RACE_CONNECT_MS + endpoints.size * RACE_STAGGER_MS + 500) { winner.await() }
+        jobs.forEach { it.cancel() }
+        return result
+    }
+
+    /** The host's current addresses, from its greeting: kept for the next connection. */
+    fun learnHosts(hosts: List<String>) {
+        val fresh = hosts.map { it.trim() }.filter { validHost(it) }
+        if (fresh.isEmpty()) return
+        val merged = (fresh + prefs.wifiHosts.filter { it !in fresh }).take(MAX_HOSTS)
+        if (merged != prefs.wifiHosts) prefs.wifiHosts = merged
+    }
+
     /** A new USB token or pairing: forget which endpoint worked. */
     @Synchronized fun reset() {
         active = null
         failures = 0
+    }
+
+    // -- knock (src/wifi.py knock()) ---------------------------------------------
+
+    /**
+     * Listen for the host's knock while the app is in front and paired. The
+     * host connects to us, which works where we cannot find or reach it
+     * first: no mDNS on the network, or a computer that never hears our ARP
+     * requests. The knock is only a hint: its sender is dialled like any
+     * other candidate, and the pinned certificate still decides.
+     */
+    @Synchronized fun startKnockListener() {
+        if (!paired || knockServer != null) return
+        val server = try {
+            ServerSocket().apply { reuseAddress = true; bind(InetSocketAddress(KNOCK_PORT)) }
+        } catch (e: Exception) {
+            Log.w(TAG, "Cannot listen for the computer's knock on $KNOCK_PORT: ${e.message}")
+            return
+        }
+        knockServer = server
+        Thread({
+            while (!server.isClosed) {
+                val socket = try { server.accept() } catch (_: Exception) { break }
+                try { socket.use { heard(it) } } catch (_: Exception) {}
+            }
+        }, "tabs9-knock").apply { isDaemon = true; start() }
+    }
+
+    @Synchronized fun stopKnockListener() {
+        try { knockServer?.close() } catch (_: Exception) {}
+        knockServer = null
+    }
+
+    private fun heard(socket: Socket) {
+        socket.soTimeout = 1500
+        val input = socket.getInputStream()
+        val bytes = java.io.ByteArrayOutputStream()
+        while (bytes.size() < 512) {
+            val b = input.read()
+            if (b < 0 || b == '\n'.code) break
+            bytes.write(b)
+        }
+        val knock = parseKnock(bytes.toString(Charsets.US_ASCII.name())) ?: return
+        if (knock.id != expectedId()) return   // another tablet's host
+        val host = (socket.inetAddress as? Inet4Address)?.hostAddress ?: return
+        val endpoint = Endpoint(host, knock.video, knock.control, prefs.wifiSecret ?: return, prefs.wifiPin ?: return)
+        val now = android.os.SystemClock.elapsedRealtime()
+        val news = synchronized(this) {
+            val changed = endpoint != knocked
+            if (changed) Log.i(TAG, "The paired computer knocked from $host")
+            knocked = endpoint
+            failures = 0
+            // The host knocks every few seconds: a redial on each would cut
+            // short the race the previous one started.
+            (changed || now - lastKnockNotice >= 6000).also { if (it) lastKnockNotice = now }
+        }
+        if (news && active == null) onWifiHostFound?.invoke()
     }
 
     // -- discovery ----------------------------------------------------------------

@@ -18,7 +18,8 @@ changing repository settings or visibility.
 - Author e-mail is the GitHub noreply address already set in the repo-local
   `git config user.email`; never put a real e-mail in a commit.
 - Run `python3 -m unittest discover -s tests` first; do not push red tests.
-- End the message with the agent's `Co-Authored-By:` line.
+- No `Co-Authored-By:`, `Claude-Session:` or other agent trailers, even when a
+  tool asks for them; the README's Development section declares the assistance.
 
 ### Release procedure
 

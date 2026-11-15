@@ -111,6 +111,82 @@ class Addresses(unittest.TestCase):
             self.assertEqual(wifi.local_addresses(), ['10.0.0.5', '192.168.1.81', '100.104.68.62'])
 
 
+
+STATUS = {
+    'BackendState': 'Running',
+    'Self': {'TailscaleIPs': ['100.104.68.62', 'fd7a:115c:a1e0::1'], 'DNSName': 'pc.tail1234.ts.net.'},
+    'Peer': {
+        'a': {'TailscaleIPs': ['100.79.238.84'], 'CurAddr': '', 'Relay': 'fra'},
+        'b': {'TailscaleIPs': ['100.108.7.14'], 'CurAddr': '192.168.1.20:41641'},
+    },
+}
+
+
+class FindingEachOther(unittest.TestCase):
+    """The knock, the tablet's remembered addresses and Tailscale (module text)."""
+
+    def test_addresses_worth_dialling(self):
+        for good in ('192.168.1.248', '100.79.238.84', '10.0.0.2'):
+            self.assertTrue(wifi.valid_ipv4(good), good)
+        for bad in ('127.0.0.1', '0.0.0.0', '224.0.0.251', '169.254.1.1', '255.255.255.255',
+                    '300.1.1.1', '1.2.3', 'tablet', None, 42):
+            self.assertFalse(wifi.valid_ipv4(bad), bad)
+        self.assertTrue(wifi.is_tailnet('100.79.238.84'))
+        self.assertFalse(wifi.is_tailnet('192.168.1.81'))
+
+    def test_tablet_addresses_are_remembered_newest_first_and_the_secret_kept(self):
+        directory = Path(tempfile.mkdtemp())
+        record = wifi.save_pairing('sm_x910', 'SM X910', '2960x1848', directory)
+        self.assertEqual(wifi.remember_addresses('sm_x910', ['192.168.1.248', 'junk'], directory),
+                         ['192.168.1.248'])
+        merged = wifi.remember_addresses('sm_x910', ['100.79.238.84', '192.168.1.248'], directory)
+        self.assertEqual(merged, ['100.79.238.84', '192.168.1.248'])
+        many = [f'10.0.0.{i}' for i in range(1, 10)]
+        self.assertEqual(len(wifi.remember_addresses('sm_x910', many, directory)), wifi.MAX_TABLET_ADDRESSES)
+        again = wifi.load_pairing('sm_x910', directory)
+        self.assertEqual(again['secret'], record['secret'])
+        mode = stat.S_IMODE(os.stat(wifi.record_path('sm_x910', directory)).st_mode)
+        self.assertEqual(mode & 0o077, 0)
+        self.assertEqual(wifi.remember_addresses('unpaired', ['10.0.0.1'], directory), [])
+
+    def test_tailscale_addresses_and_paths(self):
+        self.assertEqual(wifi.tailscale_addresses(STATUS), ['100.104.68.62', 'pc.tail1234.ts.net'])
+        self.assertEqual(wifi.tailscale_addresses(None), [])
+        self.assertEqual(wifi.tailscale_path(STATUS, '100.79.238.84'), 'relay')
+        self.assertEqual(wifi.tailscale_path(STATUS, '100.108.7.14'), 'direct')
+        self.assertIsNone(wifi.tailscale_path(STATUS, '100.1.1.1'))
+        with mock.patch.object(wifi, 'local_addresses', return_value=['192.168.1.81', '100.104.68.62']):
+            self.assertEqual(wifi.host_candidates(STATUS),
+                             ['192.168.1.81', '100.104.68.62', 'pc.tail1234.ts.net'])
+
+    def test_a_stopped_tailscale_counts_as_none(self):
+        stopped = mock.Mock(returncode=0, stdout=json.dumps({'BackendState': 'Stopped'}))
+        with mock.patch.object(wifi.subprocess, 'run', return_value=stopped):
+            self.assertIsNone(wifi.tailscale_status())
+        with mock.patch.object(wifi.subprocess, 'run', side_effect=FileNotFoundError):
+            self.assertIsNone(wifi.tailscale_status())
+
+    def test_the_knock_is_one_line_the_app_parses(self):
+        server = socket.socket()
+        server.bind(('127.0.0.1', 0))
+        server.listen(1)
+        got = []
+
+        def accept():
+            conn, _ = server.accept()
+            with conn:
+                got.append(conn.makefile().readline())
+        thread = threading.Thread(target=accept)
+        thread.start()
+        with mock.patch.object(wifi, 'KNOCK_PORT', server.getsockname()[1]):
+            self.assertTrue(wifi.knock('127.0.0.1', '0123456789abcdef', 8893, 8894))
+        thread.join(5)
+        server.close()
+        # The exact shape LinkTest.theHostsKnockLine expects.
+        self.assertEqual(got, ['{"tabs9": 1, "id": "0123456789abcdef", "video": 8893, "control": 8894}\n'])
+        with mock.patch.object(wifi, 'KNOCK_PORT', 9):
+            self.assertFalse(wifi.knock('127.0.0.1', '0123456789abcdef', 8893, 8894, timeout=0.5))
+
 class SavedSettings(unittest.TestCase):
     def test_wifi_start_leaves_usb_sized_settings_out(self):
         saved = {'side': 'left', 'profile': 'smooth', 'bitrate': 60000, 'scale': 2.0}

@@ -715,3 +715,42 @@ class HostTouchIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TabletLinkTests(unittest.TestCase):
+    """Wi-Fi: how the tablet came in decides the bitrate; the greeting names our addresses."""
+
+    def wifi_host(self):
+        value = bare_host()
+        value.args.bitrate = 60000
+        value.full_bitrate = None
+        value.tablet_link = None
+        value.control_generation = 3
+        value.control_owner = object()
+        value.pipeline = None
+        value.broadcasts = 0
+        value.aio = SimpleNamespace(call_soon_threadsafe=lambda f: setattr(value, 'broadcasts', value.broadcasts + 1))
+        return value
+
+    def test_a_relay_lowers_the_bitrate_and_a_direct_path_restores_it(self):
+        value = self.wifi_host()
+        value.apply_tablet_link('100.79.238.84', 'tailscale-relay', 3)
+        self.assertEqual((value.tablet_link, value.args.bitrate), ('tailscale-relay', host_module.Host.RELAY_BITRATE))
+        self.assertEqual(value.broadcasts, 1)
+        value.apply_tablet_link('192.168.1.248', 'lan', 3)
+        self.assertEqual((value.tablet_link, value.args.bitrate, value.full_bitrate), ('lan', 60000, None))
+        self.assertEqual(value.broadcasts, 2)
+        value.apply_tablet_link('192.168.1.248', 'lan', 3)
+        self.assertEqual(value.broadcasts, 2)   # nothing changed, nothing sent
+
+    def test_a_late_classification_of_an_old_connection_changes_nothing(self):
+        value = self.wifi_host()
+        value.apply_tablet_link('100.79.238.84', 'tailscale-relay', 2)
+        self.assertEqual((value.tablet_link, value.args.bitrate), (None, 60000))
+
+    def test_the_greeting_names_this_computers_addresses(self):
+        value = self.wifi_host()
+        value.host_addresses = ['192.168.1.81', '100.104.68.62']
+        self.assertEqual(value.settings()['hosts'], ['192.168.1.81', '100.104.68.62'])
+        value.host_addresses = []
+        self.assertNotIn('hosts', value.settings())

@@ -322,7 +322,8 @@ From then on no cable is needed. On the computer:
 ./tabs9 start --wifi --tablet SM
 ```
 
-and open tabs9 on the tablet (same network). It finds the computer by itself
+and open tabs9 on the tablet (same network, or anywhere when both run
+[Tailscale](#tailscale)). It finds the computer by itself
 and the picture appears within a second; restart the host and it reconnects
 on its own. `./tabs9 stop`, `status` and `logs` work as usual; `./tabs9
 unpair --tablet SM` forgets the pairing on the computer.
@@ -336,13 +337,31 @@ How it works (`src/wifi.py`, `android/.../Link.kt`):
   else on the network can read the desktop picture or pose as the computer;
   the secret then authenticates the tablet inside TLS. Pairing again
   replaces the secret, so the old one stops working.
-- **Discovery.** The host announces `_tabs9._tcp` through Avahi (mDNS). The
-  advert carries a hash of the tablet's secret instead of any name, so
-  each tablet finds the host running for it — two paired tablets work
-  side by side as over USB. If the network drops mDNS the app falls back to
-  the last address that worked and the computer's addresses at pairing
-  time. It listens on ports 8890–8891 (+4 per extra tablet) on every
-  interface; if you run a firewall, allow those from your LAN.
+- **Discovery.** Three ways, because any one of them can be missing on a
+  given network or computer:
+  - The host announces `_tabs9._tcp` through Avahi (mDNS). The advert
+    carries a hash of the tablet's secret instead of any name, so each
+    tablet finds the host running for it — two paired tablets work side by
+    side as over USB.
+  - The host **knocks**: while no tablet is connected it opens a short TCP
+    connection to the tablet's last known addresses on port 8889 (every 2 s
+    for a minute, then every 5 s) saying which ports it listens on. The app
+    listens there only while it is open and paired, and treats a knock as a
+    hint: it dials the sender like any other address and still checks the
+    pinned certificate. This covers a computer that never hears the tablet's
+    broadcasts (no mDNS, no ARP; seen with Intel Wi-Fi 7 on a multi-link
+    connection), which `./tabs9 start --wifi` detects and reports.
+  - The app dials **every address it knows at once** and keeps the first
+    that answers: the announced one, the knock's sender, the last that
+    worked, and the computer's LAN and Tailscale addresses (from pairing,
+    refreshed in every greeting, so a new DHCP lease needs no new pairing).
+    Same-network addresses get a head start of 120 ms each over Tailscale
+    ones. Before, it tried them one after the other, a few seconds each.
+- **Ports and firewall.** The host listens on 8890–8891 (+4 per extra
+  tablet) on every interface. With `ufw` on, the tablet gets through over
+  Tailscale only, unless you allow the LAN; `./tabs9 start --wifi` prints
+  the rule for your network, e.g.
+  `sudo ufw allow in on wlp44s0f0 from 192.168.1.0/24 to any port 8890:8905 proto tcp comment tabs9`.
 - **Transport choice.** A USB start (`am start` with a session token) always
   wins; a tablet opened by hand tries Wi-Fi first when it is paired. The
   video socket follows whichever address the control channel authenticated on.
@@ -350,6 +369,13 @@ How it works (`src/wifi.py`, `android/.../Link.kt`):
   Wi-Fi start uses 60 fps at 20 Mbit/s, and the control panel's saved
   profile/fps/bitrate (chosen for the cable) are left out. Settings applied
   in the tablet's own settings sheet still win, as over USB.
+- <a id="tailscale"></a>**Tailscale.** When both the computer and the tablet run
+  Tailscale the same TLS connection also goes through the tailnet: from
+  another network, or past a firewall that blocks the LAN ports. The host
+  logs whether the tablet came in over the LAN, a direct Tailscale path, or
+  a Tailscale relay (DERP); over a relay every packet crosses the internet,
+  so it drops to 4 Mbit/s while the relay lasts and goes back to the full
+  bitrate when the tablet reconnects on a direct path.
 - **Not over Wi-Fi:** remote control (showing the tablet its own desktop and
   driving it with this computer's mouse) needs adb, so `--wifi` turns it off.
 
@@ -1003,7 +1029,10 @@ USB the servers bind `127.0.0.1`, using ports 8890 and 8891, and every adb
 call names the USB device, so a wireless ADB device is not silently
 substituted for it. The host never calls `adb tcpip`. It opens a LAN
 listening port only with `--wifi`, and then only with TLS and a certificate
-the paired tablet pins (see [Over Wi-Fi](#over-wi-fi)).
+the paired tablet pins (see [Over Wi-Fi](#over-wi-fi)). The paired app
+listens on TCP 8889 while it is open, for the host's knock: one line with a
+16-hex-digit id and two port numbers, which it only uses as an address to
+dial and verify; nothing is sent back.
 
 The host and client are still undergoing live integration checks. See the
 performance report for the distinction between configured refresh rate,
@@ -1020,3 +1049,8 @@ EVDI/kernel-module pipeline with KDE/PipeWire and portal input.
 
 Protocol references: [XDG ScreenCast](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.ScreenCast.html)
 and [XDG RemoteDesktop](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html).
+
+## Development
+
+Developed with the assistance of Claude (Anthropic) and other coding agents;
+[AGENTS.md](AGENTS.md) holds the rules they follow here.

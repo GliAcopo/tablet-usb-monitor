@@ -161,11 +161,17 @@ class TouchCapture {
             // every idle desktop then looked like a dead link after 10 s.
             // This hello carries no fps/bitrate, so the host's own profile
             // stays in force.
-            webSocket.send((pendingConfig ?: JSONObject().apply {
+            val hello = JSONObject((pendingConfig ?: JSONObject().apply {
                 put("type", "config")
                 put("protocol", PROTOCOL)
                 put("features", JSONArray(FEATURES))
             }).toString())
+            // Wi-Fi: where this tablet is, so the host can knock here next time.
+            if (dialing?.wifi == true) {
+                val own = Link.ownAddresses()
+                if (own.isNotEmpty()) hello.put("addresses", JSONArray(own))
+            }
+            webSocket.send(hello.toString())
             pendingMode?.let {
                 webSocket.send(it.toString())
                 pendingMode = null
@@ -186,6 +192,10 @@ class TouchCapture {
                 if (o.has("features") || o.has("status")) {
                     // A greeting: the host accepted our token on this endpoint.
                     dialing?.let { link?.confirmed(it) }
+                }
+                o.optJSONArray("hosts")?.let { list ->
+                    // The computer's addresses now (LAN, Tailscale): next time, dial those too.
+                    link?.learnHosts((0 until list.length()).mapNotNull { list.optString(it, null) })
                 }
                 if (o.has("features")) {
                     val list = o.optJSONArray("features")
@@ -305,15 +315,38 @@ class TouchCapture {
         connectWebSocket()
     }
 
+    /** Bumped by every dial, so a race that finishes late opens nothing. */
+    private val dialAttempt = java.util.concurrent.atomic.AtomicInteger()
+
     private fun connectWebSocket() {
         webSocket?.cancel()
         webSocket = null
-        val endpoint = link?.next()
+        val attempt = dialAttempt.incrementAndGet()
+        val l = link
+        val endpoint = l?.next()
         if (endpoint == null) {
             Log.w(TAG, "No host to dial yet (no USB token, no Wi-Fi pairing)")
             scheduleReconnect()
             return
         }
+        if (endpoint.wifi && l.active == null) {
+            // No confirmed endpoint: race every Wi-Fi address, then open the winner.
+            reconnectJob = scope.launch {
+                val reached = l.race()
+                if (!wanted || isConnected || attempt != dialAttempt.get()) return@launch
+                if (reached == null) {
+                    Log.w(TAG, "The computer answers at none of ${l.wifiCandidates().size} address(es)")
+                    scheduleReconnect()
+                } else {
+                    open(reached)
+                }
+            }
+            return
+        }
+        open(endpoint)
+    }
+
+    private fun open(endpoint: Endpoint) {
         dialing = endpoint
         val request = Request.Builder()
             .url(endpoint.controlUrl)
